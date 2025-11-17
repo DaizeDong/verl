@@ -60,6 +60,8 @@ from verl.utils.megatron_utils import (
     per_tensor_generator,
     register_megatron_training_hooks,
 )
+
+from verl.utils.megatron.router_replay_utils import pp_dispatch
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import get_hf_model_path, load_mcore_dist_weights, load_megatron_gptmodel_weights
 from verl.utils.profiler import (
@@ -725,6 +727,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._is_offload_optimizer:
             load_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
+        if self.enable_routing_replay and self.config.actor.router_replay.mode != "disabled":
+            local_router_map = pp_dispatch(data.batch["layers_topk_idx"], self.tf_config)
+            data.batch["layers_topk_idx"] = local_router_map
 
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
