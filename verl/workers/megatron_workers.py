@@ -60,7 +60,6 @@ from verl.utils.megatron_utils import (
     per_tensor_generator,
     register_megatron_training_hooks,
 )
-
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import get_hf_model_path, load_mcore_dist_weights, load_megatron_gptmodel_weights
 from verl.utils.profiler import (
@@ -73,6 +72,7 @@ from verl.utils.profiler import (
 )
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.ray_utils import get_event_loop
+from verl.utils.torch_functional import use_original_torch_compile
 from verl.workers.actor.megatron_actor import MegatronPPOActor
 from verl.workers.config import HFModelConfig, McoreCriticConfig, RolloutConfig
 from verl.workers.critic.megatron_critic import MegatronPPOCritic
@@ -598,7 +598,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("After MegatronPPOActor init", logger=logger)
 
         if self._is_rollout:
-            self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+            with use_original_torch_compile():
+                self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
             log_gpu_memory_usage("After rollout init", logger=logger)
 
         if self._is_ref:
@@ -856,7 +857,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             meta_info={"temperature": self.config.rollout.temperature},
         )
         if self.config.actor.router_replay.mode == "R2":
-            output.batch["layers_topk_idx"] = layers_topk_idx
+            output.batch["routed_experts"] = layers_topk_idx
 
         if self.config.actor.router_replay.mode in ["R2", "R3"]:
             RouterReplay.clear_global_indices()
