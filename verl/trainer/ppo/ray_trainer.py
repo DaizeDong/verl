@@ -447,8 +447,23 @@ class RayPPOTrainer:
 
         lines = []
         for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            entry = {}
+            for k, v in base_data.items():
+                if isinstance(v[i], np.bool_):
+                    entry[k] = bool(v[i])
+                elif isinstance(v[i], (np.str_)):
+                    entry[k] = str(v[i])
+                elif isinstance(v[i], (np.integer)):
+                    entry[k] = int(v[i])
+                elif isinstance(v[i], (np.floating)):
+                    entry[k] = float(v[i])
+                else:
+                    entry[k] = v[i]
+            try:
+                lines.append(json.dumps(entry, ensure_ascii=False))
+            except Exception as e:
+                print(f"Warning: Could not serialize entry {i} due to error: {e}. (entry: {entry})")
+                lines.append("{}")
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")
