@@ -51,7 +51,7 @@ from verl.utils.device import (
 from verl.utils.distributed import set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
-from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
+from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, RouterReplayCacheAction, apply_router_replay_patch
 from verl.utils.megatron_utils import (
     load_megatron_model_to_gpu,
     load_megatron_optimizer,
@@ -288,12 +288,32 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         only_rollout = self._is_rollout and not self._is_actor
 
         self.enable_routing_replay = False
+        self.enable_logits_saving = False
+        
         if self._is_actor:
             self.router_replay = self.config.actor.router_replay
             self.enable_routing_replay = self.router_replay.mode != "disabled"
+            
+            # Initialize logits saver if record_file is specified (独立于 router_replay)
+            if self.router_replay.record_file is not None:
+                from verl.utils.megatron.router_replay_saver import RouterReplayLogitsSaver
+                self.logits_saver = RouterReplayLogitsSaver(self.router_replay.record_file)
+                self.enable_logits_saving = True
+                self.log_prob_step = 0  # Track compute_log_prob steps for file naming
+                self.save_frequency = self.router_replay.save_frequency
+                logger.info(f"Router logits saving enabled in HybridEngine. Save directory: {self.router_replay.record_file}, frequency: every {self.save_frequency} step(s)")
+            else:
+                self.logits_saver = None
+                self.enable_logits_saving = False
+                self.save_frequency = 1
+        else:
+            self.logits_saver = None
+            self.enable_logits_saving = False
 
-        if self.enable_routing_replay:
+        # Apply patch if either router_replay or logits_saving is enabled
+        if self.enable_routing_replay or self.enable_logits_saving:
             apply_router_replay_patch()
+            logger.info(f"Applied router replay patch. router_replay={self.enable_routing_replay}, logits_saving={self.enable_logits_saving}")
 
         set_random_seed(seed=self.config.actor.megatron.seed, only_rollout=only_rollout)
 
@@ -550,8 +570,15 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             override_transformer_config = OmegaConf.to_container(
                 OmegaConf.create(self.config.actor.megatron.get("override_transformer_config", {}))
             )
+            # Only set enable_routing_replay=True if router_replay mode is enabled
+            # For logits-only recording (mode="disabled"), we use layer_number instead
             if self.enable_routing_replay:
                 override_transformer_config["enable_routing_replay"] = True
+                logger.info(f"[Rank {self.rank}] Set enable_routing_replay=True in transformer_config")
+            
+            # Log logits_saving status for debugging
+            if self.enable_logits_saving:
+                logger.info(f"[Rank {self.rank}] Logits saving enabled (router_replay={self.enable_routing_replay})")
             override_ddp_config = OmegaConf.to_container(
                 OmegaConf.create(self.config.actor.megatron.get("override_ddp_config", {}))
             )
@@ -598,6 +625,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 actor_optimizer=self.actor_optimizer,
             )
             print(f"routing replay layers: {len(RouterReplay.router_instances)}")
+            if self.enable_routing_replay and len(RouterReplay.router_instances) == 0:
+                logger.error(f"[Rank {self.rank}] ❌ Router replay is enabled but no router instances found! Check if enable_routing_replay is set in transformer_config.")
             log_gpu_memory_usage("After MegatronPPOActor init", logger=logger)
 
         if self._is_rollout:
@@ -848,6 +877,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
 
+        # Set cache action to COMPUTE_LOG_PROB phase
+        if self.enable_logits_saving:
+            RouterReplay.set_cache_action(RouterReplayCacheAction.COMPUTE_LOG_PROB)
+            logger.info(f"[Rank {self.rank}] Enabled logits recording for COMPUTE_LOG_PROB. Debug: {RouterReplay.get_debug_info()}")
+
         if self.enable_routing_replay and self.config.actor.router_replay.mode == "R2":
             RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
@@ -865,6 +899,46 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self.config.actor.router_replay.mode in ["R2", "R3"]:
             RouterReplay.clear_global_indices()
             RouterReplay.clear_global_router_replay_action()
+
+        # Save logits cache for this compute_log_prob call
+        if self.enable_logits_saving:
+            from verl.utils.megatron.router_replay_saver import RouterReplayLogitsSaver
+            
+            # Debug: Check state before getting cache
+            debug_info = RouterReplay.get_debug_info()
+            logger.info(f"[Rank {self.rank}] Before get_and_clear_logits_cache: {debug_info}")
+            
+            logits_cache = RouterReplay.get_and_clear_logits_cache()
+            logger.info(f"[Rank {self.rank}] Logits cache sizes - compute_log_prob: {len(logits_cache['compute_log_prob'])}, training: {len(logits_cache['training'])}")
+            
+            # Check if should save this step based on save_frequency
+            should_save = (self.log_prob_step % self.save_frequency == 0)
+            
+            # Only save if there's data and frequency matches
+            if should_save and (logits_cache["compute_log_prob"] or logits_cache["training"]):
+                # Step 1: Gather logits across TP group (only TP rank 0 will have data after this)
+                if mpu.get_tensor_model_parallel_world_size() > 1:
+                    logits_cache = RouterReplayLogitsSaver.gather_logits_from_tp_group(logits_cache)
+                
+                # Step 2: Gather logits across DP group (only DP rank 0 will have data after this)
+                # Only TP rank 0 participates in DP gathering
+                if mpu.get_tensor_model_parallel_rank() == 0:
+                    if mpu.get_data_parallel_world_size() > 1:
+                        logits_cache = RouterReplayLogitsSaver.gather_logits_from_dp_group(logits_cache)
+                    
+                    # Step 3: Save asynchronously (only on DP rank 0 and TP rank 0)
+                    if mpu.get_data_parallel_rank() == 0:
+                        step_name = f"log_prob_{self.log_prob_step}"
+                        self.logits_saver.save_logits_async(logits_cache, step_name)
+                        logger.info(f"Scheduled async save for compute_log_prob step {self.log_prob_step}")
+            elif not should_save:
+                logger.debug(f"Skipping save for compute_log_prob step {self.log_prob_step} (frequency={self.save_frequency})")
+            
+            # Increment step counter
+            self.log_prob_step += 1
+            
+            # Clear cache action
+            RouterReplay.clear_cache_action()
 
         output = output.to("cpu")
         # clear kv cache

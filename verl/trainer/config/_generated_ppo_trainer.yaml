@@ -112,6 +112,7 @@ actor_rollout_ref:
       mode: disabled
       record_file: null
       replay_file: null
+      save_frequency: 1
     grad_clip: 1.0
     ulysses_sequence_parallel_size: 1
     entropy_from_logits_with_chunking: false
@@ -155,6 +156,7 @@ actor_rollout_ref:
       mode: disabled
       record_file: null
       replay_file: null
+      save_frequency: 1
     fsdp_config:
       _target_: verl.workers.config.FSDPEngineConfig
       wrap_policy:

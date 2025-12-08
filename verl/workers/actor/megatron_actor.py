@@ -40,7 +40,8 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
-from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction
+from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, RouterReplayCacheAction
+from verl.utils.megatron.router_replay_saver import RouterReplayLogitsSaver
 from verl.utils.megatron.router_replay_utils import (
     RouterReplayHelper,
     merge_router_topk_indices,
@@ -160,8 +161,22 @@ class MegatronPPOActor(BasePPOActor):
 
         self.router_replay = self.config.router_replay
         self.enable_routing_replay = self.router_replay.mode != "disabled"
+        
+        # Initialize mini_layer_topk_idx_list if router replay is enabled
         if self.enable_routing_replay:
             self.mini_layer_topk_idx_list = []
+        
+        # Initialize logits saver if record_file is specified (独立于 router_replay mode)
+        if self.router_replay.record_file is not None:
+            self.logits_saver = RouterReplayLogitsSaver(self.router_replay.record_file)
+            self.enable_logits_saving = True
+            self.training_step = 0  # Track training steps for file naming
+            self.save_frequency = self.router_replay.save_frequency
+            logger.info(f"Router logits saving enabled. Save directory: {self.router_replay.record_file}, frequency: every {self.save_frequency} step(s)")
+        else:
+            self.logits_saver = None
+            self.enable_logits_saving = False
+            self.save_frequency = 1
 
         config = get_model_config(self.actor_module[0])
         print(config)
@@ -736,6 +751,10 @@ class MegatronPPOActor(BasePPOActor):
             and users have to combine the output in each dp rank manually.
 
         """
+        # Set cache action to TRAINING phase
+        if self.enable_logits_saving:
+            RouterReplay.set_cache_action(RouterReplayCacheAction.TRAINING)
+        
         metrics = {}
         if self.use_torch_profiler and self.prof and self.prof.enable:
             self.prof.start()
@@ -784,6 +803,39 @@ class MegatronPPOActor(BasePPOActor):
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.clear_global_router_replay_action()
                 RouterReplay.clear_global_indices()
+
+        # Save logits cache for this training step
+        if self.enable_logits_saving:
+            logits_cache = RouterReplay.get_and_clear_logits_cache()
+            
+            # Check if should save this step based on save_frequency
+            should_save = (self.training_step % self.save_frequency == 0)
+            
+            # Only save if there's data and frequency matches
+            if should_save and (logits_cache["compute_log_prob"] or logits_cache["training"]):
+                # Step 1: Gather logits across TP group (only TP rank 0 will have data after this)
+                if mpu.get_tensor_model_parallel_world_size() > 1:
+                    logits_cache = RouterReplayLogitsSaver.gather_logits_from_tp_group(logits_cache)
+                
+                # Step 2: Gather logits across DP group (only DP rank 0 will have data after this)
+                # Only TP rank 0 participates in DP gathering
+                if mpu.get_tensor_model_parallel_rank() == 0:
+                    if mpu.get_data_parallel_world_size() > 1:
+                        logits_cache = RouterReplayLogitsSaver.gather_logits_from_dp_group(logits_cache)
+                    
+                    # Step 3: Save asynchronously (only on DP rank 0 and TP rank 0)
+                    if mpu.get_data_parallel_rank() == 0:
+                        step_name = f"training_{self.training_step}"
+                        self.logits_saver.save_logits_async(logits_cache, step_name)
+                        logger.info(f"Scheduled async save for training step {self.training_step}")
+            elif not should_save:
+                logger.debug(f"Skipping save for training step {self.training_step} (frequency={self.save_frequency})")
+            
+            # Increment training step
+            self.training_step += 1
+            
+            # Clear cache action
+            RouterReplay.clear_cache_action()
 
         # add empty cache after each compute
         if self.use_torch_profiler and self.prof and self.prof.enable:

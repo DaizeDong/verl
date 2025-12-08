@@ -1,0 +1,240 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Utilities for saving router replay logits to disk.
+Handles distributed training scenarios (DP, TP, PP) and asynchronous saving.
+"""
+
+import logging
+import os
+import threading
+from typing import Dict, List, Tuple
+
+import torch
+from torch import no_grad
+
+from megatron.core import parallel_state as mpu
+
+logger = logging.getLogger(__name__)
+
+
+class RouterReplayLogitsSaver:
+    """
+    Handler for saving router replay logits with support for:
+    - Distributed training (DP, TP, PP)
+    - Asynchronous saving to reduce training latency
+    - CPU memory management
+    """
+
+    def __init__(self, save_dir: str):
+        """
+        Args:
+            save_dir: Directory to save logits files
+        """
+        self.save_dir = save_dir
+        self.save_threads = []
+        
+        # Create directory only on global rank 0 (DP rank 0, TP rank 0, PP rank 0)
+        if (mpu.get_data_parallel_rank() == 0 and 
+            mpu.get_tensor_model_parallel_rank() == 0 and 
+            mpu.get_pipeline_model_parallel_rank() == 0):
+            os.makedirs(save_dir, exist_ok=True)
+            logger.info(f"Router replay logits will be saved to: {save_dir}")
+    
+    def _save_logits_sync(self, logits_data: Dict[str, List[Tuple[int, torch.Tensor]]], step):
+        """
+        Synchronously save logits data to disk.
+        
+        Args:
+            logits_data: Dict with 'compute_log_prob' and 'training' keys
+            step: Current training step (int or str)
+        """
+        try:
+            # Get parallel ranks
+            tp_rank = mpu.get_tensor_model_parallel_rank()
+            pp_rank = mpu.get_pipeline_model_parallel_rank()
+            
+            # Prepare filename without dp_rank (since we merge across DP)
+            filename = f"{step}_tp{tp_rank}_pp{pp_rank}.pt"
+            filepath = os.path.join(self.save_dir, filename)
+            
+            # Convert list of tuples to structured dict
+            save_dict = {
+                "step": step,
+                "tp_rank": tp_rank,
+                "pp_rank": pp_rank,
+                "dp_world_size": mpu.get_data_parallel_world_size(),
+                "compute_log_prob": {},
+                "training": {},
+            }
+            
+            # Organize by layer index
+            for layer_idx, logits in logits_data.get("compute_log_prob", []):
+                if layer_idx not in save_dict["compute_log_prob"]:
+                    save_dict["compute_log_prob"][layer_idx] = []
+                save_dict["compute_log_prob"][layer_idx].append(logits)
+            
+            for layer_idx, logits in logits_data.get("training", []):
+                if layer_idx not in save_dict["training"]:
+                    save_dict["training"][layer_idx] = []
+                save_dict["training"][layer_idx].append(logits)
+            
+            # Concatenate multiple micro-batches if present
+            for phase in ["compute_log_prob", "training"]:
+                for layer_idx in save_dict[phase]:
+                    if len(save_dict[phase][layer_idx]) > 0:
+                        save_dict[phase][layer_idx] = torch.cat(save_dict[phase][layer_idx], dim=0)
+            
+            # Save to disk
+            torch.save(save_dict, filepath)
+            logger.info(f"Saved router replay logits to {filepath}")
+            logger.info(f"  File contains: compute_log_prob={len(save_dict['compute_log_prob'])} layers, "
+                       f"training={len(save_dict['training'])} layers")
+            
+        except Exception as e:
+            logger.error(f"Failed to save router replay logits for step {step}: {e}")
+    
+    def save_logits_async(self, logits_data: Dict[str, List[Tuple[int, torch.Tensor]]], step):
+        """
+        Asynchronously save logits data to disk to reduce training latency.
+        
+        Args:
+            logits_data: Dict with 'compute_log_prob' and 'training' keys
+            step: Current training step (int or str)
+        """
+        # Debug: log what we're about to save
+        logger.info(f"[save_logits_async] Step {step}: "
+                   f"compute_log_prob={len(logits_data.get('compute_log_prob', []))} items, "
+                   f"training={len(logits_data.get('training', []))} items")
+        
+        # Create a deep copy to avoid data corruption during async save
+        logits_data_copy = {
+            "compute_log_prob": [(idx, tensor.clone()) for idx, tensor in logits_data.get("compute_log_prob", [])],
+            "training": [(idx, tensor.clone()) for idx, tensor in logits_data.get("training", [])],
+        }
+        
+        logger.info(f"[save_logits_async] After copy: "
+                   f"compute_log_prob={len(logits_data_copy['compute_log_prob'])} items, "
+                   f"training={len(logits_data_copy['training'])} items")
+        
+        # Start save thread
+        save_thread = threading.Thread(
+            target=self._save_logits_sync,
+            args=(logits_data_copy, step),
+            daemon=True
+        )
+        save_thread.start()
+        self.save_threads.append(save_thread)
+        
+        # Clean up finished threads
+        self.save_threads = [t for t in self.save_threads if t.is_alive()]
+    
+    def wait_all_saves(self):
+        """Wait for all async save operations to complete."""
+        for thread in self.save_threads:
+            thread.join()
+        self.save_threads = []
+        logger.info("All router replay logits saved successfully")
+    
+    @staticmethod
+    @no_grad()
+    def gather_logits_from_tp_group(logits_data: Dict[str, List[Tuple[int, torch.Tensor]]]) -> Dict[str, List[Tuple[int, torch.Tensor]]]:
+        """
+        Note: Router logits are NOT sharded across TP ranks in Megatron MoE.
+        
+        In Megatron MoE:
+        - Router logits shape: [tokens, num_experts]
+        - num_experts dimension is NOT split by TP (Tensor Parallel)
+        - Experts are split by EP (Expert Parallel), not TP
+        - Each TP rank has identical router logits
+        
+        Therefore, we only need to save on TP rank 0 to avoid duplicate saves.
+        No gathering is needed since all TP ranks have the same data.
+        
+        Args:
+            logits_data: Local logits data (identical across TP ranks)
+            
+        Returns:
+            logits_data on TP rank 0, empty dict on other ranks
+        """
+        tp_world_size = mpu.get_tensor_model_parallel_world_size()
+        if tp_world_size == 1:
+            return logits_data
+        
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        
+        # Router logits are identical across TP ranks, so only return data on rank 0
+        # to avoid duplicate saves
+        return logits_data if tp_rank == 0 else {"compute_log_prob": [], "training": []}
+    
+    @staticmethod
+    @no_grad()
+    def gather_logits_from_dp_group(logits_data: Dict[str, List[Tuple[int, torch.Tensor]]]) -> Dict[str, List[Tuple[int, torch.Tensor]]]:
+        """
+        Gather logits across data parallel group and concatenate along batch dimension.
+        Only DP rank 0 will have the complete data.
+        
+        Args:
+            logits_data: Local logits data from this DP rank
+            
+        Returns:
+            Gathered logits data (only valid on DP rank 0)
+        """
+        dp_world_size = mpu.get_data_parallel_world_size()
+        if dp_world_size == 1:
+            return logits_data
+        
+        dp_rank = mpu.get_data_parallel_rank()
+        dp_group = mpu.get_data_parallel_group()
+        
+        gathered_data = {"compute_log_prob": [], "training": []}
+        
+        for phase in ["compute_log_prob", "training"]:
+            phase_data = logits_data.get(phase, [])
+            
+            if len(phase_data) == 0:
+                continue
+            
+            # Organize by layer index first
+            layer_dict = {}
+            for layer_idx, logits in phase_data:
+                if layer_idx not in layer_dict:
+                    layer_dict[layer_idx] = []
+                layer_dict[layer_idx].append(logits)
+            
+            # Concatenate micro-batches for each layer
+            for layer_idx in sorted(layer_dict.keys()):
+                local_logits = torch.cat(layer_dict[layer_idx], dim=0)  # [local_tokens, num_experts]
+                
+                # Move to GPU for all_gather (NCCL backend requires GPU tensors)
+                local_logits_gpu = local_logits.to(torch.cuda.current_device())
+                
+                # Gather logits from all DP ranks
+                gathered_logits_list = [torch.zeros_like(local_logits_gpu) for _ in range(dp_world_size)]
+                torch.distributed.all_gather(gathered_logits_list, local_logits_gpu, group=dp_group)
+                
+                if dp_rank == 0:
+                    # Concatenate along batch/token dimension and move back to CPU
+                    combined_logits = torch.cat(gathered_logits_list, dim=0).cpu()  # [total_tokens, num_experts]
+                    gathered_data[phase].append((layer_idx, combined_logits))
+                    
+                    # Explicitly delete GPU tensors to free memory
+                    del gathered_logits_list
+                
+                # Delete local GPU tensor
+                del local_logits_gpu
+        
+        return gathered_data if dp_rank == 0 else {"compute_log_prob": [], "training": []}
+

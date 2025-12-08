@@ -14,6 +14,8 @@
 from enum import Enum
 
 import torch
+from torch import no_grad
+
 from megatron.core.transformer.moe.moe_utils import (
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
@@ -31,6 +33,12 @@ class RouterReplayAction(Enum):
     REPLAY_BACKWARD = "replay_backward"
 
 
+class RouterReplayCacheAction(Enum):
+    """Enum for logits cache recording phases."""
+    COMPUTE_LOG_PROB = "compute_log_prob"
+    TRAINING = "training"
+
+
 class RouterReplay:
     """
     A class to manage the recording and replaying of MoE routing decisions.
@@ -40,6 +48,17 @@ class RouterReplay:
 
     # Static variable to hold all router instances, one per MoE layer.
     router_instances = []
+    
+    # Global logits cache for recording
+    # Structure: {"compute_log_prob": [], "training": []}
+    # Each list contains tuples of (layer_idx, logits_cpu)
+    logits_cache = {"compute_log_prob": [], "training": []}
+    
+    # Flag to enable/disable logits recording
+    enable_logits_recording = False
+    
+    # Current cache action phase
+    current_cache_action = None
 
     @staticmethod
     def set_replay_data(all_layers_topk_indices: list):
@@ -77,6 +96,7 @@ class RouterReplay:
         self.recorded_topk_idx = None  # For recording
         self.router_replay_action = None  # Router replay action for this layer
         self.replay_backward_list = []  # List of tensors for backward pass replay
+        self.layer_idx = len(RouterReplay.router_instances)  # Layer index
         RouterReplay.router_instances.append(self)
 
     def set_target_indices(self, topk_indices: torch.Tensor):
@@ -117,6 +137,87 @@ class RouterReplay:
         """Clears the router replay action for all router instances."""
         for router in RouterReplay.router_instances:
             router.clear_router_replay_action()
+    
+    @staticmethod
+    def set_cache_action(cache_action: RouterReplayCacheAction):
+        """Set the current cache action phase."""
+        RouterReplay.current_cache_action = cache_action
+        RouterReplay.enable_logits_recording = True
+    
+    @staticmethod
+    def clear_cache_action():
+        """Clear the current cache action phase."""
+        RouterReplay.current_cache_action = None
+        RouterReplay.enable_logits_recording = False
+    
+    @staticmethod
+    def get_and_clear_logits_cache():
+        """
+        Get the current logits cache and clear it.
+        Returns a dict with 'compute_log_prob' and 'training' keys.
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Debug: check cache before clearing
+        logger.info(f"[get_and_clear_logits_cache] Before clear - "
+                   f"compute_log_prob: {len(RouterReplay.logits_cache['compute_log_prob'])} items, "
+                   f"training: {len(RouterReplay.logits_cache['training'])} items")
+        
+        cache = RouterReplay.logits_cache
+        RouterReplay.logits_cache = {"compute_log_prob": [], "training": []}
+        return cache
+    
+    @staticmethod
+    @no_grad()
+    def record_logits(logits: torch.Tensor, layer_idx: int):
+        """
+        Record logits to cache (moved to CPU to save GPU memory).
+        Records to the appropriate cache based on current_cache_action.
+        
+        Args:
+            logits: The logits tensor from routing computation
+            layer_idx: The layer index
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Debug: log first call
+        if layer_idx == 0:
+            logger.info(f"[record_logits] Layer 0: enable_recording={RouterReplay.enable_logits_recording}, "
+                       f"cache_action={RouterReplay.current_cache_action}, "
+                       f"logits_shape={logits.shape}")
+        
+        if not RouterReplay.enable_logits_recording or RouterReplay.current_cache_action is None:
+            if layer_idx == 0:
+                logger.warning(f"[record_logits] Skipping - enable_recording={RouterReplay.enable_logits_recording}, "
+                             f"cache_action={RouterReplay.current_cache_action}")
+            return
+        
+        # Move to CPU to avoid GPU memory pressure
+        logits_cpu = logits.detach().cpu()
+        
+        if RouterReplay.current_cache_action == RouterReplayCacheAction.COMPUTE_LOG_PROB:
+            RouterReplay.logits_cache["compute_log_prob"].append((layer_idx, logits_cpu))
+            if layer_idx == 0:
+                logger.info(f"[record_logits] Recorded to compute_log_prob cache. Current size: {len(RouterReplay.logits_cache['compute_log_prob'])}")
+        elif RouterReplay.current_cache_action == RouterReplayCacheAction.TRAINING:
+            RouterReplay.logits_cache["training"].append((layer_idx, logits_cpu))
+            if layer_idx == 0:
+                logger.info(f"[record_logits] Recorded to training cache. Current size: {len(RouterReplay.logits_cache['training'])}")
+    
+    @staticmethod
+    def get_debug_info():
+        """Get debug information about current state."""
+        return {
+            "enable_logits_recording": RouterReplay.enable_logits_recording,
+            "current_cache_action": RouterReplay.current_cache_action,
+            "num_router_instances": len(RouterReplay.router_instances),
+            "cache_sizes": {
+                "compute_log_prob": len(RouterReplay.logits_cache.get("compute_log_prob", [])),
+                "training": len(RouterReplay.logits_cache.get("training", [])),
+            }
+        }
 
 
 def _patched_topk_routing_with_score_function(
@@ -130,6 +231,7 @@ def _patched_topk_routing_with_score_function(
     fused: bool,
     router_replay: RouterReplay,
     scaling_factor: float,
+    layer_number: int = None,  # Added: for logits recording without router_replay
 ):
     """
     Patched version of topk_routing_with_score_function that supports router replay.
@@ -150,20 +252,44 @@ def _patched_topk_routing_with_score_function(
             return torch.topk(scores, k=topk, dim=1)
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
-        # Default behavior if no replay is active
-
+        # Get layer_idx from router_replay or use layer_number directly
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Determine layer_idx for logits recording
+        if router_replay is not None:
+            layer_idx = router_replay.layer_idx  # 0-indexed (from list position)
+        elif layer_number is not None:
+            layer_idx = layer_number - 1  # Convert from 1-indexed to 0-indexed
+        else:
+            layer_idx = 0  # Fallback
+        
         routing_action = router_replay.router_replay_action if router_replay is not None else None
+        
+        # Record logits regardless of routing_action (if cache_action is set)
+        # This allows recording even when router_replay is disabled
+        if RouterReplay.enable_logits_recording and RouterReplay.current_cache_action is not None:
+            RouterReplay.record_logits(scores, layer_idx)
+        
+        # Debug: log first call
+        if layer_idx == 0:
+            logger.info(f"[compute_topk] Layer 0: routing_action={routing_action}, "
+                       f"router_replay={router_replay is not None}, layer_number={layer_number}, "
+                       f"will_record_logits={RouterReplay.enable_logits_recording}")
 
         if routing_action is None:
+            # No router replay, just compute topk normally
             return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
 
         if routing_action == RouterReplayAction.RECORD:
+            # Compute topk normally and record the indices
             probs, top_indices = _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
             if router_replay is not None:
                 router_replay.record_indices(top_indices)
             return probs, top_indices
 
         elif routing_action == RouterReplayAction.REPLAY_FORWARD:
+            
             if router_replay is None or router_replay.target_topk_idx is None:
                 # Fallback if replay data is not available
                 return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
@@ -261,6 +387,7 @@ def patched_routing(self, logits: torch.Tensor):
             expert_bias=self.expert_bias,
             fused=self.config.moe_router_fusion,
             router_replay=self.router_replay,
+            layer_number=self.layer_number,  # Pass layer_number for logits recording
         )
 
     # Apply token dropping to probs and routing_map.

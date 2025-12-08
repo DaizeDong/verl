@@ -119,3 +119,6 @@ router_replay:
   # File path to load recorded routing decisions for replay
   # Required when mode is 'replay'
   replay_file: null
+  
+  # Save router logits every N steps
+  save_frequency: 1
