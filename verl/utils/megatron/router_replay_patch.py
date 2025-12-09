@@ -195,7 +195,13 @@ class RouterReplay:
             return
         
         # Move to CPU to avoid GPU memory pressure
-        logits_cpu = logits.detach().cpu()
+        # Make a contiguous copy to ensure clean memory layout
+        logits_cpu = logits.detach().cpu().contiguous()
+        
+        # Force synchronization if on CUDA to ensure data is fully copied to CPU
+        # This allows GPU memory to be freed immediately
+        # if logits.is_cuda:
+        #     torch.cuda.synchronize()
         
         if RouterReplay.current_cache_action == RouterReplayCacheAction.COMPUTE_LOG_PROB:
             RouterReplay.logits_cache["compute_log_prob"].append((layer_idx, logits_cpu))

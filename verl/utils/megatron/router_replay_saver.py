@@ -186,8 +186,11 @@ class RouterReplayLogitsSaver:
         Gather logits across data parallel group and concatenate along batch dimension.
         Only DP rank 0 will have the complete data.
         
+        This version uses CPU-based gathering to avoid GPU OOM issues.
+        Uses torch.distributed.gather_object to collect data directly on CPU.
+        
         Args:
-            logits_data: Local logits data from this DP rank
+            logits_data: Local logits data from this DP rank (tensors on CPU)
             
         Returns:
             Gathered logits data (only valid on DP rank 0)
@@ -201,40 +204,55 @@ class RouterReplayLogitsSaver:
         
         gathered_data = {"compute_log_prob": [], "training": []}
         
-        for phase in ["compute_log_prob", "training"]:
-            phase_data = logits_data.get(phase, [])
-            
-            if len(phase_data) == 0:
-                continue
-            
-            # Organize by layer index first
-            layer_dict = {}
-            for layer_idx, logits in phase_data:
-                if layer_idx not in layer_dict:
-                    layer_dict[layer_idx] = []
-                layer_dict[layer_idx].append(logits)
-            
-            # Concatenate micro-batches for each layer
-            for layer_idx in sorted(layer_dict.keys()):
-                local_logits = torch.cat(layer_dict[layer_idx], dim=0)  # [local_tokens, num_experts]
+        try:
+            for phase in ["compute_log_prob", "training"]:
+                phase_data = logits_data.get(phase, [])
                 
-                # Move to GPU for all_gather (NCCL backend requires GPU tensors)
-                local_logits_gpu = local_logits.to(torch.cuda.current_device())
+                # Even if empty, participate in collective operation
+                # Prepare local data: concatenate micro-batches for each layer
+                layer_dict = {}
+                for layer_idx, logits in phase_data:
+                    if layer_idx not in layer_dict:
+                        layer_dict[layer_idx] = []
+                    # Ensure logits are on CPU and contiguous
+                    logits_cpu = logits.cpu().contiguous() if logits.is_cuda else logits.contiguous()
+                    layer_dict[layer_idx].append(logits_cpu)
                 
-                # Gather logits from all DP ranks
-                gathered_logits_list = [torch.zeros_like(local_logits_gpu) for _ in range(dp_world_size)]
-                torch.distributed.all_gather(gathered_logits_list, local_logits_gpu, group=dp_group)
+                # Concatenate micro-batches for each layer
+                local_layer_data = []
+                for layer_idx in sorted(layer_dict.keys()):
+                    local_logits = torch.cat(layer_dict[layer_idx], dim=0)  # [local_tokens, num_experts]
+                    local_layer_data.append((layer_idx, local_logits))
                 
+                # Use gather_object to collect data on CPU (avoids GPU memory spike)
+                # This works with gloo backend or when objects are serializable
                 if dp_rank == 0:
-                    # Concatenate along batch/token dimension and move back to CPU
-                    combined_logits = torch.cat(gathered_logits_list, dim=0).cpu()  # [total_tokens, num_experts]
-                    gathered_data[phase].append((layer_idx, combined_logits))
+                    gather_list = [None] * dp_world_size
+                    torch.distributed.gather_object(local_layer_data, gather_list, dst=0, group=dp_group)
                     
-                    # Explicitly delete GPU tensors to free memory
-                    del gathered_logits_list
-                
-                # Delete local GPU tensor
-                del local_logits_gpu
+                    # Merge data from all DP ranks
+                    layer_combined = {}
+                    for rank_data in gather_list:
+                        if rank_data is None:
+                            continue
+                        for layer_idx, logits in rank_data:
+                            if layer_idx not in layer_combined:
+                                layer_combined[layer_idx] = []
+                            layer_combined[layer_idx].append(logits)
+                    
+                    # Concatenate along batch/token dimension
+                    for layer_idx in sorted(layer_combined.keys()):
+                        combined_logits = torch.cat(layer_combined[layer_idx], dim=0)  # [total_tokens, num_experts]
+                        gathered_data[phase].append((layer_idx, combined_logits))
+                    
+                    logger.info(f"[gather_logits_from_dp_group] {phase}: gathered {len(layer_combined)} layers from {dp_world_size} DP ranks")
+                else:
+                    torch.distributed.gather_object(local_layer_data, None, dst=0, group=dp_group)
+        
+        except Exception as e:
+            logger.error(f"[gather_logits_from_dp_group] Error during gathering: {e}")
+            logger.error(f"  DP rank: {dp_rank}, DP world size: {dp_world_size}")
+            raise
         
         return gathered_data if dp_rank == 0 else {"compute_log_prob": [], "training": []}
 
