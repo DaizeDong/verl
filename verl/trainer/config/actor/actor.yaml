@@ -239,7 +239,7 @@ router_replay:
   # File path to load recorded routing decisions for replay
   # Required when mode is 'replay'
   replay_file: null
-  
+
   # Save router logits every N steps (default: 1, save every step)
   # Set to higher values to reduce I/O overhead (e.g., 10 to save every 10 steps)
   save_frequency: 1

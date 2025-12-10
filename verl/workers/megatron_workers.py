@@ -19,7 +19,6 @@ import datetime
 import logging
 import os
 import time
-import warnings
 from typing import Any, Optional
 
 import psutil
@@ -290,11 +289,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         self.enable_routing_replay = False
         self.enable_logits_saving = False
-        
+
         if self._is_actor:
             self.router_replay = self.config.actor.router_replay
             self.enable_routing_replay = self.router_replay.mode != "disabled"
-            
+
             # Initialize logits saver if record_file is specified (独立于 router_replay)
             if self.router_replay.record_file not in [None, ""]:
                 from verl.utils.megatron.router_replay_saver import RouterReplayLogitsSaver
@@ -483,7 +482,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         # TODO: add more optimizer args into config
         if self._is_actor:
-            optim_config_megatron = init_megatron_optim_config(optim_config, fp16=self.dtype == torch.float16)
+            optim_config_megatron = init_megatron_optim_config(
+                optim_config,
+                use_distributed_optimizer=wrap_config.use_distributed_optimizer,
+                fp16=self.dtype == torch.float16,
+            )
             actor_optimizer = get_megatron_optimizer(model=actor_module, config=optim_config_megatron)
             actor_optimizer_scheduler = get_megatron_optimizer_param_scheduler(
                 optimizer=actor_optimizer, config=optim_config
@@ -575,7 +578,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             if self.enable_routing_replay:
                 override_transformer_config["enable_routing_replay"] = True
                 logger.info(f"[Rank {self.rank}] Set enable_routing_replay=True in transformer_config")
-            
+
             # Log logits_saving status for debugging
             if self.enable_logits_saving:
                 logger.info(f"[Rank {self.rank}] Logits saving enabled (router_replay={self.enable_routing_replay})")
@@ -692,6 +695,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
         aggressive_empty_cache(force_sync=True)
+        set_expandable_segments(False)
 
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor.actor_module, load_grad=False)
@@ -710,8 +714,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 self.tf_config,
                 self.layer_name_mapping,
             )
-
-        set_expandable_segments(False)
 
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
@@ -914,17 +916,17 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # Save logits cache for this compute_log_prob call (only if should_save)
         if should_save:
             from verl.utils.megatron.router_replay_saver import RouterReplayLogitsSaver
-            
+
             # Debug: Check state before getting cache
             debug_info = RouterReplay.get_debug_info()
             logger.info(f"[Rank {self.rank}] Before get_and_clear_logits_cache: {debug_info}")
-            
+
             logits_cache = RouterReplay.get_and_clear_logits_cache()
             logger.info(
                 f"[Rank {self.rank}] Logits cache sizes - compute_log_prob: {len(logits_cache['compute_log_prob'])}, "
                 f"training: {len(logits_cache['training'])}"
             )
-            
+
             if global_step is not None and global_step >= 0:
                 step_name = f"log_prob_{global_step}"
             else:
@@ -935,20 +937,20 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 # Step 1: Gather logits across TP group (only TP rank 0 will have data after this)
                 if mpu.get_tensor_model_parallel_world_size() > 1:
                     logits_cache = RouterReplayLogitsSaver.gather_logits_from_tp_group(logits_cache)
-                
+
                 # Step 2: Gather logits across DP group (only DP rank 0 will have data after this)
                 # Only TP rank 0 participates in DP gathering
                 if mpu.get_tensor_model_parallel_rank() == 0:
                     if mpu.get_data_parallel_world_size() > 1:
                         logits_cache = RouterReplayLogitsSaver.gather_logits_from_dp_group(logits_cache)
-                    
+
                     # Step 3: Save asynchronously (only on DP rank 0 and TP rank 0)
                     if mpu.get_data_parallel_rank() == 0:
                         self.logits_saver.save_logits_async(logits_cache, step_name)
                         logger.info(f"Scheduled async save for {step_name}")
             elif not should_save:
                 logger.debug(f"Skipping save for step {global_step} (frequency={self.save_frequency})")
-            
+
             # Clear cache action
             RouterReplay.clear_cache_action()
 
@@ -995,6 +997,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def async_calls_finalize_fn_exec(self, blocking=False):
+        from megatron.core.dist_checkpointing.strategies.base import async_calls
+
+        async_calls.maybe_finalize_async_calls(blocking=blocking)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def start_profile(self, **kwargs) -> None:
@@ -1198,7 +1206,11 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
             print_model_size(critic_module[0])
 
         # TODO: add more optimizer args into config
-        optim_config_megatron = init_megatron_optim_config(optim_config, fp16=self.dtype == torch.float16)
+        optim_config_megatron = init_megatron_optim_config(
+            optim_config,
+            use_distributed_optimizer=wrap_config.use_distributed_optimizer,
+            fp16=self.dtype == torch.float16,
+        )
         critic_optimizer = get_megatron_optimizer(model=critic_module, config=optim_config_megatron)
         critic_optimizer_scheduler = get_megatron_optimizer_param_scheduler(
             optimizer=critic_optimizer, config=optim_config

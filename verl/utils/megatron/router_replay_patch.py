@@ -11,16 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import warnings
 from enum import Enum
 
 import torch
 from torch import no_grad
 
-from megatron.core.transformer.moe.moe_utils import (
-    apply_router_token_dropping,
-    compute_routing_scores_for_aux_loss,
-    group_limited_topk,
-)
+try:
+    from megatron.core.transformer.moe.moe_utils import (
+        apply_router_token_dropping,
+        compute_routing_scores_for_aux_loss,
+        group_limited_topk,
+    )
+except ImportError:
+    warnings.warn("NPU not support router replay for now.", stacklevel=2)
+    pass
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -48,15 +53,15 @@ class RouterReplay:
 
     # Static variable to hold all router instances, one per MoE layer.
     router_instances = []
-    
+
     # Global logits cache for recording
     # Structure: {"compute_log_prob": [], "training": [], "router_weights": []}
     # Each list contains tuples of (layer_idx, tensor_cpu), router_weights stores parameter tensors
     logits_cache = {"compute_log_prob": [], "training": [], "router_weights": []}
-    
+
     # Flag to enable/disable logits recording
     enable_logits_recording = False
-    
+
     # Current cache action phase
     current_cache_action = None
 
@@ -137,19 +142,19 @@ class RouterReplay:
         """Clears the router replay action for all router instances."""
         for router in RouterReplay.router_instances:
             router.clear_router_replay_action()
-    
+
     @staticmethod
     def set_cache_action(cache_action: RouterReplayCacheAction):
         """Set the current cache action phase."""
         RouterReplay.current_cache_action = cache_action
         RouterReplay.enable_logits_recording = True
-    
+
     @staticmethod
     def clear_cache_action():
         """Clear the current cache action phase."""
         RouterReplay.current_cache_action = None
         RouterReplay.enable_logits_recording = False
-    
+
     @staticmethod
     def get_and_clear_logits_cache():
         """
@@ -158,13 +163,13 @@ class RouterReplay:
         """
         import logging
         logger = logging.getLogger(__name__)
-        
+
         # Debug: check cache before clearing
         logger.info(f"[get_and_clear_logits_cache] Before clear - "
                    f"compute_log_prob: {len(RouterReplay.logits_cache['compute_log_prob'])} items, "
                    f"training: {len(RouterReplay.logits_cache['training'])} items, "
                    f"router_weights: {len(RouterReplay.logits_cache['router_weights'])} items")
-        
+
         cache = RouterReplay.logits_cache
         RouterReplay.logits_cache = {"compute_log_prob": [], "training": [], "router_weights": []}
         return cache
@@ -178,7 +183,7 @@ class RouterReplay:
         """
         if not RouterReplay.enable_logits_recording or RouterReplay.current_cache_action is None:
             return
-        
+
         if RouterReplay.current_cache_action == RouterReplayCacheAction.TRAINING:
             weights_cpu = weights.detach().cpu().contiguous()
             RouterReplay.logits_cache["router_weights"].append((layer_idx, weights_cpu))
@@ -189,35 +194,35 @@ class RouterReplay:
         """
         Record logits to cache (moved to CPU to save GPU memory).
         Records to the appropriate cache based on current_cache_action.
-        
+
         Args:
             logits: The logits tensor from routing computation
             layer_idx: The layer index
         """
         import logging
         logger = logging.getLogger(__name__)
-        
+
         # Debug: log first call
         if layer_idx == 0:
             logger.info(f"[record_logits] Layer 0: enable_recording={RouterReplay.enable_logits_recording}, "
                        f"cache_action={RouterReplay.current_cache_action}, "
                        f"logits_shape={logits.shape}")
-        
+
         if not RouterReplay.enable_logits_recording or RouterReplay.current_cache_action is None:
             if layer_idx == 0:
                 logger.warning(f"[record_logits] Skipping - enable_recording={RouterReplay.enable_logits_recording}, "
                              f"cache_action={RouterReplay.current_cache_action}")
             return
-        
+
         # Move to CPU to avoid GPU memory pressure
         # Make a contiguous copy to ensure clean memory layout
         logits_cpu = logits.detach().cpu().contiguous()
-        
+
         # Force synchronization if on CUDA to ensure data is fully copied to CPU
         # This allows GPU memory to be freed immediately
         # if logits.is_cuda:
         #     torch.cuda.synchronize()
-        
+
         if RouterReplay.current_cache_action == RouterReplayCacheAction.COMPUTE_LOG_PROB:
             RouterReplay.logits_cache["compute_log_prob"].append((layer_idx, logits_cpu))
             if layer_idx == 0:
@@ -226,7 +231,7 @@ class RouterReplay:
             RouterReplay.logits_cache["training"].append((layer_idx, logits_cpu))
             if layer_idx == 0:
                 logger.info(f"[record_logits] Recorded to training cache. Current size: {len(RouterReplay.logits_cache['training'])}")
-    
+
     @staticmethod
     def get_debug_info():
         """Get debug information about current state."""
@@ -277,7 +282,7 @@ def _patched_topk_routing_with_score_function(
         # Get layer_idx from router_replay or use layer_number directly
         import logging
         logger = logging.getLogger(__name__)
-        
+
         # Determine layer_idx for logits recording
         if router_replay is not None:
             layer_idx = router_replay.layer_idx  # 0-indexed (from list position)
@@ -285,14 +290,14 @@ def _patched_topk_routing_with_score_function(
             layer_idx = layer_number - 1  # Convert from 1-indexed to 0-indexed
         else:
             layer_idx = 0  # Fallback
-        
+
         routing_action = router_replay.router_replay_action if router_replay is not None else None
-        
+
         # Record logits regardless of routing_action (if cache_action is set)
         # This allows recording even when router_replay is disabled
         if RouterReplay.enable_logits_recording and RouterReplay.current_cache_action is not None:
             RouterReplay.record_logits(scores, layer_idx)
-        
+
         # Debug: log first call
         if layer_idx == 0:
             logger.info(f"[compute_topk] Layer 0: routing_action={routing_action}, "
@@ -311,7 +316,7 @@ def _patched_topk_routing_with_score_function(
             return probs, top_indices
 
         elif routing_action == RouterReplayAction.REPLAY_FORWARD:
-            
+
             if router_replay is None or router_replay.target_topk_idx is None:
                 # Fallback if replay data is not available
                 return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
