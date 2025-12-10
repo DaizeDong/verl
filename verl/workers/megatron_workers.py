@@ -19,6 +19,7 @@ import datetime
 import logging
 import os
 import time
+import warnings
 from typing import Any, Optional
 
 import psutil
@@ -750,7 +751,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="update_actor", logger=logger)
     @DistProfiler.annotate(color="red")
-    def update_actor(self, data: DataProto):
+    def update_actor(self, data: DataProto, global_step: int = None):
         assert self._is_actor
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)
@@ -763,7 +764,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["micro_batch_size"] = micro_batch_size
         dataloader = self.actor.make_minibatch_iterator(data=data)
         with Timer(name="update_policy", logger=None) as timer:
-            metrics = self.actor.update_policy(dataloader=dataloader)
+            metrics = self.actor.update_policy(dataloader=dataloader, global_step=global_step)
         delta_time = timer.last
         global_num_tokens = data.meta_info["global_token_num"]
         estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -865,7 +866,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="compute_log_prob", logger=logger)
     @DistProfiler.annotate(color="blue")
-    def compute_log_prob(self, data: DataProto):
+    def compute_log_prob(self, data: DataProto, global_step: Optional[int] = None):
         assert self._is_actor
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module, load_grad=False)
@@ -880,13 +881,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # Determine whether to record/save this compute_log_prob based on save_frequency
         should_save = False
         if self.enable_logits_saving:
-            global_step = -1
-            if data is not None and isinstance(data, DataProto):
-                global_step = data.meta_info.get("global_step", -1)
-            if global_step >= 0:
+            if global_step is not None and global_step >= 0:
                 should_save = (global_step % self.save_frequency == 0)
             else:
                 should_save = False  # Fallback: not record if step unknown
+                logger.warning(f"[Rank {self.rank}] compute_log_prob called without global_step, skipping logits saving.")
 
         if should_save:
             RouterReplay.set_cache_action(RouterReplayCacheAction.COMPUTE_LOG_PROB)
@@ -926,12 +925,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 f"training: {len(logits_cache['training'])}"
             )
             
-            # Prefer global_step passed via data.meta_info to survive resume from checkpoint
-            global_step = -1
-            if data is not None and isinstance(data, DataProto):
-                global_step = data.meta_info.get("global_step", -1)
-            
-            if global_step >= 0:
+            if global_step is not None and global_step >= 0:
                 step_name = f"log_prob_{global_step}"
             else:
                 step_name = f"log_prob_ts_{int(time.time())}"

@@ -739,7 +739,7 @@ class MegatronPPOActor(BasePPOActor):
         return losses_reduced
 
     @GPUMemoryLogger(role="megatron actor", logger=logger)
-    def update_policy(self, dataloader: Iterable[DataProto]) -> dict:
+    def update_policy(self, dataloader: Iterable[DataProto], global_step: int = None) -> dict:
         """Update the policy with an iterator of DataProto
 
         Args:
@@ -752,10 +752,12 @@ class MegatronPPOActor(BasePPOActor):
 
         """
         metrics = {}
+        # step used for frequency and naming; prefer external global_step if provided
+        step_for_save = self.training_step if global_step is None else global_step
         if self.use_torch_profiler and self.prof and self.prof.enable:
             self.prof.start()
         for mini_step, data in enumerate(dataloader):
-            should_save = self.enable_logits_saving and (self.training_step % self.save_frequency == 0)
+            should_save = self.enable_logits_saving and (step_for_save % self.save_frequency == 0)
             if should_save:
                 RouterReplay.set_cache_action(RouterReplayCacheAction.TRAINING)
             else:
@@ -820,15 +822,16 @@ class MegatronPPOActor(BasePPOActor):
                             logits_cache = RouterReplayLogitsSaver.gather_logits_from_dp_group(logits_cache)
 
                         if mpu.get_data_parallel_rank() == 0:
-                            step_name = f"training_{self.training_step}_mini{mini_step}"
+                            step_name = f"training_{step_for_save}_mini{mini_step}"
                             self.logits_saver.save_logits_async(logits_cache, step_name)
-                            logger.info(f"Scheduled async save for training step {self.training_step}, mini {mini_step}")
+                            logger.info(f"Scheduled async save for training step {step_for_save}, mini {mini_step}")
                 else:
-                    logger.debug(f"Skipping save for training step {self.training_step}, mini {mini_step} (frequency={self.save_frequency})")
+                    logger.debug(f"Skipping save for training step {step_for_save}, mini {mini_step} (frequency={self.save_frequency})")
 
         # Increment training step after all mini steps
         if self.enable_logits_saving:
-            self.training_step += 1
+            if global_step is None:
+                self.training_step += 1
             RouterReplay.clear_cache_action()
 
         # add empty cache after each compute

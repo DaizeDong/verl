@@ -1147,7 +1147,7 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch, global_step=self.global_steps)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
@@ -1248,7 +1248,7 @@ class RayPPOTrainer:
                             batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
                             # TODO: Make "temperature" single source of truth from generation.
                             batch.meta_info["temperature"] = rollout_config.temperature
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output = self.actor_rollout_wg.update_actor(batch, global_step=self.global_steps)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
