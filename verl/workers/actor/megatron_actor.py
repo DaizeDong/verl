@@ -167,7 +167,7 @@ class MegatronPPOActor(BasePPOActor):
             self.mini_layer_topk_idx_list = []
         
         # Initialize logits saver if record_file is specified (独立于 router_replay mode)
-        if self.router_replay.record_file is not None:
+        if self.router_replay.record_file not in [None, ""]:
             self.logits_saver = RouterReplayLogitsSaver(self.router_replay.record_file)
             self.enable_logits_saving = True
             self.training_step = 0  # Track training steps for file naming
@@ -751,16 +751,19 @@ class MegatronPPOActor(BasePPOActor):
             and users have to combine the output in each dp rank manually.
 
         """
-        # Set cache action to TRAINING phase
-        if self.enable_logits_saving:
-            RouterReplay.set_cache_action(RouterReplayCacheAction.TRAINING)
-        
         metrics = {}
         if self.use_torch_profiler and self.prof and self.prof.enable:
             self.prof.start()
-        for data in dataloader:
+        for mini_step, data in enumerate(dataloader):
+            should_save = self.enable_logits_saving and (self.training_step % self.save_frequency == 0)
+            if should_save:
+                RouterReplay.set_cache_action(RouterReplayCacheAction.TRAINING)
+            else:
+                RouterReplay.clear_cache_action()
+
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+
             self.actor_optimizer.zero_grad()
             # use use_contiguous_buffers_in_local_ddp and no overlap_dp_param_comm
             for chunk in self.actor_module:
@@ -804,37 +807,28 @@ class MegatronPPOActor(BasePPOActor):
                 RouterReplay.clear_global_router_replay_action()
                 RouterReplay.clear_global_indices()
 
-        # Save logits cache for this training step
+            # Save logits cache for this mini step (only when should_save)
+            if should_save:
+                logits_cache = RouterReplay.get_and_clear_logits_cache()
+
+                if should_save and (logits_cache["compute_log_prob"] or logits_cache["training"]):
+                    if mpu.get_tensor_model_parallel_world_size() > 1:
+                        logits_cache = RouterReplayLogitsSaver.gather_logits_from_tp_group(logits_cache)
+
+                    if mpu.get_tensor_model_parallel_rank() == 0:
+                        if mpu.get_data_parallel_world_size() > 1:
+                            logits_cache = RouterReplayLogitsSaver.gather_logits_from_dp_group(logits_cache)
+
+                        if mpu.get_data_parallel_rank() == 0:
+                            step_name = f"training_{self.training_step}_mini{mini_step}"
+                            self.logits_saver.save_logits_async(logits_cache, step_name)
+                            logger.info(f"Scheduled async save for training step {self.training_step}, mini {mini_step}")
+                else:
+                    logger.debug(f"Skipping save for training step {self.training_step}, mini {mini_step} (frequency={self.save_frequency})")
+
+        # Increment training step after all mini steps
         if self.enable_logits_saving:
-            logits_cache = RouterReplay.get_and_clear_logits_cache()
-            
-            # Check if should save this step based on save_frequency
-            should_save = (self.training_step % self.save_frequency == 0)
-            
-            # Only save if there's data and frequency matches
-            if should_save and (logits_cache["compute_log_prob"] or logits_cache["training"]):
-                # Step 1: Gather logits across TP group (only TP rank 0 will have data after this)
-                if mpu.get_tensor_model_parallel_world_size() > 1:
-                    logits_cache = RouterReplayLogitsSaver.gather_logits_from_tp_group(logits_cache)
-                
-                # Step 2: Gather logits across DP group (only DP rank 0 will have data after this)
-                # Only TP rank 0 participates in DP gathering
-                if mpu.get_tensor_model_parallel_rank() == 0:
-                    if mpu.get_data_parallel_world_size() > 1:
-                        logits_cache = RouterReplayLogitsSaver.gather_logits_from_dp_group(logits_cache)
-                    
-                    # Step 3: Save asynchronously (only on DP rank 0 and TP rank 0)
-                    if mpu.get_data_parallel_rank() == 0:
-                        step_name = f"training_{self.training_step}"
-                        self.logits_saver.save_logits_async(logits_cache, step_name)
-                        logger.info(f"Scheduled async save for training step {self.training_step}")
-            elif not should_save:
-                logger.debug(f"Skipping save for training step {self.training_step} (frequency={self.save_frequency})")
-            
-            # Increment training step
             self.training_step += 1
-            
-            # Clear cache action
             RouterReplay.clear_cache_action()
 
         # add empty cache after each compute

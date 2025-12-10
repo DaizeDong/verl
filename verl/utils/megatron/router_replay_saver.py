@@ -78,6 +78,7 @@ class RouterReplayLogitsSaver:
                 "dp_world_size": mpu.get_data_parallel_world_size(),
                 "compute_log_prob": {},
                 "training": {},
+                "router_weights": {},
             }
             
             # Organize by layer index
@@ -91,6 +92,11 @@ class RouterReplayLogitsSaver:
                     save_dict["training"][layer_idx] = []
                 save_dict["training"][layer_idx].append(logits)
             
+            for layer_idx, weights in logits_data.get("router_weights", []):
+                # Router weights are parameters; we keep the first occurrence
+                if layer_idx not in save_dict["router_weights"]:
+                    save_dict["router_weights"][layer_idx] = weights
+            
             # Concatenate multiple micro-batches if present
             for phase in ["compute_log_prob", "training"]:
                 for layer_idx in save_dict[phase]:
@@ -101,7 +107,7 @@ class RouterReplayLogitsSaver:
             torch.save(save_dict, filepath)
             logger.info(f"Saved router replay logits to {filepath}")
             logger.info(f"  File contains: compute_log_prob={len(save_dict['compute_log_prob'])} layers, "
-                       f"training={len(save_dict['training'])} layers")
+                       f"training={len(save_dict['training'])} layers, router_weights={len(save_dict['router_weights'])} layers")
             
         except Exception as e:
             logger.error(f"Failed to save router replay logits for step {step}: {e}")
@@ -123,6 +129,7 @@ class RouterReplayLogitsSaver:
         logits_data_copy = {
             "compute_log_prob": [(idx, tensor.clone()) for idx, tensor in logits_data.get("compute_log_prob", [])],
             "training": [(idx, tensor.clone()) for idx, tensor in logits_data.get("training", [])],
+            "router_weights": [(idx, tensor.clone()) for idx, tensor in logits_data.get("router_weights", [])],
         }
         
         logger.info(f"[save_logits_async] After copy: "
@@ -177,11 +184,11 @@ class RouterReplayLogitsSaver:
         
         # Router logits are identical across TP ranks, so only return data on rank 0
         # to avoid duplicate saves
-        return logits_data if tp_rank == 0 else {"compute_log_prob": [], "training": []}
+        return logits_data if tp_rank == 0 else {"compute_log_prob": [], "training": [], "router_weights": []}
     
     @staticmethod
     @no_grad()
-    def gather_logits_from_dp_group(logits_data: Dict[str, List[Tuple[int, torch.Tensor]]]) -> Dict[str, List[Tuple[int, torch.Tensor]]]:
+    def gather_logits_from_dp_group(logits_data: Dict[str, List[Tuple[int, torch.Tensor]]], max_tokens: int = None) -> Dict[str, List[Tuple[int, torch.Tensor]]]:
         """
         Gather logits across data parallel group and concatenate along batch dimension.
         Only DP rank 0 will have the complete data.
@@ -191,21 +198,46 @@ class RouterReplayLogitsSaver:
         
         Args:
             logits_data: Local logits data from this DP rank (tensors on CPU)
+            max_tokens: Maximum number of tokens to save globally. If set, each rank contributes
+                       max_tokens // dp_world_size tokens.
             
         Returns:
             Gathered logits data (only valid on DP rank 0)
         """
         dp_world_size = mpu.get_data_parallel_world_size()
+        
+        # Calculate tokens to keep per rank if max_tokens is set
+        tokens_per_rank = None
+        if max_tokens is not None:
+            tokens_per_rank = max_tokens // dp_world_size
+            if tokens_per_rank == 0:
+                logger.warning(f"max_tokens {max_tokens} is smaller than dp_world_size {dp_world_size}, setting to 1 per rank")
+                tokens_per_rank = 1
+        
         if dp_world_size == 1:
+            # If downsampling is requested even with DP=1
+            if tokens_per_rank is not None:
+                downsampled_data = {
+                    "compute_log_prob": [],
+                    "training": [],
+                    "router_weights": [],
+                }
+                for phase in ["compute_log_prob", "training", "router_weights"]:
+                    for layer_idx, logits in logits_data.get(phase, []):
+                        if logits.size(0) > tokens_per_rank:
+                            logits = logits[:tokens_per_rank]
+                        downsampled_data[phase].append((layer_idx, logits))
+                return downsampled_data
             return logits_data
         
         dp_rank = mpu.get_data_parallel_rank()
         dp_group = mpu.get_data_parallel_group()
         
-        gathered_data = {"compute_log_prob": [], "training": []}
+        gathered_data = {"compute_log_prob": [], "training": [], "router_weights": []}
         
         try:
-            for phase in ["compute_log_prob", "training"]:
+
+            for phase in ["compute_log_prob", "training", "router_weights"]:
                 phase_data = logits_data.get(phase, [])
                 
                 # Even if empty, participate in collective operation
@@ -222,6 +254,11 @@ class RouterReplayLogitsSaver:
                 local_layer_data = []
                 for layer_idx in sorted(layer_dict.keys()):
                     local_logits = torch.cat(layer_dict[layer_idx], dim=0)  # [local_tokens, num_experts]
+                    
+                    # Apply downsampling per rank if requested
+                    if tokens_per_rank is not None and local_logits.size(0) > tokens_per_rank:
+                        local_logits = local_logits[:tokens_per_rank]
+                        
                     local_layer_data.append((layer_idx, local_logits))
                 
                 # Use gather_object to collect data on CPU (avoids GPU memory spike)
@@ -240,9 +277,12 @@ class RouterReplayLogitsSaver:
                                 layer_combined[layer_idx] = []
                             layer_combined[layer_idx].append(logits)
                     
-                    # Concatenate along batch/token dimension
+                    # Concatenate along batch/token dimension (for logits) or pick first (for router_weights)
                     for layer_idx in sorted(layer_combined.keys()):
-                        combined_logits = torch.cat(layer_combined[layer_idx], dim=0)  # [total_tokens, num_experts]
+                        if phase == "router_weights":
+                            combined_logits = layer_combined[layer_idx][0]
+                        else:
+                            combined_logits = torch.cat(layer_combined[layer_idx], dim=0)  # [total_tokens, num_experts]
                         gathered_data[phase].append((layer_idx, combined_logits))
                     
                     logger.info(f"[gather_logits_from_dp_group] {phase}: gathered {len(layer_combined)} layers from {dp_world_size} DP ranks")
@@ -254,5 +294,5 @@ class RouterReplayLogitsSaver:
             logger.error(f"  DP rank: {dp_rank}, DP world size: {dp_world_size}")
             raise
         
-        return gathered_data if dp_rank == 0 else {"compute_log_prob": [], "training": []}
+        return gathered_data if dp_rank == 0 else {"compute_log_prob": [], "training": [], "tokens_per_mini_step": [], "router_weights": []}
 

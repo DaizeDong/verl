@@ -201,6 +201,9 @@ def process_layers_batch(log_prob_batch: torch.Tensor, training_batch: torch.Ten
         'batch_time': total_time,
     }
 
+    # 清理GPU缓存，释放显存
+    torch.cuda.empty_cache()
+
     return results
 
 
@@ -433,51 +436,55 @@ def topk_entropy(logits: torch.Tensor, k: int, use_gpu: bool = True) -> torch.Te
     return torch.cat(results, dim=0)
 
 
-def find_file_pairs(save_dir: str) -> List[Tuple[str, str, str, str, str]]:
+def find_file_pairs(save_dir: str) -> List[Tuple[str, str, str, str, str, str]]:
     """
-    查找log_prob和training文件对。
+    查找log_prob和training文件对（支持mini step）。
     
     文件名格式:
     - log_prob_{N}_tp{M}_pp{K}.pt
-    - training_{N}_tp{M}_pp{K}.pt
+    - training_{N}_tp{M}_pp{K}.pt           (旧格式，无mini)
+    - training_{N}_mini{S}_tp{M}_pp{K}.pt   (新格式，含mini step)
     
     Returns:
-        List of (step_N, tp_M, pp_K, log_prob_file, training_file)
+        List of (step_N, tp_M, pp_K, mini_S, log_prob_file, training_file)
     """
     all_files = glob.glob(os.path.join(save_dir, "*.pt"))
 
-    # 解析文件名
     log_prob_pattern = re.compile(r"log_prob_(\d+)_tp(\d+)_pp(\d+)\.pt")
     training_pattern = re.compile(r"training_(\d+)_tp(\d+)_pp(\d+)\.pt")
+    training_pattern_mini = re.compile(r"training_(\d+)_mini(\d+)_tp(\d+)_pp(\d+)\.pt")
 
-    log_prob_files = {}
-    training_files = {}
+    log_prob_files: Dict[Tuple[str, str, str], str] = {}
+    training_files: Dict[Tuple[str, str, str, str], str] = {}
 
     for filepath in all_files:
         filename = os.path.basename(filepath)
 
-        match = log_prob_pattern.match(filename)
-        if match:
-            step, tp, pp = match.groups()
-            key = (step, tp, pp)
-            log_prob_files[key] = filepath
+        m = log_prob_pattern.match(filename)
+        if m:
+            step, tp, pp = m.groups()
+            log_prob_files[(step, tp, pp)] = filepath
             continue
 
-        match = training_pattern.match(filename)
-        if match:
-            step, tp, pp = match.groups()
-            key = (step, tp, pp)
-            training_files[key] = filepath
+        m = training_pattern_mini.match(filename)
+        if m:
+            step, mini, tp, pp = m.groups()
+            training_files[(step, tp, pp, mini)] = filepath
+            continue
 
-    # 找到匹配的文件对
+        m = training_pattern.match(filename)
+        if m:
+            step, tp, pp = m.groups()
+            # 旧格式视作mini=0
+            training_files[(step, tp, pp, "0")] = filepath
+
     pairs = []
-    for key in log_prob_files:
-        if key in training_files:
-            step, tp, pp = key
-            pairs.append((step, tp, pp, log_prob_files[key], training_files[key]))
+    for (step, tp, pp, mini), train_path in training_files.items():
+        log_path = log_prob_files.get((step, tp, pp))
+        if log_path:
+            pairs.append((step, tp, pp, mini, log_path, train_path))
 
-    # 按照step, tp, pp的整数值排序
-    return sorted(pairs, key=lambda x: (int(x[0]), int(x[1]), int(x[2])))
+    return sorted(pairs, key=lambda x: (int(x[0]), int(x[1]), int(x[2]), int(x[3])))
 
 
 def load_logits_data(filepath: str, use_weights_only: bool = False,
@@ -689,8 +696,9 @@ def calculate_topk_expert_diff(log_prob_logits: torch.Tensor,
 
 
 def analyze_file_pair(log_prob_file: str, training_file: str, k: int,
-                      output_dir: str, step: str, tp: str, pp: str,
-                      use_parallel_load: bool = True, use_parallel_plot: bool = True):
+                      output_dir: str, step: str, tp: str, pp: str, mini: str,
+                      use_parallel_load: bool = True, use_parallel_plot: bool = True,
+                      skip_existing: bool = False, use_batch_layers: bool = True):
     """
     分析一对log_prob和training文件。
     
@@ -702,11 +710,40 @@ def analyze_file_pair(log_prob_file: str, training_file: str, k: int,
         step: 步数
         tp: tensor parallel rank
         pp: pipeline parallel rank
+        mini: mini step id (字符串)
         use_parallel_load: 是否使用并行加载（默认True）
         use_parallel_plot: 是否使用并行绘图（默认True）
+        skip_existing: 如果输出目录已存在则跳过（默认False）
+        use_batch_layers: 是否使用批量处理多层（默认True，可提高显存利用率）
     """
+    # 检查输出目录是否已存在
+    step_output_dir = os.path.join(output_dir, f"step{step}_mini{mini}_tp{tp}_pp{pp}")
+    if skip_existing and os.path.exists(step_output_dir):
+        # 检查目录是否非空，并且至少存在correlation或entropy等关键子目录
+        subdirs = ['correlation', 'entropy', 'topk_diff', 'scores_load']
+        has_output = False
+        if os.listdir(step_output_dir):
+            # 检查是否存在关键子目录
+            for subdir in subdirs:
+                subdir_path = os.path.join(step_output_dir, subdir)
+                if os.path.exists(subdir_path) and os.listdir(subdir_path):
+                    has_output = True
+                    break
+            # 如果没有子目录，检查是否有直接的文件（旧格式）
+            if not has_output:
+                files = [f for f in os.listdir(step_output_dir) if f.endswith('.png')]
+                if files:
+                    has_output = True
+
+        if has_output:
+            print(f"\n{'=' * 80}")
+            print(f"跳过已存在的分析: step={step}, tp={tp}, pp={pp}")
+            print(f"输出目录: {step_output_dir}")
+            print(f"{'=' * 80}")
+            return 'skipped'
+
     print(f"\n{'=' * 80}")
-    print(f"分析文件对: step={step}, tp={tp}, pp={pp}")
+    print(f"分析文件对: step={step}, mini={mini}, tp={tp}, pp={pp}")
     print(f"{'=' * 80}")
 
     # 1. 加载数据（并行加载两个文件以加速）
@@ -726,7 +763,7 @@ def analyze_file_pair(log_prob_file: str, training_file: str, k: int,
 
     if log_prob_data is None or training_data is None:
         print("❌ 数据加载失败，跳过该文件对")
-        return
+        return 'failed'
 
     load_time = time.time() - t_load_start
     load_speed_mbps = total_size_mb / load_time if load_time > 0 else 0
@@ -744,7 +781,7 @@ def analyze_file_pair(log_prob_file: str, training_file: str, k: int,
 
     if not log_prob_logits_dict or not training_logits_dict:
         print("❌ 未能提取logits，跳过该文件对")
-        return
+        return 'failed'
 
     # 找到共同的层
     log_prob_layers = set(log_prob_logits_dict.keys())
@@ -753,7 +790,7 @@ def analyze_file_pair(log_prob_file: str, training_file: str, k: int,
 
     if not common_layers:
         print("❌ 没有共同的层，跳过该文件对")
-        return
+        return 'failed'
 
     print(f"  ✓ 找到共同的层: {len(common_layers)} 层")
     print(f"  层索引: {common_layers}")
@@ -771,13 +808,18 @@ def analyze_file_pair(log_prob_file: str, training_file: str, k: int,
     analysis_start_time = time.time()
 
     if use_gpu:
-        # 估算每张卡能处理的层数
-        sample_shape = log_prob_logits_dict[common_layers[0]].shape
-        num_experts = sample_shape[1]
-        layers_per_gpu = estimate_layers_per_gpu(sample_shape, num_experts)
+        if use_batch_layers:
+            # 估算每张卡能处理的层数
+            sample_shape = log_prob_logits_dict[common_layers[0]].shape
+            num_experts = sample_shape[1]
+            layers_per_gpu = estimate_layers_per_gpu(sample_shape, num_experts)
 
-        print(f"  计算模式: 批量并行（{NUM_GPUS} GPU，每GPU处理{layers_per_gpu}层）")
-        print(f"  策略: 多层合并计算，充分利用显存，减少kernel启动")
+            print(f"  计算模式: 批量并行（{NUM_GPUS} GPU，每GPU处理{layers_per_gpu}层）")
+            print(f"  策略: 多层合并计算，充分利用显存，减少kernel启动")
+        else:
+            print(f"  计算模式: 层级并行（{NUM_GPUS} GPU，每GPU处理1层）")
+            print(f"  策略: 单层处理，降低显存占用，避免OOM")
+            layers_per_gpu = 1
 
         # 将层分配到GPU（轮询分配）
         layer_groups = {}  # {gpu_id: [layer_indices]}
@@ -798,6 +840,8 @@ def analyze_file_pair(log_prob_file: str, training_file: str, k: int,
             log_prob_logits_dict[layer_idx] = log_prob_logits_dict[layer_idx].to(device, non_blocking=True)
             training_logits_dict[layer_idx] = training_logits_dict[layer_idx].to(device, non_blocking=True)
         torch.cuda.synchronize()
+        # 清理缓存，释放未使用的显存
+        torch.cuda.empty_cache()
         print(f"  ✓ 数据已预加载到GPU")
         print_gpu_memory_stats()
     else:
@@ -871,6 +915,9 @@ def analyze_file_pair(log_prob_file: str, training_file: str, k: int,
             }
 
             start_idx = end_idx
+
+        # 清理GPU缓存，释放显存
+        torch.cuda.empty_cache()
 
         return layer_results
 
@@ -947,6 +994,8 @@ def analyze_file_pair(log_prob_file: str, training_file: str, k: int,
                 topk_diff = topk_diff.cpu()
                 log_prob_logits_cpu = log_prob_logits.cpu()
                 training_logits_cpu = training_logits.cpu()
+                # 清理GPU缓存，释放显存
+                torch.cuda.empty_cache()
         else:
             # CPU计算
             t0 = time.time()
@@ -982,8 +1031,8 @@ def analyze_file_pair(log_prob_file: str, training_file: str, k: int,
             'topk_diff_time': topk_diff_time,
         }, None
 
-    # 使用批量处理策略
-    if use_gpu and len(common_layers) > 1:
+    # 使用批量处理策略（如果启用）
+    if use_gpu and len(common_layers) > 1 and use_batch_layers:
         # 将层分组（每GPU处理layers_per_gpu层）
         batches = []  # [(gpu_id, [layer_indices])]
         for gpu_id, layer_list in sorted(layer_groups.items()):
@@ -1028,6 +1077,13 @@ def analyze_file_pair(log_prob_file: str, training_file: str, k: int,
                     print(f"\n  ❌ GPU {gpu_id} 批次 {batch_layers} 处理出错: {e}")
                     import traceback
                     traceback.print_exc()
+                    # 出错后清理GPU缓存
+                    if use_gpu:
+                        torch.cuda.empty_cache()
+
+        # 批量处理完成后清理GPU缓存
+        if use_gpu:
+            torch.cuda.empty_cache()
     else:
         # 串行处理（CPU或单GPU，使用单层处理）
         for layer_idx in tqdm(common_layers, desc="  进度", ncols=100,
@@ -1036,12 +1092,18 @@ def analyze_file_pair(log_prob_file: str, training_file: str, k: int,
             result, error = process_single_layer(layer_idx, gpu_id)
             if error:
                 print(f"\n  ⚠ 层 {layer_idx}: {error}")
+                # 出错后清理GPU缓存
+                if use_gpu:
+                    torch.cuda.empty_cache()
                 continue
             if result:
                 results[result['layer_idx']] = result
                 PERF_STATS['entropy_time'].append(result['entropy_time'])
                 PERF_STATS['topk_entropy_time'].append(result['topk_entropy_time'])
                 PERF_STATS['topk_diff_time'].append(result['topk_diff_time'])
+                # 每处理完一层后清理GPU缓存，避免OOM
+                if use_gpu:
+                    torch.cuda.empty_cache()
 
     analysis_time = time.time() - analysis_start_time
     print(f"\n  ✓ 所有层分析完成，耗时: {analysis_time:.2f}s")
@@ -1050,6 +1112,8 @@ def analyze_file_pair(log_prob_file: str, training_file: str, k: int,
     # 打印分析阶段的GPU内存使用
     if use_gpu:
         print_gpu_memory_stats()
+        # 分析完成后清理GPU缓存，释放显存
+        torch.cuda.empty_cache()
 
     # 4. 绘制相关性图和MoE可视化图（并行执行）
     print(f"\n[4/4] 生成可视化图表...")
@@ -1104,9 +1168,11 @@ def analyze_file_pair(log_prob_file: str, training_file: str, k: int,
     print(f"  可视化: {viz_time:.2f}s")
     print(f"{'=' * 80}")
 
+    return 'success'
+
 
 def plot_correlation_analysis(results: Dict, k: int, output_dir: str,
-                              step: str, tp: str, pp: str, use_parallel: bool = True):
+                              step: str, mini: str, tp: str, pp: str, use_parallel: bool = True):
     """
     绘制topK差异与entropy的相关性分析图。
     
@@ -1119,7 +1185,7 @@ def plot_correlation_analysis(results: Dict, k: int, output_dir: str,
         pp: pipeline parallel rank
         use_parallel: 是否使用并行绘图（默认True）
     """
-    base_corr_dir = os.path.join(output_dir, f"step{step}_tp{tp}_pp{pp}", "correlation")
+    base_corr_dir = os.path.join(output_dir, f"step{step}_mini{mini}_tp{tp}_pp{pp}", "correlation")
     corr_entropy_dir = os.path.join(base_corr_dir, "entropy")
     corr_entropy_exp_dir = os.path.join(base_corr_dir, "entropy_exp")
     os.makedirs(corr_entropy_dir, exist_ok=True)
@@ -1171,36 +1237,36 @@ def plot_correlation_analysis(results: Dict, k: int, output_dir: str,
         # 原始entropy的散点图 -> correlation/entropy
         ("Log_Prob Entropy", all_log_prob_entropy, all_topk_diff,
          "Log_Prob Entropy (All Experts)", f"TopK({k}) Expert Difference Count",
-         f"TopK Difference vs Log_Prob Entropy (Step {step})",
+         f"TopK Difference vs Log_Prob Entropy (Step {step}, Mini {mini})",
          os.path.join(corr_entropy_dir, "topk_diff_vs_logprob_entropy.png")),
         ("Training Entropy", all_training_entropy, all_topk_diff,
          "Training Entropy (All Experts)", f"TopK({k}) Expert Difference Count",
-         f"TopK Difference vs Training Entropy (Step {step})",
+         f"TopK Difference vs Training Entropy (Step {step}, Mini {mini})",
          os.path.join(corr_entropy_dir, "topk_diff_vs_training_entropy.png")),
         ("Log_Prob TopK Entropy", all_log_prob_topk_entropy, all_topk_diff,
          f"Log_Prob TopK({k}) Entropy", f"TopK({k}) Expert Difference Count",
-         f"TopK Difference vs Log_Prob TopK Entropy (Step {step})",
+         f"TopK Difference vs Log_Prob TopK Entropy (Step {step}, Mini {mini})",
          os.path.join(corr_entropy_dir, "topk_diff_vs_logprob_topk_entropy.png")),
         ("Training TopK Entropy", all_training_topk_entropy, all_topk_diff,
          f"Training TopK({k}) Entropy", f"TopK({k}) Expert Difference Count",
-         f"TopK Difference vs Training TopK Entropy (Step {step})",
+         f"TopK Difference vs Training TopK Entropy (Step {step}, Mini {mini})",
          os.path.join(corr_entropy_dir, "topk_diff_vs_training_topk_entropy.png")),
         # exp(entropy)的散点图 -> correlation/entropy_exp
         ("Log_Prob exp(Entropy)", all_log_prob_exp_entropy, all_topk_diff,
          "Log_Prob exp(Entropy) (All Experts)", f"TopK({k}) Expert Difference Count",
-         f"TopK Difference vs Log_Prob exp(Entropy) (Step {step})",
+         f"TopK Difference vs Log_Prob exp(Entropy) (Step {step}, Mini {mini})",
          os.path.join(corr_entropy_exp_dir, "topk_diff_vs_logprob_exp_entropy.png")),
         ("Training exp(Entropy)", all_training_exp_entropy, all_topk_diff,
          "Training exp(Entropy) (All Experts)", f"TopK({k}) Expert Difference Count",
-         f"TopK Difference vs Training exp(Entropy) (Step {step})",
+         f"TopK Difference vs Training exp(Entropy) (Step {step}, Mini {mini})",
          os.path.join(corr_entropy_exp_dir, "topk_diff_vs_training_exp_entropy.png")),
         ("Log_Prob exp(TopK Entropy)", all_log_prob_exp_topk_entropy, all_topk_diff,
          f"Log_Prob exp(TopK({k}) Entropy)", f"TopK({k}) Expert Difference Count",
-         f"TopK Difference vs Log_Prob exp(TopK Entropy) (Step {step})",
+         f"TopK Difference vs Log_Prob exp(TopK Entropy) (Step {step}, Mini {mini})",
          os.path.join(corr_entropy_exp_dir, "topk_diff_vs_logprob_exp_topk_entropy.png")),
         ("Training exp(TopK Entropy)", all_training_exp_topk_entropy, all_topk_diff,
          f"Training exp(TopK({k}) Entropy)", f"TopK({k}) Expert Difference Count",
-         f"TopK Difference vs Training exp(TopK Entropy) (Step {step})",
+         f"TopK Difference vs Training exp(TopK Entropy) (Step {step}, Mini {mini})",
          os.path.join(corr_entropy_exp_dir, "topk_diff_vs_training_exp_topk_entropy.png")),
     ]
 
@@ -1550,7 +1616,7 @@ def plot_layerwise_correlation(results: Dict, k: int, corr_entropy_dir: str, cor
 
 
 def plot_moe_visualizations(results: Dict, k: int, output_dir: str,
-                            step: str, tp: str, pp: str, use_parallel: bool = True):
+                            step: str, mini: str, tp: str, pp: str, use_parallel: bool = True):
     """
     绘制MoE相关的可视化图（重新组织目录结构）。
     
@@ -1565,7 +1631,7 @@ def plot_moe_visualizations(results: Dict, k: int, output_dir: str,
         pp: pipeline parallel rank
         use_parallel: 是否使用并行绘图（默认True）
     """
-    base_dir = os.path.join(output_dir, f"step{step}_tp{tp}_pp{pp}")
+    base_dir = os.path.join(output_dir, f"step{step}_mini{mini}_tp{tp}_pp{pp}")
 
     # 创建新的目录结构
     entropy_dir = os.path.join(base_dir, "entropy")
@@ -1986,6 +2052,8 @@ def plot_expert_load_heatmap(results: Dict, k: int, viz_dir: str, step: str, pha
             logits_gpu = logits.to(device)
             _, topk_ids = torch.topk(logits_gpu, k, dim=-1)
             topk_ids = topk_ids.cpu()
+            # 立即清理GPU缓存，避免OOM
+            torch.cuda.empty_cache()
         else:
             _, topk_ids = torch.topk(logits, k, dim=-1)
 
@@ -1994,7 +2062,7 @@ def plot_expert_load_heatmap(results: Dict, k: int, viz_dir: str, step: str, pha
         load = (tokens_per_expert / (num_tokens * k)).numpy()
         load_list.append(load)
 
-    # 清理GPU内存
+    # 最终清理GPU内存
     if use_gpu:
         torch.cuda.empty_cache()
 
@@ -2059,10 +2127,14 @@ def main():
                         help="输出目录 (默认: save_dir/analysis_output)")
     parser.add_argument("--no_gpu", action='store_true',
                         help="禁用GPU加速，强制使用CPU")
+    parser.add_argument("--no_batch_layers", action='store_true',
+                        help="禁用批量处理多层（默认启用，可提高显存利用率但可能增加OOM风险）")
     parser.add_argument("--serial_load", action='store_true',
                         help="串行加载文件（禁用并行加载）")
     parser.add_argument("--serial_plot", action='store_true',
                         help="串行绘制图像（禁用并行绘图）")
+    parser.add_argument("--skip_existing", action='store_true',
+                        help="跳过已存在的输出目录（避免重复计算）")
 
     args = parser.parse_args()
 
@@ -2090,6 +2162,8 @@ def main():
     print(f"TopK值: {args.topk}")
     print(f"GPU加速: {'禁用 (强制CPU)' if args.no_gpu else f'启用 ({NUM_GPUS} GPUs)'}")
     print(f"数据加载: {'串行加载' if args.serial_load else '并行加载（2线程，推荐）'}")
+    print(f"批量处理多层: {'禁用' if args.no_batch_layers else '启用（推荐，提高显存利用率）'}")
+    print(f"跳过已存在: {'是' if args.skip_existing else '否'}")
     print("=" * 80)
 
     # 1. 查找文件对
@@ -2109,13 +2183,13 @@ def main():
 
     # 统计总文件大小
     total_data_size = 0
-    for idx, (step, tp, pp, log_prob_file, training_file) in enumerate(file_pairs, 1):
+    for idx, (step, tp, pp, mini, log_prob_file, training_file) in enumerate(file_pairs, 1):
         log_prob_size = os.path.getsize(log_prob_file) / (1024 ** 2)
         training_size = os.path.getsize(training_file) / (1024 ** 2)
         pair_size = log_prob_size + training_size
         total_data_size += pair_size
 
-        print(f"  [{idx}] Step {step:>3}, TP {tp}, PP {pp} (大小: {pair_size:.1f} MB)")
+        print(f"  [{idx}] Step {step:>3}, Mini {mini}, TP {tp}, PP {pp} (大小: {pair_size:.1f} MB)")
         print(f"      log_prob: {os.path.basename(log_prob_file)}")
         print(f"      training: {os.path.basename(training_file)}")
 
@@ -2130,19 +2204,29 @@ def main():
     # 2. 分析每对文件
     total_start_time = time.time()
     success_count = 0
+    skipped_count = 0
+    failed_count = 0
 
-    for idx, (step, tp, pp, log_prob_file, training_file) in enumerate(file_pairs, 1):
+    for idx, (step, tp, pp, mini, log_prob_file, training_file) in enumerate(file_pairs, 1):
         print(f"\n处理进度: [{idx}/{len(file_pairs)}]")
         try:
-            analyze_file_pair(log_prob_file, training_file, args.topk,
-                              args.output_dir, step, tp, pp,
-                              use_parallel_load=not args.serial_load,
-                              use_parallel_plot=not args.serial_plot)
-            success_count += 1
+            result = analyze_file_pair(log_prob_file, training_file, args.topk,
+                                       args.output_dir, step, tp, pp, mini,
+                                       use_parallel_load=not args.serial_load,
+                                       use_parallel_plot=not args.serial_plot,
+                                       skip_existing=args.skip_existing,
+                                       use_batch_layers=not args.no_batch_layers)
+            if result == 'skipped':
+                skipped_count += 1
+            elif result == 'success':
+                success_count += 1
+            elif result == 'failed':
+                failed_count += 1
         except Exception as e:
-            print(f"\n❌ 分析 step={step}, tp={tp}, pp={pp} 时出错: {e}")
+            print(f"\n❌ 分析 step={step}, mini={mini}, tp={tp}, pp={pp} 时出错: {e}")
             import traceback
             traceback.print_exc()
+            failed_count += 1
             continue
 
     total_time = time.time() - total_start_time
@@ -2154,7 +2238,12 @@ def main():
     print("\n" + "=" * 80)
     print("分析完成总结")
     print("=" * 80)
-    print(f"处理文件对: {success_count}/{len(file_pairs)} 成功")
+    print(f"处理文件对: {success_count}/{len(file_pairs)} 成功", end="")
+    if skipped_count > 0:
+        print(f", {skipped_count} 跳过", end="")
+    if failed_count > 0:
+        print(f", {failed_count} 失败", end="")
+    print()
     print(f"总耗时: {total_time:.2f}s ({total_time / 60:.1f} 分钟)")
     if success_count > 0:
         print(f"平均每对: {total_time / success_count:.2f}s")

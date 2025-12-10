@@ -295,11 +295,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             self.enable_routing_replay = self.router_replay.mode != "disabled"
             
             # Initialize logits saver if record_file is specified (独立于 router_replay)
-            if self.router_replay.record_file is not None:
+            if self.router_replay.record_file not in [None, ""]:
                 from verl.utils.megatron.router_replay_saver import RouterReplayLogitsSaver
                 self.logits_saver = RouterReplayLogitsSaver(self.router_replay.record_file)
                 self.enable_logits_saving = True
-                self.log_prob_step = 0  # Track compute_log_prob steps for file naming
                 self.save_frequency = self.router_replay.save_frequency
                 logger.info(f"Router logits saving enabled in HybridEngine. Save directory: {self.router_replay.record_file}, frequency: every {self.save_frequency} step(s)")
             else:
@@ -878,9 +877,22 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["temperature"] = self.config.rollout.temperature
 
         # Set cache action to COMPUTE_LOG_PROB phase
+        # Determine whether to record/save this compute_log_prob based on save_frequency
+        should_save = False
         if self.enable_logits_saving:
+            global_step = -1
+            if data is not None and isinstance(data, DataProto):
+                global_step = data.meta_info.get("global_step", -1)
+            if global_step >= 0:
+                should_save = (global_step % self.save_frequency == 0)
+            else:
+                should_save = False  # Fallback: not record if step unknown
+
+        if should_save:
             RouterReplay.set_cache_action(RouterReplayCacheAction.COMPUTE_LOG_PROB)
             logger.info(f"[Rank {self.rank}] Enabled logits recording for COMPUTE_LOG_PROB. Debug: {RouterReplay.get_debug_info()}")
+        else:
+            RouterReplay.clear_cache_action()
 
         if self.enable_routing_replay and self.config.actor.router_replay.mode == "R2":
             RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
@@ -900,8 +912,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             RouterReplay.clear_global_indices()
             RouterReplay.clear_global_router_replay_action()
 
-        # Save logits cache for this compute_log_prob call
-        if self.enable_logits_saving:
+        # Save logits cache for this compute_log_prob call (only if should_save)
+        if should_save:
             from verl.utils.megatron.router_replay_saver import RouterReplayLogitsSaver
             
             # Debug: Check state before getting cache
@@ -909,11 +921,21 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             logger.info(f"[Rank {self.rank}] Before get_and_clear_logits_cache: {debug_info}")
             
             logits_cache = RouterReplay.get_and_clear_logits_cache()
-            logger.info(f"[Rank {self.rank}] Logits cache sizes - compute_log_prob: {len(logits_cache['compute_log_prob'])}, training: {len(logits_cache['training'])}")
+            logger.info(
+                f"[Rank {self.rank}] Logits cache sizes - compute_log_prob: {len(logits_cache['compute_log_prob'])}, "
+                f"training: {len(logits_cache['training'])}"
+            )
             
-            # Check if should save this step based on save_frequency
-            should_save = (self.log_prob_step % self.save_frequency == 0)
+            # Prefer global_step passed via data.meta_info to survive resume from checkpoint
+            global_step = -1
+            if data is not None and isinstance(data, DataProto):
+                global_step = data.meta_info.get("global_step", -1)
             
+            if global_step >= 0:
+                step_name = f"log_prob_{global_step}"
+            else:
+                step_name = f"log_prob_ts_{int(time.time())}"
+
             # Only save if there's data and frequency matches
             if should_save and (logits_cache["compute_log_prob"] or logits_cache["training"]):
                 # Step 1: Gather logits across TP group (only TP rank 0 will have data after this)
@@ -928,14 +950,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     
                     # Step 3: Save asynchronously (only on DP rank 0 and TP rank 0)
                     if mpu.get_data_parallel_rank() == 0:
-                        step_name = f"log_prob_{self.log_prob_step}"
                         self.logits_saver.save_logits_async(logits_cache, step_name)
-                        logger.info(f"Scheduled async save for compute_log_prob step {self.log_prob_step}")
+                        logger.info(f"Scheduled async save for {step_name}")
             elif not should_save:
-                logger.debug(f"Skipping save for compute_log_prob step {self.log_prob_step} (frequency={self.save_frequency})")
-            
-            # Increment step counter
-            self.log_prob_step += 1
+                logger.debug(f"Skipping save for step {global_step} (frequency={self.save_frequency})")
             
             # Clear cache action
             RouterReplay.clear_cache_action()

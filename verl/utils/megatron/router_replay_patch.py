@@ -50,9 +50,9 @@ class RouterReplay:
     router_instances = []
     
     # Global logits cache for recording
-    # Structure: {"compute_log_prob": [], "training": []}
-    # Each list contains tuples of (layer_idx, logits_cpu)
-    logits_cache = {"compute_log_prob": [], "training": []}
+    # Structure: {"compute_log_prob": [], "training": [], "router_weights": []}
+    # Each list contains tuples of (layer_idx, tensor_cpu), router_weights stores parameter tensors
+    logits_cache = {"compute_log_prob": [], "training": [], "router_weights": []}
     
     # Flag to enable/disable logits recording
     enable_logits_recording = False
@@ -154,7 +154,7 @@ class RouterReplay:
     def get_and_clear_logits_cache():
         """
         Get the current logits cache and clear it.
-        Returns a dict with 'compute_log_prob' and 'training' keys.
+        Returns a dict with 'compute_log_prob', 'training', and 'router_weights' keys.
         """
         import logging
         logger = logging.getLogger(__name__)
@@ -162,12 +162,27 @@ class RouterReplay:
         # Debug: check cache before clearing
         logger.info(f"[get_and_clear_logits_cache] Before clear - "
                    f"compute_log_prob: {len(RouterReplay.logits_cache['compute_log_prob'])} items, "
-                   f"training: {len(RouterReplay.logits_cache['training'])} items")
+                   f"training: {len(RouterReplay.logits_cache['training'])} items, "
+                   f"router_weights: {len(RouterReplay.logits_cache['router_weights'])} items")
         
         cache = RouterReplay.logits_cache
-        RouterReplay.logits_cache = {"compute_log_prob": [], "training": []}
+        RouterReplay.logits_cache = {"compute_log_prob": [], "training": [], "router_weights": []}
         return cache
-    
+
+    @staticmethod
+    @no_grad()
+    def record_router_weights(weights: torch.Tensor, layer_idx: int):
+        """
+        Record router **parameters** (weights matrix), not probabilities.
+        Only records during TRAINING cache phase.
+        """
+        if not RouterReplay.enable_logits_recording or RouterReplay.current_cache_action is None:
+            return
+        
+        if RouterReplay.current_cache_action == RouterReplayCacheAction.TRAINING:
+            weights_cpu = weights.detach().cpu().contiguous()
+            RouterReplay.logits_cache["router_weights"].append((layer_idx, weights_cpu))
+
     @staticmethod
     @no_grad()
     def record_logits(logits: torch.Tensor, layer_idx: int):
@@ -222,6 +237,7 @@ class RouterReplay:
             "cache_sizes": {
                 "compute_log_prob": len(RouterReplay.logits_cache.get("compute_log_prob", [])),
                 "training": len(RouterReplay.logits_cache.get("training", [])),
+                "router_weights": len(RouterReplay.logits_cache.get("router_weights", [])),
             }
         }
 
@@ -374,6 +390,28 @@ def patched_routing(self, logits: torch.Tensor):
     """
     seq_length, bsz = logits.shape[:2]
     logits = logits.view(-1, self.config.num_moe_experts)
+    # Capture router parameter weights (not probabilities) for logging
+    if RouterReplay.enable_logits_recording and RouterReplay.current_cache_action is not None:
+        layer_idx_for_weights = getattr(self, "layer_number", None)
+        if layer_idx_for_weights is not None:
+            layer_idx_for_weights = layer_idx_for_weights - 1
+        else:
+            layer_idx_for_weights = 0
+        router_weight_param = None
+        # Common attribute names in TopKRouter
+        if hasattr(self, "router") and hasattr(self.router, "weight"):
+            router_weight_param = self.router.weight
+        elif hasattr(self, "linear") and hasattr(self.linear, "weight"):
+            router_weight_param = self.linear.weight
+        elif hasattr(self, "weight"):
+            router_weight_param = self.weight
+        else:
+            # fallback: first parameter if exists
+            for p in self.parameters():
+                router_weight_param = p
+                break
+        if router_weight_param is not None:
+            RouterReplay.record_router_weights(router_weight_param, layer_idx_for_weights)
 
     # Apply Z-Loss
     logits = self.apply_z_loss(logits)
