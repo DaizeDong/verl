@@ -77,17 +77,23 @@ def _split_args_kwargs_data_proto(chunks, *args, **kwargs):
 
     splitted_args = []
     for arg in args:
-        assert isinstance(arg, DataProto | DataProtoFuture | BatchMeta | TensorDict)
-        chunked_arg = arg.chunk(chunks=chunks)
-        assert len(chunked_arg) == chunks
-        splitted_args.append(chunked_arg)
+        if isinstance(arg, DataProto | DataProtoFuture | BatchMeta | TensorDict):
+            chunked_arg = arg.chunk(chunks=chunks)
+            assert len(chunked_arg) == chunks
+            splitted_args.append(chunked_arg)
+        else:
+            # For other types, we broadcast them to all chunks
+            splitted_args.append([arg] * chunks)
 
     splitted_kwargs = {}
     for key, val in kwargs.items():
-        assert isinstance(val, DataProto | DataProtoFuture | BatchMeta | TensorDict)
-        chunked_kwarg = val.chunk(chunks=chunks)
-        assert len(chunked_kwarg) == chunks
-        splitted_kwargs[key] = chunked_kwarg
+        if isinstance(val, DataProto | DataProtoFuture | BatchMeta | TensorDict):
+            chunked_kwarg = val.chunk(chunks=chunks)
+            assert len(chunked_kwarg) == chunks
+            splitted_kwargs[key] = chunked_kwarg
+        else:
+            # For other types, we broadcast them to all chunks
+            splitted_kwargs[key] = [val] * chunks
 
     return splitted_args, splitted_kwargs
 

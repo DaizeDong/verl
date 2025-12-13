@@ -883,12 +883,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # Determine whether to record/save this compute_log_prob based on save_frequency
         should_save = False
         if self.enable_logits_saving:
-            if global_step is not None and global_step >= 0:
-                should_save = (global_step % self.save_frequency == 0)
-            else:
-                should_save = False  # Fallback: not record if step unknown
-                logger.warning(f"[Rank {self.rank}] compute_log_prob called without global_step, skipping logits saving.")
-
+            should_save = (global_step % self.save_frequency == 0)
         if should_save:
             RouterReplay.set_cache_action(RouterReplayCacheAction.COMPUTE_LOG_PROB)
             logger.info(f"[Rank {self.rank}] Enabled logits recording for COMPUTE_LOG_PROB. Debug: {RouterReplay.get_debug_info()}")
@@ -899,15 +894,26 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
         if self.enable_routing_replay and self.config.actor.router_replay.mode == "R3":
-            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+            # R3 mode: Replay if routed_experts available, otherwise Record (for first step)
+            if "routed_experts" in data.batch.keys():
+                RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+            else:
+                logger.info(f"[Rank {self.rank}] R3 mode: routed_experts not in batch (first step). Using RECORD mode this time.")
+                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
         output, entropys, layers_topk_idx = self.actor.compute_log_prob(data=data, calculate_entropy=True)
         output = DataProto.from_dict(
             tensors={"old_log_probs": output, "entropys": entropys},
             meta_info={"temperature": self.config.rollout.temperature},
         )
+        # Save routed_experts for R2, or R3 when it recorded this step (for next step's replay)
         if self.config.actor.router_replay.mode == "R2":
             output.batch["routed_experts"] = layers_topk_idx
+        elif self.config.actor.router_replay.mode == "R3":
+            # R3: only save if we recorded this step (i.e., routed_experts was not in input batch)
+            if "routed_experts" not in data.batch.keys() and layers_topk_idx is not None:
+                output.batch["routed_experts"] = layers_topk_idx
+                logger.info(f"[Rank {self.rank}] R3 first step: recorded routed_experts for next step's replay")
 
         if self.config.actor.router_replay.mode in ["R2", "R3"]:
             RouterReplay.clear_global_indices()
@@ -916,6 +922,18 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # Save logits cache for this compute_log_prob call (only if should_save)
         if should_save:
             from verl.utils.megatron.router_replay_saver import RouterReplayLogitsSaver
+            from megatron.core.transformer.moe.router import TopKRouter
+
+            # Record router_weights after forward (captures weights at LogProb phase)
+            for module in self.actor_module:
+                for name, layer in module.named_modules():
+                    if isinstance(layer, TopKRouter):
+                        layer_idx = layer.layer_number
+                        RouterReplay.logits_cache["router_weights"][layer_idx] = layer.weight.detach().cpu().contiguous()
+                        print(f"[compute_log_prob] Post-forward: Recorded router_weights for layer {layer_idx}, shape={layer.weight.shape}")
+                    else:
+                        # print(f"[compute_log_prob] Module {name} is not TopKRouter, skipping.")
+                        pass
 
             # Debug: Check state before getting cache
             debug_info = RouterReplay.get_debug_info()
@@ -924,16 +942,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             logits_cache = RouterReplay.get_and_clear_logits_cache()
             logger.info(
                 f"[Rank {self.rank}] Logits cache sizes - compute_log_prob: {len(logits_cache['compute_log_prob'])}, "
-                f"training: {len(logits_cache['training'])}"
+                f"training: {len(logits_cache['training'])}, "
+                f"router_weights: {len(logits_cache['router_weights'])}, "
+                f"global_token_ids: {len(logits_cache.get('global_token_ids', []))}"
             )
 
-            if global_step is not None and global_step >= 0:
-                step_name = f"log_prob_{global_step}"
-            else:
-                step_name = f"log_prob_ts_{int(time.time())}"
-
-            # Only save if there's data and frequency matches
-            if should_save and (logits_cache["compute_log_prob"] or logits_cache["training"]):
+            step_name = f"log_prob_{global_step}"
+            if should_save:
                 # Step 1: Gather logits across TP group (only TP rank 0 will have data after this)
                 if mpu.get_tensor_model_parallel_world_size() > 1:
                     logits_cache = RouterReplayLogitsSaver.gather_logits_from_tp_group(logits_cache)
@@ -948,8 +963,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     if mpu.get_data_parallel_rank() == 0:
                         self.logits_saver.save_logits_async(logits_cache, step_name)
                         logger.info(f"Scheduled async save for {step_name}")
-            elif not should_save:
-                logger.debug(f"Skipping save for step {global_step} (frequency={self.save_frequency})")
 
             # Clear cache action
             RouterReplay.clear_cache_action()

@@ -54,6 +54,7 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
+from verl.utils.megatron.router_replay_patch import RouterReplay
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -1128,6 +1129,13 @@ class RayPPOTrainer:
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+                    # Inject global_token_ids if logits saving is enabled (check config, not runtime state)
+                    if self.config.actor_rollout_ref.actor.router_replay.record_file not in [None, ""]:
+                        batch_size, seq_len = batch.batch["attention_mask"].shape
+                        batch.batch["global_token_ids"] = torch.arange(batch_size * seq_len, device=batch.batch["attention_mask"].device).reshape(batch_size, seq_len)
+
+                    # print(batch)
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score

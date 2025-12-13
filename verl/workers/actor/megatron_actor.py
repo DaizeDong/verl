@@ -237,10 +237,20 @@ class MegatronPPOActor(BasePPOActor):
         if recompute_old_log_prob:
             select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
 
+            # R3 mode: use routed_experts from previous step if available
+            # For the first step, routed_experts won't exist, so we skip the check
             if self.enable_routing_replay and self.config.router_replay.mode == "R3":
-                assert "routed_experts" in data.batch.keys(), "routed_experts must be in data.batch.keys()"
-                select_keys.append("routed_experts")
-
+                if "routed_experts" in data.batch.keys():
+                    select_keys.append("routed_experts")
+                else:
+                    # First step in R3 mode: no routed_experts yet, will use R2-like recording
+                    logger.warning("[compute_log_prob] R3 mode but routed_experts not in batch (likely first step). "
+                                   "Will record routing decisions this step for replay in next step.")
+            
+            # Include global_token_ids if present (for alignment in LogProb phase)
+            if "global_token_ids" in data.batch.keys():
+                select_keys.append("global_token_ids")
+            
             batch = data.select(batch_keys=select_keys).batch
             input_ids = batch["input_ids"]
             batch_size = input_ids.size(0)
@@ -370,7 +380,14 @@ class MegatronPPOActor(BasePPOActor):
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         # router replay
         if self.enable_routing_replay:
-            select_keys.append("routed_experts")
+            # Only include routed_experts if it actually exists in the data
+            if "routed_experts" in data.batch.keys():
+                select_keys.append("routed_experts")
+            elif self.config.router_replay.mode == "R3":
+                # R3 without routed_experts: first step, will use RECORD mode
+                logger.warning("[make_minibatch_iterator] R3 mode but routed_experts not in batch. Training will record this step.")
+        if self.enable_logits_saving:
+            select_keys.append("global_token_ids")
         if self.has_multi_modal_inputs:
             data = data.select(select_keys, ["multi_modal_inputs"])
         else:
@@ -380,7 +397,6 @@ class MegatronPPOActor(BasePPOActor):
             mini_batch_size=self.config.ppo_mini_batch_size,
             epochs=self.config.ppo_epochs,
             seed=self.config.data_loader_seed,
-            dataloader_kwargs={"shuffle": self.config.shuffle},
         )
 
     def forward_backward_batch(
@@ -611,8 +627,13 @@ class MegatronPPOActor(BasePPOActor):
                     router.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
             if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
-                layers_topk_idx = batch["routed_experts"]
-                set_router_replay_data(layers_topk_idx, attention_mask, self.tf_config, vp_rank)
+                # R3 mode: use routed_experts if available
+                if "routed_experts" in batch:
+                    layers_topk_idx = batch["routed_experts"]
+                    set_router_replay_data(layers_topk_idx, attention_mask, self.tf_config, vp_rank)
+                else:
+                    # First step without routed_experts, skip replay (will use natural routing)
+                    logger.warning("[forward_step] R3 replay_forward but routed_experts not in batch. Skipping replay.")
 
             from verl.models.mcore import get_mcore_forward_fn, get_mcore_forward_fused_fn
 
@@ -682,6 +703,17 @@ class MegatronPPOActor(BasePPOActor):
                 merge_router_topk_indices(
                     attention_mask, input_ids, self.mini_layer_topk_idx_list, self.tf_config, vp_rank
                 )
+
+            # Record token_ids if present and logits saving is enabled
+            if self.enable_logits_saving and RouterReplay.current_cache_action is not None:
+                if "global_token_ids" in batch:
+                    global_token_ids = batch["global_token_ids"]
+                    # Only record valid tokens (remove padding)
+                    valid_ids = torch.masked_select(global_token_ids.to(attention_mask.device), attention_mask)
+                    print(f"[forward_step] Recording {len(valid_ids)} valid global_token_ids (shape before mask: {global_token_ids.shape})")
+                    RouterReplay.record_global_token_ids(valid_ids)
+                else:
+                    print(f"[forward_step] WARNING: global_token_ids not in batch, cannot record!")
 
             if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
                 router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
@@ -799,6 +831,19 @@ class MegatronPPOActor(BasePPOActor):
             data = {"actor/grad_norm": grad_norm}
             append_to_dict(metrics, data)
 
+            # 在 optimizer.step 后，重新记录 router_weights 以捕获更新后的参数
+            if should_save:
+                from megatron.core.transformer.moe.router import TopKRouter
+                for module in self.actor_module:
+                    for name, layer in module.named_modules():
+                        if isinstance(layer, TopKRouter):
+                            layer_idx = layer.layer_number
+                            RouterReplay.logits_cache["router_weights"][layer_idx] = layer.weight.detach().cpu().contiguous()
+                            print(f"[update_policy] Post-step: Updated router_weights for layer {layer_idx}, shape={layer.weight.shape}")
+                        else:
+                            # print(f"[compute_log_prob] Module {name} is not TopKRouter, skipping.")
+                            pass
+
             if update_successful:
                 # allgather already execute in optimizer.step in new megatron
                 pass
@@ -824,6 +869,11 @@ class MegatronPPOActor(BasePPOActor):
                             logits_cache = RouterReplayLogitsSaver.gather_logits_from_dp_group(logits_cache)
 
                         if mpu.get_data_parallel_rank() == 0:
+                            logger.info(
+                                f"Logits cache sizes before save - compute_log_prob: {len(logits_cache['compute_log_prob'])}, "
+                                f"training: {len(logits_cache['training'])}, "
+                                f"global_token_ids: {len(logits_cache.get('global_token_ids', []))}"
+                            )
                             step_name = f"training_{step_for_save}_mini{mini_step}"
                             self.logits_saver.save_logits_async(logits_cache, step_name)
                             logger.info(f"Scheduled async save for training step {step_for_save}, mini {mini_step}")

@@ -55,15 +55,19 @@ class RouterReplay:
     router_instances = []
 
     # Global logits cache for recording
-    # Structure: {"compute_log_prob": [], "training": [], "router_weights": []}
+    # Structure: {"compute_log_prob": [], "training": [], "router_weights": {}, "global_token_ids": []}
     # Each list contains tuples of (layer_idx, tensor_cpu), router_weights stores parameter tensors
-    logits_cache = {"compute_log_prob": [], "training": [], "router_weights": []}
+    # global_token_ids: list of token_ids_tensor
+    logits_cache = {"compute_log_prob": [], "training": [], "router_weights": {}, "global_token_ids": []}
 
     # Flag to enable/disable logits recording
     enable_logits_recording = False
 
     # Current cache action phase
     current_cache_action = None
+
+    # Current token indices for alignment
+    current_token_indices = None
 
     @staticmethod
     def set_replay_data(all_layers_topk_indices: list):
@@ -159,34 +163,36 @@ class RouterReplay:
     def get_and_clear_logits_cache():
         """
         Get the current logits cache and clear it.
-        Returns a dict with 'compute_log_prob', 'training', and 'router_weights' keys.
+        Returns a dict with 'compute_log_prob', 'training', 'router_weights' and 'global_token_ids' keys.
         """
-        import logging
-        logger = logging.getLogger(__name__)
-
         # Debug: check cache before clearing
-        logger.info(f"[get_and_clear_logits_cache] Before clear - "
+        print(f"[get_and_clear_logits_cache] Before clear - "
                    f"compute_log_prob: {len(RouterReplay.logits_cache['compute_log_prob'])} items, "
                    f"training: {len(RouterReplay.logits_cache['training'])} items, "
-                   f"router_weights: {len(RouterReplay.logits_cache['router_weights'])} items")
+                   f"router_weights: {len(RouterReplay.logits_cache['router_weights'])} items, "
+                   f"global_token_ids: {len(RouterReplay.logits_cache['global_token_ids'])} items")
 
         cache = RouterReplay.logits_cache
-        RouterReplay.logits_cache = {"compute_log_prob": [], "training": [], "router_weights": []}
+        RouterReplay.logits_cache = {"compute_log_prob": [], "training": [], "router_weights": {}, "global_token_ids": []}
         return cache
 
     @staticmethod
     @no_grad()
-    def record_router_weights(weights: torch.Tensor, layer_idx: int):
+    def record_global_token_ids(global_token_ids: torch.Tensor):
         """
-        Record router **parameters** (weights matrix), not probabilities.
-        Only records during TRAINING cache phase.
+        Record valid token IDs for the current micro-batch.
+
+        Args:
+            token_ids: Tensor of valid token IDs (CPU, shape [num_tokens])
         """
+        # Record global token IDs for the current micro-batch.
         if not RouterReplay.enable_logits_recording or RouterReplay.current_cache_action is None:
+            print(f"[record_global_token_ids] Skipping - enable_recording={RouterReplay.enable_logits_recording}, ")
             return
 
-        if RouterReplay.current_cache_action == RouterReplayCacheAction.TRAINING:
-            weights_cpu = weights.detach().cpu().contiguous()
-            RouterReplay.logits_cache["router_weights"].append((layer_idx, weights_cpu))
+        ids_cpu = global_token_ids.detach().cpu().contiguous()
+        RouterReplay.logits_cache["global_token_ids"].append(ids_cpu)
+        print(f"[record_global_token_ids] Recorded global token IDs of shape {ids_cpu.shape}. ")
 
     @staticmethod
     @no_grad()
@@ -199,19 +205,16 @@ class RouterReplay:
             logits: The logits tensor from routing computation
             layer_idx: The layer index
         """
-        import logging
-        logger = logging.getLogger(__name__)
-
         # Debug: log first call
         if layer_idx == 0:
-            logger.info(f"[record_logits] Layer 0: enable_recording={RouterReplay.enable_logits_recording}, "
-                       f"cache_action={RouterReplay.current_cache_action}, "
-                       f"logits_shape={logits.shape}")
+            print(f"[record_logits] Layer 0: enable_recording={RouterReplay.enable_logits_recording}, "
+                  f"cache_action={RouterReplay.current_cache_action}, "
+                  f"logits_shape={logits.shape}")
 
         if not RouterReplay.enable_logits_recording or RouterReplay.current_cache_action is None:
             if layer_idx == 0:
-                logger.warning(f"[record_logits] Skipping - enable_recording={RouterReplay.enable_logits_recording}, "
-                             f"cache_action={RouterReplay.current_cache_action}")
+                print(f"[record_logits] Skipping - enable_recording={RouterReplay.enable_logits_recording}, "
+                      f"cache_action={RouterReplay.current_cache_action}")
             return
 
         # Move to CPU to avoid GPU memory pressure
@@ -226,11 +229,11 @@ class RouterReplay:
         if RouterReplay.current_cache_action == RouterReplayCacheAction.COMPUTE_LOG_PROB:
             RouterReplay.logits_cache["compute_log_prob"].append((layer_idx, logits_cpu))
             if layer_idx == 0:
-                logger.info(f"[record_logits] Recorded to compute_log_prob cache. Current size: {len(RouterReplay.logits_cache['compute_log_prob'])}")
+                print(f"[record_logits] Recorded to compute_log_prob cache. Current size: {len(RouterReplay.logits_cache['compute_log_prob'])}")
         elif RouterReplay.current_cache_action == RouterReplayCacheAction.TRAINING:
             RouterReplay.logits_cache["training"].append((layer_idx, logits_cpu))
             if layer_idx == 0:
-                logger.info(f"[record_logits] Recorded to training cache. Current size: {len(RouterReplay.logits_cache['training'])}")
+                print(f"[record_logits] Recorded to training cache. Current size: {len(RouterReplay.logits_cache['training'])}")
 
     @staticmethod
     def get_debug_info():
@@ -300,9 +303,9 @@ def _patched_topk_routing_with_score_function(
 
         # Debug: log first call
         if layer_idx == 0:
-            logger.info(f"[compute_topk] Layer 0: routing_action={routing_action}, "
-                       f"router_replay={router_replay is not None}, layer_number={layer_number}, "
-                       f"will_record_logits={RouterReplay.enable_logits_recording}")
+            print(f"[compute_topk] Layer 0: routing_action={routing_action}, "
+                  f"router_replay={router_replay is not None}, layer_number={layer_number}, "
+                  f"will_record_logits={RouterReplay.enable_logits_recording}")
 
         if routing_action is None:
             # No router replay, just compute topk normally
@@ -395,28 +398,8 @@ def patched_routing(self, logits: torch.Tensor):
     """
     seq_length, bsz = logits.shape[:2]
     logits = logits.view(-1, self.config.num_moe_experts)
-    # Capture router parameter weights (not probabilities) for logging
-    if RouterReplay.enable_logits_recording and RouterReplay.current_cache_action is not None:
-        layer_idx_for_weights = getattr(self, "layer_number", None)
-        if layer_idx_for_weights is not None:
-            layer_idx_for_weights = layer_idx_for_weights - 1
-        else:
-            layer_idx_for_weights = 0
-        router_weight_param = None
-        # Common attribute names in TopKRouter
-        if hasattr(self, "router") and hasattr(self.router, "weight"):
-            router_weight_param = self.router.weight
-        elif hasattr(self, "linear") and hasattr(self.linear, "weight"):
-            router_weight_param = self.linear.weight
-        elif hasattr(self, "weight"):
-            router_weight_param = self.weight
-        else:
-            # fallback: first parameter if exists
-            for p in self.parameters():
-                router_weight_param = p
-                break
-        if router_weight_param is not None:
-            RouterReplay.record_router_weights(router_weight_param, layer_idx_for_weights)
+    # Note: Router weights recording moved to post-forward hooks in megatron_workers/actor
+    # to ensure we capture updated weights after optimizer.step
 
     # Apply Z-Loss
     logits = self.apply_z_loss(logits)

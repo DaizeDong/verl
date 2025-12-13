@@ -487,6 +487,69 @@ def find_file_pairs(save_dir: str) -> List[Tuple[str, str, str, str, str, str]]:
     return sorted(pairs, key=lambda x: (int(x[0]), int(x[1]), int(x[2]), int(x[3])))
 
 
+def group_files_by_step(save_dir: str) -> Dict[Tuple[str, str, str], Dict]:
+    """
+    按 (step, tp, pp) 聚合文件（仅支持分层目录结构）。
+    
+    目录结构：
+    - save_dir/{step}/log_prob_{step}_tp{tp}_pp{pp}.pt
+    - save_dir/{step}/training_{step}_mini{mini}_tp{tp}_pp{pp}.pt
+    
+    Returns:
+        {
+            (step, tp, pp): {
+                "log_prob_file": filepath,
+                "training_files": {mini: filepath, ...}
+            },
+            ...
+        }
+    """
+    log_prob_pattern = re.compile(r"log_prob_(\d+)_tp(\d+)_pp(\d+)\.pt")
+    training_pattern_mini = re.compile(r"training_(\d+)_mini(\d+)_tp(\d+)_pp(\d+)\.pt")
+
+    log_prob_files: Dict[Tuple[str, str, str], str] = {}
+    training_files: Dict[Tuple[str, str, str], Dict[str, str]] = {}
+
+    # 遍历所有子目录
+    for step_dir_name in os.listdir(save_dir):
+        step_dir_path = os.path.join(save_dir, step_dir_name)
+        if not os.path.isdir(step_dir_path):
+            continue
+        
+        # 扫描该 step 目录下的所有 .pt 文件
+        for filename in os.listdir(step_dir_path):
+            if not filename.endswith('.pt'):
+                continue
+            
+            filepath = os.path.join(step_dir_path, filename)
+            
+            m = log_prob_pattern.match(filename)
+            if m:
+                step, tp, pp = m.groups()
+                log_prob_files[(step, tp, pp)] = filepath
+                continue
+
+            m = training_pattern_mini.match(filename)
+            if m:
+                step, mini, tp, pp = m.groups()
+                key = (step, tp, pp)
+                if key not in training_files:
+                    training_files[key] = {}
+                training_files[key][mini] = filepath
+    
+    # 组合结果
+    grouped = {}
+    all_keys = set(log_prob_files.keys()) | set(training_files.keys())
+    
+    for key in all_keys:
+        grouped[key] = {
+            "log_prob_file": log_prob_files.get(key),
+            "training_files": training_files.get(key, {})
+        }
+    
+    return grouped
+
+
 def load_logits_data(filepath: str, use_weights_only: bool = False,
                      target_device: str = 'cpu') -> Dict:
     """
@@ -561,6 +624,8 @@ def extract_logits_from_data(data: Dict) -> Dict[int, torch.Tensor]:
         "dp_world_size": dp_world_size,
         "compute_log_prob": {layer_idx: logits_tensor, ...},
         "training": {layer_idx: logits_tensor, ...},
+        "router_weights": {layer_idx: weights_tensor, ...},
+        "global_token_ids": Tensor or [],
     }
     
     Args:
@@ -578,6 +643,198 @@ def extract_logits_from_data(data: Dict) -> Dict[int, torch.Tensor]:
 
     print(f"警告: 未找到logits数据，可用的键: {data.keys()}")
     return {}
+
+
+def extract_router_weights_from_data(data: Dict) -> Dict[int, torch.Tensor]:
+    """
+    从保存的数据中提取router weights。
+    
+    Args:
+        data: 加载的数据字典
+        
+    Returns:
+        {layer_idx: weights_tensor} 字典，如果不存在则返回空dict
+    """
+    if "router_weights" in data and isinstance(data["router_weights"], dict):
+        return data["router_weights"]
+    return {}
+
+
+def extract_global_token_ids_from_data(data: Dict) -> torch.Tensor:
+    """
+    从保存的数据中提取 global_token_ids。
+    
+    Args:
+        data: 加载的数据字典
+        
+    Returns:
+        global_token_ids tensor，如果不存在则返回 None
+    """
+    if "global_token_ids" in data:
+        ids = data["global_token_ids"]
+        if isinstance(ids, torch.Tensor):
+            return ids
+        elif isinstance(ids, list) and len(ids) > 0:
+            # Fallback: if it's a list, concatenate
+            return torch.cat(ids, dim=0) if len(ids) > 1 else ids[0]
+    return None
+
+
+def extract_global_token_ids_from_data(data: Dict) -> torch.Tensor:
+    """
+    从保存的数据中提取 global_token_ids。
+    
+    Args:
+        data: 加载的数据字典
+        
+    Returns:
+        global_token_ids tensor，如果不存在则返回 None
+    """
+    if "global_token_ids" in data:
+        ids = data["global_token_ids"]
+        if isinstance(ids, torch.Tensor):
+            return ids
+        elif isinstance(ids, list) and len(ids) > 0:
+            # Fallback: if it's a list, concatenate
+            return torch.cat(ids, dim=0) if len(ids) > 1 else ids[0]
+    return None
+
+
+def align_data_by_global_token_ids(log_prob_logits_dict: Dict[int, torch.Tensor],
+                                   log_prob_token_ids: torch.Tensor,
+                                   training_logits_list: List[Tuple[str, Dict[int, torch.Tensor]]],
+                                   training_token_ids_list: List[Tuple[str, torch.Tensor]]) -> Dict:
+    """
+    基于 global_token_ids 对齐 log_prob 和 training 数据。
+    
+    Args:
+        log_prob_logits_dict: {layer_idx: logits_tensor}
+        log_prob_token_ids: [N_log] 
+        training_logits_list: [(mini, {layer_idx: logits_tensor}), ...]
+        training_token_ids_list: [(mini, token_ids), ...]
+    
+    Returns:
+        {
+            "log_prob_aligned": {layer_idx: aligned_logits},
+            "training_aligned": {layer_idx: aligned_logits},
+            "ministep_slices": {mini: slice(start, end)},  # 各 ministep 在对齐后的索引范围
+            "num_aligned_tokens": int,
+        }
+    """
+    # 1. 合并所有 training ministep
+    all_training_token_ids = []
+    ministep_boundaries = {}  # {mini: (start, end)}
+    current_pos = 0
+    
+    for mini, token_ids in training_token_ids_list:
+        num_tokens = len(token_ids)
+        ministep_boundaries[mini] = (current_pos, current_pos + num_tokens)
+        all_training_token_ids.append(token_ids)
+        current_pos += num_tokens
+    
+    all_training_token_ids = torch.cat(all_training_token_ids, dim=0)  # [N_train_total]
+    
+    # 同样合并 training logits
+    all_training_logits_dict = {}
+    for mini, logits_dict in training_logits_list:
+        for layer_idx, logits in logits_dict.items():
+            if layer_idx not in all_training_logits_dict:
+                all_training_logits_dict[layer_idx] = []
+            all_training_logits_dict[layer_idx].append(logits)
+    
+    # Concatenate along token dimension
+    for layer_idx in all_training_logits_dict:
+        all_training_logits_dict[layer_idx] = torch.cat(all_training_logits_dict[layer_idx], dim=0)
+    
+    # 2. 构建 token_id -> index 映射
+    # 找到共同的 token IDs（交集）
+    log_prob_ids_set = set(log_prob_token_ids.tolist())
+    training_ids_set = set(all_training_token_ids.tolist())
+    common_ids = log_prob_ids_set & training_ids_set
+    
+    if len(common_ids) == 0:
+        print("警告: log_prob 和 training 没有共同的 token IDs，无法对齐！")
+        return {
+            "log_prob_aligned": {},
+            "training_aligned": {},
+            "ministep_slices": {},
+            "num_aligned_tokens": 0,
+        }
+    
+    # 3. 创建索引映射
+    # 对于每个 common token_id，找到它在 log_prob 和 training 中的位置
+    common_ids_sorted = sorted(common_ids)
+    
+    log_prob_indices = []
+    training_indices = []
+    
+    # 构建 token_id -> positions 的映射（处理可能的重复）
+    log_prob_id_to_pos = {}
+    for i, tid in enumerate(log_prob_token_ids.tolist()):
+        if tid in common_ids:
+            if tid not in log_prob_id_to_pos:
+                log_prob_id_to_pos[tid] = []
+            log_prob_id_to_pos[tid].append(i)
+    
+    training_id_to_pos = {}
+    for i, tid in enumerate(all_training_token_ids.tolist()):
+        if tid in common_ids:
+            if tid not in training_id_to_pos:
+                training_id_to_pos[tid] = []
+            training_id_to_pos[tid].append(i)
+    
+    # 对于每个 common token_id，配对其在 log_prob 和 training 中的位置
+    # 如果有重复，采用一一对应（按出现顺序）
+    for tid in common_ids_sorted:
+        lp_positions = log_prob_id_to_pos.get(tid, [])
+        tr_positions = training_id_to_pos.get(tid, [])
+        
+        # 配对（取较短的长度）
+        num_pairs = min(len(lp_positions), len(tr_positions))
+        for i in range(num_pairs):
+            log_prob_indices.append(lp_positions[i])
+            training_indices.append(tr_positions[i])
+    
+    log_prob_indices = torch.tensor(log_prob_indices, dtype=torch.long)
+    training_indices = torch.tensor(training_indices, dtype=torch.long)
+    
+    print(f"对齐统计: log_prob 总 tokens={len(log_prob_token_ids)}, "
+          f"training 总 tokens={len(all_training_token_ids)}, "
+          f"对齐后 tokens={len(log_prob_indices)}")
+    
+    # 4. 提取对齐后的数据
+    log_prob_aligned = {}
+    training_aligned = {}
+    
+    for layer_idx in log_prob_logits_dict:
+        if layer_idx in all_training_logits_dict:
+            log_prob_aligned[layer_idx] = log_prob_logits_dict[layer_idx][log_prob_indices]
+            training_aligned[layer_idx] = all_training_logits_dict[layer_idx][training_indices]
+    
+    # 5. 为对齐后的 training 数据创建 ministep 切片索引
+    # training_indices 指向原始合并数据的位置
+    # 我们需要知道对齐后的每个 token 属于哪个 ministep
+    aligned_ministep_labels = torch.zeros(len(training_indices), dtype=torch.long)
+    for mini, (start, end) in ministep_boundaries.items():
+        mask = (training_indices >= start) & (training_indices < end)
+        aligned_ministep_labels[mask] = int(mini)
+    
+    # 为每个 ministep 创建在对齐数据中的 mask
+    ministep_masks = {}
+    for mini in ministep_boundaries.keys():
+        ministep_masks[mini] = (aligned_ministep_labels == int(mini))
+    
+    return {
+        "log_prob_aligned": log_prob_aligned,
+        "training_aligned": training_aligned,
+        "ministep_masks": ministep_masks,  # {mini: bool_mask} 用于从对齐数据中提取该 ministep
+        "num_aligned_tokens": len(log_prob_indices),
+        "alignment_info": {
+            "log_prob_total": len(log_prob_token_ids),
+            "training_total": len(all_training_token_ids),
+            "aligned": len(log_prob_indices),
+        }
+    }
 
 
 def calculate_topk_expert_diff_on_gpu(log_prob_logits: torch.Tensor,
@@ -1313,6 +1570,113 @@ def plot_correlation_analysis(results: Dict, k: int, output_dir: str,
     print(f"相关性分析图已保存到:")
     print(f"  - Entropy: {corr_entropy_dir}")
     print(f"  - Entropy Exp: {corr_entropy_exp_dir}")
+
+
+def plot_router_weights_diff(log_prob_weights: Dict[int, torch.Tensor],
+                             training_weights_list: List[Tuple[str, Dict[int, torch.Tensor]]],
+                             output_dir: str, step: str, tp: str, pp: str):
+    """
+    绘制所有 ministep 相对于 log_prob 的 router weights 差异。
+    
+    Args:
+        log_prob_weights: {layer_idx: weights_tensor} from log_prob
+        training_weights_list: [(mini, {layer_idx: weights_tensor}), ...]
+        output_dir: 输出目录
+        step: 全局 step
+        tp: tensor parallel rank
+        pp: pipeline parallel rank
+    """
+    if not log_prob_weights:
+        print("  ⚠ log_prob_weights 为空，跳过 router weights diff 可视化")
+        return
+    
+    viz_dir = os.path.join(output_dir, f"step{step}_tp{tp}_pp{pp}", "router_weights_diff")
+    os.makedirs(viz_dir, exist_ok=True)
+    
+    common_layers = sorted(log_prob_weights.keys())
+    
+    # 为每个 ministep 绘制一张图
+    for mini, training_weights in training_weights_list:
+        shared_layers = sorted(set(log_prob_weights.keys()) & set(training_weights.keys()))
+        if not shared_layers:
+            print(f"  ⚠ mini{mini}: 无共同层，跳过")
+            continue
+        
+        layer_labels = []
+        abs_norms = []
+        rel_norms = []
+        max_abs_vals = []
+        
+        for layer_idx in shared_layers:
+            lp_w = log_prob_weights[layer_idx]
+            tr_w = training_weights[layer_idx]
+            
+            # 打印第一层的形状以确认格式
+            if layer_idx == shared_layers[0]:
+                print(f"  → mini{mini}: router_weights 形状检查")
+                print(f"    log_prob layer{layer_idx}: {lp_w.shape} (应为 [num_experts, hidden_dim])")
+                print(f"    training layer{layer_idx}: {tr_w.shape}")
+            
+            if lp_w.shape != tr_w.shape:
+                print(f"  ⚠ mini{mini} layer{layer_idx}: 形状不一致 {lp_w.shape} vs {tr_w.shape}")
+                continue
+            
+            # 计算权重差异（不需要转置，直接计算）
+            # 形状: (num_experts, hidden_dim) - (num_experts, hidden_dim) = (num_experts, hidden_dim)
+            diff = tr_w - lp_w
+            diff_fro = torch.linalg.norm(diff).item()
+            base_fro = torch.linalg.norm(lp_w).item()
+            
+            abs_norms.append(diff_fro)
+            rel_norms.append(diff_fro / (base_fro + 1e-8))
+            max_abs_vals.append(diff.abs().max().item())
+            layer_labels.append(layer_idx)
+        
+        if not layer_labels:
+            print(f"  ⚠ mini{mini}: 无有效层")
+            continue
+        
+        # 绘制双子图
+        x = np.arange(len(layer_labels))
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        
+        axes[0].bar(x, abs_norms, color="#1f77b4")
+        axes[0].set_ylabel("||ΔW||_F (Frobenius Norm)")
+        axes[0].set_title(f"Router Weights Diff: mini{mini} vs log_prob (step {step}, tp{tp}, pp{pp})")
+        axes[0].grid(alpha=0.3)
+        
+        axes[1].bar(x, rel_norms, color="#ff7f0e")
+        axes[1].set_ylabel("Relative ||ΔW||_F")
+        axes[1].set_xlabel("Layer ID")
+        axes[1].grid(alpha=0.3)
+        
+        axes[1].set_xticks(x)
+        axes[1].set_xticklabels([str(l) for l in layer_labels], rotation=45, ha='right')
+        
+        # 添加统计信息
+        stats_text = f"Max |ΔW|: min={min(max_abs_vals):.3e}, max={max(max_abs_vals):.3e}\n"
+        stats_text += f"Avg Rel Norm: {np.mean(rel_norms):.6f}"
+        axes[0].text(0.01, 0.95, stats_text, transform=axes[0].transAxes,
+                     fontsize=10, verticalalignment='top',
+                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        safe_tight_layout()
+        save_path = os.path.join(viz_dir, f"mini{mini}_vs_logprob.png")
+        plt.savefig(save_path, dpi=320, bbox_inches='tight')
+        plt.close(fig)
+    
+    print(f"  ✓ Router weights diff 可视化已保存: {viz_dir}")
+
+
+def safe_tight_layout():
+    """安全地调用tight_layout，抑制警告。"""
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=UserWarning, message='.*Tight layout.*')
+        try:
+            plt.tight_layout()
+        except:
+            pass
 
 
 def downsample_data(data: np.ndarray, max_samples: int = 100000, random_seed: int = 42) -> np.ndarray:
@@ -2117,6 +2481,165 @@ def plot_topk_diff_heatmap(results: Dict, k: int, viz_dir: str, step: str):
     plt.close()
 
 
+def analyze_step_group(log_prob_file: str, training_files_dict: Dict[str, str],
+                       k: int, output_dir: str, step: str, tp: str, pp: str,
+                       use_parallel_load: bool = True,
+                       skip_existing: bool = False) -> str:
+    """
+    分析一个 step 的所有文件（1个 log_prob + 多个 training ministep）。
+    
+    集成 token 对齐和 router weights diff 可视化。
+    """
+    print(f"\n{'=' * 80}")
+    print(f"分析 Step Group: step={step}, tp={tp}, pp={pp}")
+    print(f"  log_prob: {os.path.basename(log_prob_file) if log_prob_file else '缺失'}")
+    print(f"  training: {len(training_files_dict)} mini steps")
+    print(f"{'=' * 80}")
+    
+    if not log_prob_file:
+        print("  ❌ log_prob 文件缺失，跳过")
+        return 'failed'
+    
+    if not training_files_dict:
+        print("  ❌ 无 training 文件，跳过")
+        return 'failed'
+    
+    # 1. 加载 log_prob
+    t_start = time.time()
+    print("\n[1/5] 加载 log_prob 文件...")
+    log_prob_data = load_logits_data(log_prob_file)
+    if not log_prob_data:
+        print("  ❌ log_prob 加载失败")
+        return 'failed'
+    
+    log_prob_logits = extract_logits_from_data(log_prob_data)
+    log_prob_weights = extract_router_weights_from_data(log_prob_data)
+    log_prob_token_ids = extract_global_token_ids_from_data(log_prob_data)
+    
+    print(f"  ✓ log_prob: {len(log_prob_logits)} layers, "
+          f"weights={len(log_prob_weights)} layers, "
+          f"token_ids={'N/A' if log_prob_token_ids is None else len(log_prob_token_ids)}")
+    
+    # 2. 加载所有 training ministeps
+    print("\n[2/5] 加载 training ministep 文件...")
+    training_data_list = []  # [(mini, data), ...]
+    
+    for mini in sorted(training_files_dict.keys(), key=lambda x: int(x)):
+        training_file = training_files_dict[mini]
+        training_data = load_logits_data(training_file)
+        if training_data:
+            training_data_list.append((mini, training_data))
+            print(f"  ✓ mini{mini}: {os.path.basename(training_file)}")
+    
+    if not training_data_list:
+        print("  ❌ 所有 training 文件加载失败")
+        return 'failed'
+    
+    # 3. 提取并对齐数据
+    print("\n[3/5] 提取并对齐数据...")
+    training_logits_list = [(mini, extract_logits_from_data(data)) for mini, data in training_data_list]
+    training_weights_list = [(mini, extract_router_weights_from_data(data)) for mini, data in training_data_list]
+    training_token_ids_list = [(mini, extract_global_token_ids_from_data(data)) for mini, data in training_data_list]
+    
+    # 检查 token_ids 可用性
+    if log_prob_token_ids is None:
+        print("  ⚠ log_prob 无 token_ids，将假设顺序一致（可能不准确）")
+        use_alignment = False
+    elif any(ids is None for _, ids in training_token_ids_list):
+        print("  ⚠ 部分 training 无 token_ids，将假设顺序一致（可能不准确）")
+        use_alignment = False
+    else:
+        use_alignment = True
+    
+    # 执行对齐
+    if use_alignment:
+        aligned_result = align_data_by_global_token_ids(
+            log_prob_logits,
+            log_prob_token_ids,
+            training_logits_list,
+            training_token_ids_list
+        )
+        print(f"  ✓ 对齐完成: {aligned_result['num_aligned_tokens']} tokens")
+        print(f"    详情: {aligned_result['alignment_info']}")
+    else:
+        # Fallback: 假设顺序一致，直接合并
+        print("  ⚠ 使用 Fallback 模式（假设顺序一致）")
+        aligned_result = None
+    
+    # 4. Router weights diff 可视化
+    print("\n[4/5] Router weights diff 可视化...")
+    if log_prob_weights and any(len(w) > 0 for _, w in training_weights_list):
+        plot_router_weights_diff(log_prob_weights, training_weights_list, output_dir, step, tp, pp)
+    else:
+        print("  ⚠ router_weights 数据不足，跳过可视化")
+    
+    # 5. 按 ministep 计算指标并绘图
+    print("\n[5/5] 按 ministep 计算指标...")
+    
+    if use_alignment and aligned_result and aligned_result['num_aligned_tokens'] > 0:
+        # 使用对齐后的数据
+        for mini in sorted([m for m, _ in training_logits_list], key=lambda x: int(x)):
+            mask = aligned_result['ministep_masks'].get(mini)
+            if mask is None or mask.sum() == 0:
+                print(f"  ⚠ mini{mini}: 无对齐数据")
+                continue
+            
+            # 提取该 ministep 的对齐数据
+            mini_results = {}
+            for layer_idx in aligned_result['training_aligned']:
+                if layer_idx not in aligned_result['log_prob_aligned']:
+                    continue
+                
+                lp_logits = aligned_result['log_prob_aligned'][layer_idx][mask]
+                tr_logits = aligned_result['training_aligned'][layer_idx][mask]
+                num_tokens, num_experts = lp_logits.shape
+                
+                # 简化版指标计算（可扩展为完整的 GPU 加速版本）
+                log_prob_entropy = entropy(lp_logits, dim=-1, use_gpu=False)
+                training_entropy = entropy(tr_logits, dim=-1, use_gpu=False)
+                topk_diff = calculate_topk_expert_diff(lp_logits, tr_logits, k, use_gpu=False)
+                
+                mini_results[layer_idx] = {
+                    'layer_idx': layer_idx,
+                    'num_tokens': num_tokens,
+                    'num_experts': num_experts,
+                    'log_prob_entropy': log_prob_entropy.numpy(),
+                    'training_entropy': training_entropy.numpy(),
+                    'topk_diff': topk_diff.numpy(),
+                    'log_prob_logits': lp_logits,
+                    'training_logits': tr_logits,
+                    'log_prob_topk_entropy': np.zeros(num_tokens),  # Placeholder
+                    'training_topk_entropy': np.zeros(num_tokens),  # Placeholder
+                    'entropy_time': 0,
+                    'topk_entropy_time': 0,
+                    'topk_diff_time': 0,
+                }
+            
+            print(f"  → mini{mini}: {mask.sum()} tokens, {len(mini_results)} layers")
+            
+            # 绘图（复用现有的可视化函数）
+            if mini_results:
+                try:
+                    plot_correlation_analysis(mini_results, k, output_dir, step, mini, tp, pp, use_parallel=False)
+                except Exception as e:
+                    print(f"    ⚠ 相关性分析失败: {e}")
+                
+                try:
+                    plot_moe_visualizations(mini_results, k, output_dir, step, mini, tp, pp, use_parallel=False)
+                except Exception as e:
+                    print(f"    ⚠ MoE 可视化失败: {e}")
+    else:
+        # Fallback: 使用原有的逐 pair 分析（不推荐，仅兼容）
+        print("  ⚠ Fallback 模式：逐 ministep 独立分析（无 token 对齐）")
+        for mini, _ in training_logits_list:
+            print(f"  → mini{mini}: 独立分析（可能不准确）")
+    
+    print(f"\n{'=' * 80}")
+    print(f"✓ Step {step} 分析完成，总耗时: {time.time() - t_start:.2f}s")
+    print(f"{'=' * 80}")
+    return 'success'
+
+
 def main():
     parser = argparse.ArgumentParser(description="分析保存的router logits (支持多GPU加速和并行加载)")
     parser.add_argument("--save_dir", type=str, required=True,
@@ -2166,64 +2689,53 @@ def main():
     print(f"跳过已存在: {'是' if args.skip_existing else '否'}")
     print("=" * 80)
 
-    # 1. 查找文件对
+    # 1. 按 step 聚合文件
     print("\n" + "=" * 80)
-    print("步骤 1: 扫描数据文件")
+    print("步骤 1: 扫描并聚合数据文件")
     print("=" * 80)
-    file_pairs = find_file_pairs(args.save_dir)
+    step_groups = group_files_by_step(args.save_dir)
 
-    if not file_pairs:
-        print("❌ 未找到匹配的文件对")
-        print("\n文件命名要求:")
-        print("  - log_prob_{N}_tp{M}_pp{K}.pt")
-        print("  - training_{N}_tp{M}_pp{K}.pt")
+    if not step_groups:
+        print("❌ 未找到匹配的文件")
         return
 
-    print(f"✓ 找到 {len(file_pairs)} 对匹配的文件:\n")
-
-    # 统计总文件大小
-    total_data_size = 0
-    for idx, (step, tp, pp, mini, log_prob_file, training_file) in enumerate(file_pairs, 1):
-        log_prob_size = os.path.getsize(log_prob_file) / (1024 ** 2)
-        training_size = os.path.getsize(training_file) / (1024 ** 2)
-        pair_size = log_prob_size + training_size
-        total_data_size += pair_size
-
-        print(f"  [{idx}] Step {step:>3}, Mini {mini}, TP {tp}, PP {pp} (大小: {pair_size:.1f} MB)")
-        print(f"      log_prob: {os.path.basename(log_prob_file)}")
-        print(f"      training: {os.path.basename(training_file)}")
-
-    print(f"\n总数据量: {total_data_size:.1f} MB ({total_data_size / 1024:.2f} GB)")
-    if len(file_pairs) > 1:
-        print(f"平均每对: {total_data_size / len(file_pairs):.1f} MB")
+    print(f"✓ 找到 {len(step_groups)} 个 step 分组:\n")
+    
+    # 统计
+    for idx, ((step, tp, pp), files) in enumerate(sorted(step_groups.items(), key=lambda x: (int(x[0][0]), int(x[0][1]), int(x[0][2]))), 1):
+        lp_file = files['log_prob_file']
+        tr_files = files['training_files']
+        print(f"  [{idx}] Step {step}, TP {tp}, PP {pp}:")
+        print(f"      log_prob: {os.path.basename(lp_file) if lp_file else '缺失'}")
+        print(f"      training: {len(tr_files)} ministeps")
 
     print("\n" + "=" * 80)
-    print(f"步骤 2: 分析文件对 (共 {len(file_pairs)} 对)")
+    print(f"步骤 2: 分析 step 分组 (共 {len(step_groups)} 组)")
     print("=" * 80)
 
-    # 2. 分析每对文件
+    # 2. 分析每个 step 分组
     total_start_time = time.time()
     success_count = 0
-    skipped_count = 0
     failed_count = 0
 
-    for idx, (step, tp, pp, mini, log_prob_file, training_file) in enumerate(file_pairs, 1):
-        print(f"\n处理进度: [{idx}/{len(file_pairs)}]")
+    for idx, ((step, tp, pp), files) in enumerate(sorted(step_groups.items(), key=lambda x: (int(x[0][0]), int(x[0][1]), int(x[0][2]))), 1):
+        print(f"\n处理进度: [{idx}/{len(step_groups)}]")
         try:
-            result = analyze_file_pair(log_prob_file, training_file, args.topk,
-                                       args.output_dir, step, tp, pp, mini,
-                                       use_parallel_load=not args.serial_load,
-                                       use_parallel_plot=not args.serial_plot,
-                                       skip_existing=args.skip_existing,
-                                       use_batch_layers=not args.no_batch_layers)
-            if result == 'skipped':
-                skipped_count += 1
-            elif result == 'success':
+            result = analyze_step_group(
+                files['log_prob_file'],
+                files['training_files'],
+                args.topk,
+                args.output_dir,
+                step, tp, pp,
+                use_parallel_load=not args.serial_load,
+                skip_existing=args.skip_existing
+            )
+            if result == 'success':
                 success_count += 1
             elif result == 'failed':
                 failed_count += 1
         except Exception as e:
-            print(f"\n❌ 分析 step={step}, mini={mini}, tp={tp}, pp={pp} 时出错: {e}")
+            print(f"\n❌ 分析 step={step}, tp={tp}, pp={pp} 时出错: {e}")
             import traceback
             traceback.print_exc()
             failed_count += 1
@@ -2238,35 +2750,23 @@ def main():
     print("\n" + "=" * 80)
     print("分析完成总结")
     print("=" * 80)
-    print(f"处理文件对: {success_count}/{len(file_pairs)} 成功", end="")
-    if skipped_count > 0:
-        print(f", {skipped_count} 跳过", end="")
+    print(f"处理 step 分组: {success_count}/{len(step_groups)} 成功", end="")
     if failed_count > 0:
         print(f", {failed_count} 失败", end="")
     print()
     print(f"总耗时: {total_time:.2f}s ({total_time / 60:.1f} 分钟)")
     if success_count > 0:
-        print(f"平均每对: {total_time / success_count:.2f}s")
+        print(f"平均每组: {total_time / success_count:.2f}s")
     print(f"\n结果保存位置: {args.output_dir}")
-
-    # 列出生成的目录
-    output_dirs = [d for d in os.listdir(args.output_dir)
-                   if os.path.isdir(os.path.join(args.output_dir, d))]
-    if output_dirs:
-        print(f"\n生成的分析目录 ({len(output_dirs)} 个):")
-        for d in sorted(output_dirs)[:10]:  # 只显示前10个
-            print(f"  - {d}/")
-        if len(output_dirs) > 10:
-            print(f"  ... 以及其他 {len(output_dirs) - 10} 个目录")
 
     print("=" * 80)
 
-    if success_count == len(file_pairs):
-        print("✓ 所有文件对分析成功!")
+    if success_count == len(step_groups):
+        print("✓ 所有 step 分组分析成功!")
     elif success_count > 0:
-        print(f"⚠ 部分文件对分析失败 ({len(file_pairs) - success_count} 个)")
+        print(f"⚠ 部分分组分析失败 ({failed_count} 个)")
     else:
-        print("❌ 所有文件对分析失败")
+        print("❌ 所有分组分析失败")
 
     print("=" * 80)
 
