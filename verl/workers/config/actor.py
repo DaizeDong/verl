@@ -44,14 +44,11 @@ class RouterReplayConfig(BaseConfig):
             Required when mode is 'record', 'R2', or 'R3'.
         replay_file (Optional[str]): File path to load recorded routing decisions for replay.
             Required when mode is 'replay'.
-        save_frequency (int): Save router logits every N steps. Default is 1 (save every step).
-            Set to higher values to reduce I/O overhead (e.g., 10 to save every 10 steps).
     """
 
     mode: str = "disabled"
     record_file: Optional[str] = None
     replay_file: Optional[str] = None
-    save_frequency: int = 1
 
     def __post_init__(self):
         """Validate router replay configuration."""
