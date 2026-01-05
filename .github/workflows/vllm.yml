@@ -74,7 +74,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE: "verl-ci-cn-beijing.cr.volces.com/verlai/verl:vllm011.dev7"
+  IMAGE: "verl-ci-cn-beijing.cr.volces.com/verlai/verl:vllm012.latest"
   DYNAMIC_RUNNER_ENDPOINT: "https://sd10g3clalm04ug7alq90.apigateway-cn-beijing.volceapi.com/runner"
 
 jobs:
@@ -109,7 +109,8 @@ jobs:
           fetch-depth: 0
       - name: Install the current repository
         run: |
-          pip3 install -e .[test]
+          pip3 install -r requirements-test.txt
+          pip3 install --no-deps -e .
 #      - name: Download Model to Use
 #        run: |
 #          huggingface-cli download Qwen/Qwen2.5-0.5B-Instruct --local-dir ${HOME}/models/Qwen/Qwen2.5-0.5B-Instruct
@@ -124,12 +125,9 @@ jobs:
       - name: Test the latest vLLM Rollout async with agent loop
         run: |
           ROLLOUT_NAME=vllm pytest -svvv tests/experimental/agent_loop
-      - name: Test the latest vLLM
+      - name: Test vllm server abort functionality
         run: |
-          torchrun --standalone --nnodes=1 --nproc_per_node=4 $(which pytest) -s tests/workers/rollout/rollout_vllm/test_vllm_spmd.py
-      - name: Test the latest vLLM on model with rope scaling
-        run: |
-          torchrun --standalone --nnodes=1 --nproc_per_node=4 $(which pytest) -s tests/workers/rollout/rollout_vllm/test_vllm_model_rope_scaling.py
+          pytest tests/workers/rollout/rollout_vllm/test_vllm_abort.py -v -s
       # Note(haibin.lin): for any new test, please update gpu_unit_tests.yaml to avoid repeated tests
 
   cleanup:

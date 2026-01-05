@@ -18,6 +18,7 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import asyncio
 import uuid
 from collections import defaultdict
 from pprint import pprint
@@ -109,6 +110,18 @@ class RobRayPPOTrainer(RayPPOTrainer):
     Supports various model architectures including FSDP, Megatron, vLLM, and SGLang integration.
     """
 
+    def _start_profiling(self, do_profile: bool) -> None:
+        """Start profiling for all worker groups including env workers."""
+        super()._start_profiling(do_profile)
+        if do_profile and hasattr(self, "env_wg"):
+            self.env_wg.start_profile(role="env", profile_step=self.global_steps)
+
+    def _stop_profiling(self, do_profile: bool) -> None:
+        """Stop profiling for all worker groups including env workers."""
+        super()._stop_profiling(do_profile)
+        if do_profile and hasattr(self, "env_wg"):
+            self.env_wg.stop_profile()
+
     def init_workers(self):
         self.resource_pool_manager.create_resource_pool()
 
@@ -190,6 +203,13 @@ class RobRayPPOTrainer(RayPPOTrainer):
 
         return gen_batch
 
+    def _reset_envs(self, gen_batch: DataProto) -> asyncio.Future:
+        initial_state_ids = gen_batch.non_tensor_batch["state_ids"]
+        task_ids = gen_batch.non_tensor_batch["task_ids"]
+        reset_prompts = DataProto.from_dict(non_tensors={"state_ids": initial_state_ids, "task_ids": task_ids})
+        reset_future = self.env_wg.reset_envs_to_state_ids(reset_prompts)
+        return reset_future
+
     def fit(self):
         """
         The training loop of PPO.
@@ -240,7 +260,18 @@ class RobRayPPOTrainer(RayPPOTrainer):
         next_step_profile = False
 
         for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            train_iter = iter(self.train_dataloader)
+            next_batch_dict = next(train_iter)
+            need_validate = False
+            dataloader_len = len(self.train_dataloader)
+            print(f"Starting epoch {epoch}, dataloader length: {dataloader_len}")
+            for step_idx in range(dataloader_len):
+                batch_dict = next_batch_dict
+                try:
+                    next_batch_dict = next(train_iter)
+                except StopIteration:
+                    next_batch_dict = None
+
                 metrics = {}
                 timing_raw = {}
 
@@ -271,10 +302,31 @@ class RobRayPPOTrainer(RayPPOTrainer):
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
                 is_last_step = self.global_steps >= self.total_training_steps
+
+                if step_idx == 0 or need_validate:
+                    # reset env workers in first step
+                    # if validation on last step, the reset was not executed and need to be done here
+                    reset_future = self._reset_envs(gen_batch)
+
+                need_validate = (
+                    self.val_reward_fn is not None
+                    and self.config.trainer.test_freq > 0
+                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                )
+
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch, reset_future)
+
+                    # prepare for next batch's env reset
+                    if step_idx != dataloader_len - 1 and not need_validate:
+                        next_batch: DataProto = DataProto.from_single_dict(next_batch_dict)
+                        next_gen_batch = self._get_gen_batch(next_batch)
+                        next_gen_batch = next_gen_batch.repeat(
+                            repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                        )
+                        reset_future = self._reset_envs(next_gen_batch)
 
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
@@ -419,11 +471,7 @@ class RobRayPPOTrainer(RayPPOTrainer):
                             )
 
                 # validate
-                if (
-                    self.val_reward_fn is not None
-                    and self.config.trainer.test_freq > 0
-                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
-                ):
+                if need_validate:
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics: dict = self._validate()
                         if is_last_step:
@@ -555,7 +603,10 @@ class RobRayPPOTrainer(RayPPOTrainer):
             if not self.async_rollout_mode:
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+                reset_future = self._reset_envs(test_gen_batch_padded)
+                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(
+                    test_gen_batch_padded, reset_future
+                )
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)

@@ -28,7 +28,7 @@ from codetiming import Timer
 from omegaconf import DictConfig, OmegaConf
 
 try:
-    from mindspeed.megatron_adaptor import repatch
+    from verl.workers.engine.mindspeed.transformer_impl import repatch
 except ImportError:
     repatch = None
 
@@ -51,6 +51,7 @@ from verl.utils.device import (
 from verl.utils.distributed import set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
+from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
 from verl.utils.megatron_utils import (
     load_megatron_model_to_gpu,
     load_megatron_optimizer,
@@ -285,6 +286,15 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 mesh_name="actor", dp_rank=mpu.get_data_parallel_rank(), is_collect=is_collect
             )
         only_rollout = self._is_rollout and not self._is_actor
+
+        self.enable_routing_replay = False
+        if self._is_actor:
+            self.router_replay = self.config.actor.router_replay
+            self.enable_routing_replay = self.router_replay.mode != "disabled"
+
+        if self.enable_routing_replay:
+            apply_router_replay_patch()
+
         set_random_seed(seed=self.config.actor.megatron.seed, only_rollout=only_rollout)
 
         if self._is_actor:
@@ -453,7 +463,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         # TODO: add more optimizer args into config
         if self._is_actor:
-            optim_config_megatron = init_megatron_optim_config(optim_config, fp16=self.dtype == torch.float16)
+            optim_config_megatron = init_megatron_optim_config(
+                optim_config,
+                use_distributed_optimizer=wrap_config.use_distributed_optimizer,
+                fp16=self.dtype == torch.float16,
+            )
             actor_optimizer = get_megatron_optimizer(model=actor_module, config=optim_config_megatron)
             actor_optimizer_scheduler = get_megatron_optimizer_param_scheduler(
                 optimizer=actor_optimizer, config=optim_config
@@ -519,11 +533,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         # 5. switch to trainer mode
         # NOTE: It's critical that hybrid engine in trainer mode initially to load checkpoint.
-        # For sync mode, we directly switch to trainer mode here.
         # For async mode, we can't call run_until_complete here, so we will switch to trainer mode in AgentLoopManager.
-        if rollout_config.mode == "sync" and self._is_actor:
-            loop = get_event_loop()
-            loop.run_until_complete(self.trainer_mode())
+        # Note: sync mode is deprecated and rejected in RolloutConfig.__post_init__
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -540,6 +551,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             override_transformer_config = OmegaConf.to_container(
                 OmegaConf.create(self.config.actor.megatron.get("override_transformer_config", {}))
             )
+            if self.enable_routing_replay:
+                override_transformer_config["enable_routing_replay"] = True
             override_ddp_config = OmegaConf.to_container(
                 OmegaConf.create(self.config.actor.megatron.get("override_ddp_config", {}))
             )
@@ -585,6 +598,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 actor_module=self.actor_module,
                 actor_optimizer=self.actor_optimizer,
             )
+            print(f"routing replay layers: {len(RouterReplay.router_instances)}")
             log_gpu_memory_usage("After MegatronPPOActor init", logger=logger)
 
         if self._is_rollout:
@@ -650,6 +664,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
         aggressive_empty_cache(force_sync=True)
+        set_expandable_segments(False)
 
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor.actor_module, load_grad=False)
@@ -668,8 +683,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 self.tf_config,
                 self.layer_name_mapping,
             )
-
-        set_expandable_segments(False)
 
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
@@ -708,7 +721,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="update_actor", logger=logger)
-    @DistProfiler.annotate(color="red")
+    @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:
@@ -751,7 +764,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @GPUMemoryLogger(role="generate_sequences", logger=logger)
-    @DistProfiler.annotate(color="red")
+    @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):
         assert self._is_rollout
         prompts = prompts.to(get_device_name())
@@ -801,7 +814,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="compute_ref_log_prob", logger=logger)
-    @DistProfiler.annotate(color="olive")
+    @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
         assert self._is_ref
         if self._ref_is_offload_param:
@@ -812,7 +825,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
-        output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+        output, _, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
         output = DataProto.from_dict(tensors={"ref_log_prob": output})
         output = output.to("cpu")
         if self._ref_is_offload_param:
@@ -823,7 +836,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="compute_log_prob", logger=logger)
-    @DistProfiler.annotate(color="blue")
+    @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:
@@ -834,11 +847,25 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
-        output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+
+        if self.enable_routing_replay and self.config.actor.router_replay.mode == "R2":
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+
+        if self.enable_routing_replay and self.config.actor.router_replay.mode == "R3":
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+
+        output, entropys, layers_topk_idx = self.actor.compute_log_prob(data=data, calculate_entropy=True)
         output = DataProto.from_dict(
             tensors={"old_log_probs": output, "entropys": entropys},
             meta_info={"temperature": self.config.rollout.temperature},
         )
+        if self.config.actor.router_replay.mode == "R2":
+            output.batch["routed_experts"] = layers_topk_idx
+
+        if self.config.actor.router_replay.mode in ["R2", "R3"]:
+            RouterReplay.clear_global_indices()
+            RouterReplay.clear_global_router_replay_action()
+
         output = output.to("cpu")
         # clear kv cache
         if self._is_offload_param:
@@ -876,12 +903,16 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     def save_checkpoint(self, checkpoint_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)
+        if self.checkpoint_mananager.checkpoint_config.async_save and self._is_offload_optimizer:
+            load_megatron_optimizer(self.actor_optimizer)
         self.checkpoint_mananager.save_checkpoint(
             local_path=checkpoint_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
+        if self.checkpoint_mananager.checkpoint_config.async_save and self._is_offload_optimizer:
+            offload_megatron_optimizer(self.actor_optimizer)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def async_calls_finalize_fn_exec(self, blocking=False):
@@ -1091,7 +1122,11 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
             print_model_size(critic_module[0])
 
         # TODO: add more optimizer args into config
-        optim_config_megatron = init_megatron_optim_config(optim_config, fp16=self.dtype == torch.float16)
+        optim_config_megatron = init_megatron_optim_config(
+            optim_config,
+            use_distributed_optimizer=wrap_config.use_distributed_optimizer,
+            fp16=self.dtype == torch.float16,
+        )
         critic_optimizer = get_megatron_optimizer(model=critic_module, config=optim_config_megatron)
         critic_optimizer_scheduler = get_megatron_optimizer_param_scheduler(
             optimizer=critic_optimizer, config=optim_config
@@ -1173,7 +1208,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
         )
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
-    @DistProfiler.annotate(color="cyan")
+    @DistProfiler.annotate(color="cyan", role="compute_values")
     def compute_values(self, data: DataProto):
         micro_batch_size = self.config.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
@@ -1190,7 +1225,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
-    @DistProfiler.annotate(color="pink")
+    @DistProfiler.annotate(color="pink", role="critic_update")
     def update_critic(self, data: DataProto):
         data = data.to(get_device_id())
 
@@ -1414,7 +1449,7 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
     # TODO: reward model use itself tokenizer instead of sft tokenizer
     # the input_ids, responses, attention_mask and position_ids may be different!
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
-    @DistProfiler.annotate(color="brown")
+    @DistProfiler.annotate(color="brown", role="compute_rm_score")
     def compute_rm_score(self, data: DataProto):
         data.meta_info["micro_batch_size"] = self.config.micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = self.config.forward_max_token_len_per_gpu

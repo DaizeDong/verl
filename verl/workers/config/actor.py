@@ -25,7 +25,36 @@ from .engine import FSDPEngineConfig, McoreEngineConfig
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
-__all__ = ["PolicyLossConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
+__all__ = ["PolicyLossConfig", "RouterReplayConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
+
+
+@dataclass
+class RouterReplayConfig(BaseConfig):
+    """Configuration for router replay in MoE models.
+
+    This configuration controls the routing behavior for Mixture of Experts (MoE) models,
+    allowing for deterministic training through route recording and replay.
+
+    Args:
+        mode (str): Router replay mode. Options: 'disabled', 'R2', 'R3'.
+            - 'disabled': No router replay functionality
+            - 'R2': Use Router Replay routing strategy
+            - 'R3': Use Rollout Router Replay routing strategy
+        record_file (Optional[str]): File path to save recorded routing decisions.
+            Required when mode is 'record', 'R2', or 'R3'.
+        replay_file (Optional[str]): File path to load recorded routing decisions for replay.
+            Required when mode is 'replay'.
+    """
+
+    mode: str = "disabled"
+    record_file: Optional[str] = None
+    replay_file: Optional[str] = None
+
+    def __post_init__(self):
+        """Validate router replay configuration."""
+        valid_modes = ["disabled", "R2", "R3"]
+        if self.mode not in valid_modes:
+            raise ValueError(f"Invalid router_replay mode: {self.mode}. Must be one of {valid_modes}")
 
 
 @dataclass
@@ -74,6 +103,8 @@ class ActorConfig(BaseConfig):
         loss_scale_factor (Optional[int]): Scale factor for 'seq-mean-token-sum-norm' loss aggregation mode.
             If None, uses response_length. Set to a constant to ensure consistent normalization.
         entropy_coeff (float): Entropy coefficient for regularization.
+        tau_pos (float): Positive tau for SAPO smoothing (>= 1.0 keeps rewards stable).
+        tau_neg (float): Negative tau for SAPO smoothing (> tau_pos for asymmetry).
         use_kl_loss (bool): Whether to use KL divergence loss.
         use_torch_compile (bool): Whether to use torch.compile for optimization.
         kl_loss_coef (float): KL divergence loss coefficient.
@@ -84,6 +115,7 @@ class ActorConfig(BaseConfig):
         optim (OptimizerConfig): Configuration for optimizer.
         use_fused_kernels (bool): Whether to use custom fused kernels (e.g., FlashAttention, fused MLP).
         data_loader_seed (int): Seed for data loader. If None, uses global seed.
+        router_replay (RouterReplayConfig): Configuration for router replay in MoE models.
     """
 
     _mutable_fields = BaseConfig._mutable_fields | {
@@ -112,6 +144,8 @@ class ActorConfig(BaseConfig):
     loss_agg_mode: str = "token-mean"
     loss_scale_factor: Optional[int] = None
     entropy_coeff: float = 0
+    tau_pos: float = 1.0
+    tau_neg: float = 1.05
     calculate_entropy: bool = False
     use_kl_loss: bool = False
     use_torch_compile: bool = True
@@ -127,6 +161,7 @@ class ActorConfig(BaseConfig):
     engine: BaseConfig = field(default_factory=BaseConfig)
     rollout_n: int = MISSING  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
+    router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
@@ -247,7 +282,6 @@ class FSDPActorConfig(ActorConfig):
     entropy_checkpointing: bool = False
     fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     use_remove_padding: bool = False
-    profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     use_rollout_log_probs: bool = False
 
     def __post_init__(self):
