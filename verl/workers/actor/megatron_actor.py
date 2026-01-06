@@ -25,6 +25,7 @@ import os
 from functools import partial
 from typing import Iterable
 
+import numpy as np
 import torch
 import torch.distributed
 from megatron.core import parallel_state as mpu
@@ -40,7 +41,7 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
-from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, RouterReplayCacheAction
+from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, RouterReplayCacheAction, RouterPredictiveAction
 from verl.utils.megatron.router_replay_saver import RouterReplayLogitsSaver
 from verl.utils.megatron.router_replay_utils import (
     RouterReplayHelper,
@@ -48,6 +49,8 @@ from verl.utils.megatron.router_replay_utils import (
     pp_gather,
     reorder_and_merge_vpp_layers,
     set_router_replay_data,
+    merge_router_predictive_data,
+    set_router_predictive_data,
 )
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
 from verl.utils.megatron_utils import get_model_config, unwrap_model
@@ -161,12 +164,17 @@ class MegatronPPOActor(BasePPOActor):
 
         self.router_replay = self.config.router_replay
         self.enable_routing_replay = self.router_replay.mode != "disabled"
+        self.enable_bias_predictor = self.router_replay.enable_bias_predictor
 
         # Initialize mini_layer_topk_idx_list if router replay is enabled
         if self.enable_routing_replay:
             self.mini_layer_topk_idx_list = []
+            if self.enable_bias_predictor:
+                self.mini_layer_old_inputs_list = []
+                self.mini_layer_old_logits_list = []
+                self.mini_layer_sampled_masks_list = []  # Store sampled batch indices
 
-        # Initialize logits saver if record_file is specified (独立于 router_replay mode)
+        # Initialize logits saver if record_file is specified
         if self.router_replay.record_file not in [None, ""]:
             self.logits_saver = RouterReplayLogitsSaver(self.router_replay.record_file)
             self.enable_logits_saving = True
@@ -247,10 +255,10 @@ class MegatronPPOActor(BasePPOActor):
                     logger.warning("[compute_log_prob] R3 mode but routed_experts not in batch (likely first step). "
                                    "Will record routing decisions this step for replay in next step.")
             
-            # Include global_token_ids if present (for alignment in LogProb phase)
+            # Include global_token_ids if present (for alignment in update_policy phase)
             if "global_token_ids" in data.batch.keys():
                 select_keys.append("global_token_ids")
-            
+
             batch = data.select(batch_keys=select_keys).batch
             input_ids = batch["input_ids"]
             batch_size = input_ids.size(0)
@@ -316,7 +324,9 @@ class MegatronPPOActor(BasePPOActor):
                         async_op=False,
                     )
                     entropys = entropys.to("cpu")
+
                 layers_topk_idx = None
+                layers_predictive_states = None
 
                 if RouterReplayHelper.is_r2_record_action(self.tf_config):
                     # (bs, max_seq_len/response_len,local_layer_num,topk)
@@ -328,10 +338,55 @@ class MegatronPPOActor(BasePPOActor):
                         revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
                         layers_topk_idx = layers_topk_idx[revert_indices]
                     layers_topk_idx = pp_gather(layers_topk_idx, self.tf_config)
+
+                    if RouterReplayHelper.is_predictive_record_action(self.tf_config):
+                        layers_old_inputs = output["mini_layer_old_inputs_tensor"]  # [downsampled_batch_size, seq_len, layers, hidden]
+                        layers_old_logits = output["mini_layer_old_logits_tensor"]  # [downsampled_batch_size, seq_len, layers, experts]
+                        sampled_masks = output["mini_layer_sampled_masks_tensor"]  # [bs], bool tensor
+
+                        # Memory debug - before reordering
+                        inputs_mb = layers_old_inputs.numel() * layers_old_inputs.element_size() / 1024 / 1024
+                        logits_mb = layers_old_logits.numel() * layers_old_logits.element_size() / 1024 / 1024
+                        logger.info(f"[Memory] compute_log_prob: old_inputs={inputs_mb:.2f}MB ({layers_old_inputs.shape}), old_logits={logits_mb:.2f}MB ({layers_old_logits.shape})")
+
+                        # Note: dynamic_bsz reordering is skipped for downsampled data
+                        # The reordering will be handled in megatron_workers.py when splitting per-sample
+                        if use_dynamic_bsz:
+                            # TODO: check correctness
+                            indices = output["indices"] # [bs], range from 0 to (bs - 1)
+                            sampled_indices = indices[sampled_masks] # [sampled_batch_size], range from 0 to (bs - 1)
+                            # Now we need to reassign the indices from 0 to (sampled_batch_size - 1), while keeping the order
+                            # Out target: [99, 20, 49, 2, 40, 75, 0, 8] => [7, 3, 5, 1, 4, 6, 0, 2]
+                            indices_for_sorting = torch.argsort(sampled_indices) # [99, 20, 49, 2, 40, 75, 0, 8] => [6, 3, 7, 1, 4, 2, 5, 0]
+                            revert_indices = torch.tensor(get_reverse_idx(indices_for_sorting), dtype=torch.long) # [6, 3, 7, 1, 4, 2, 5, 0] => [7, 3, 5, 1, 4, 6, 0, 2]
+                            layers_old_inputs = layers_old_inputs[revert_indices]
+                            layers_old_logits = layers_old_logits[revert_indices]
+                            # raise NotImplementedError("Dynamic batch size reordering for predictive data is not implemented yet.")
+
+                        # Reorder and merge vpp layers
+                        hidden_size = layers_old_inputs.shape[-1]
+                        num_experts = layers_old_logits.shape[-1]
+                        layers_merged = torch.cat([layers_old_inputs, layers_old_logits], dim=-1)
+                        layers_merged = pp_gather(layers_merged, self.tf_config) # [downsampled_batch_size, seq_len, layers, hidden + experts]
+                        layers_old_inputs, layers_old_logits = torch.split(layers_merged, [hidden_size, num_experts], dim=-1)
+
+                        # convert to numpy and add None for unsampled entries
+                        downsampled_batch_size = layers_old_inputs.shape[0]
+                        layers_old_inputs = np.split(layers_old_inputs.numpy(), layers_old_inputs.shape[0], axis=0) # list of [seq_len, layers, hidden], length = downsampled_batch_size
+                        layers_old_logits = np.split(layers_old_logits.numpy(), layers_old_logits.shape[0], axis=0) # list of [seq_len, layers, experts], length = downsampled_batch_size
+                        for i in range(len(sampled_masks)):
+                            if sampled_masks[i] == False:
+                                layers_old_inputs.insert(i, None)
+                                layers_old_logits.insert(i, None)
+                        full_batch_size = len(sampled_masks)
+                        logger.info(f"[Downsample] Restored predictive data to full batch size: {full_batch_size} (downsampled from {downsampled_batch_size})")
+
+                        layers_predictive_states = (layers_old_inputs, layers_old_logits)
+
         # add empty cache after each compute
         get_torch_device().empty_cache()
 
-        return log_probs, entropys, layers_topk_idx
+        return log_probs, entropys, layers_topk_idx, layers_predictive_states
 
     def make_minibatch_iterator(self, data: DataProto) -> Iterable[DataProto]:
         """Make minibatch iterator for updating the actor
@@ -388,6 +443,12 @@ class MegatronPPOActor(BasePPOActor):
                 logger.warning("[make_minibatch_iterator] R3 mode but routed_experts not in batch. Training will record this step.")
         if self.enable_logits_saving:
             select_keys.append("global_token_ids")
+        # Router bias predictor: include old_inputs and old_logits for training
+        if self.enable_bias_predictor:
+            if "old_inputs" in data.batch.keys():
+                select_keys.append("old_inputs")
+            if "old_logits" in data.batch.keys():
+                select_keys.append("old_logits")
         if self.has_multi_modal_inputs:
             data = data.select(select_keys, ["multi_modal_inputs"])
         else:
@@ -452,6 +513,7 @@ class MegatronPPOActor(BasePPOActor):
                     num_batches_divided_by=microbatch_group_size_per_vp_stage,
                     max_token_len=max_token_len,
                 )
+                # TODO: non_tensor_batch for old_inputs and old_logits
                 assert len(micro_batches) % self.tf_config.microbatch_group_size_per_vp_stage == 0, (
                     f"micro_batches {micro_batches} must be divisible by microbatch_group_size_per_vp_stage "
                     f"{microbatch_group_size_per_vp_stage} for megatron backend"
@@ -464,6 +526,7 @@ class MegatronPPOActor(BasePPOActor):
                 "micro_batch_size is needed to be passed in when not using dynamic batch size"
             )
             micro_batches = mini_batch.batch.split(micro_batch_size)
+            # TODO: non_tensor_batch for old_inputs and old_logits
             seq_len = micro_batches[0]["input_ids"].shape[1]
             total_seqlen = micro_batch_size * seq_len
         # compute input shapes for pp stages
@@ -628,12 +691,17 @@ class MegatronPPOActor(BasePPOActor):
 
             if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
                 # R3 mode: use routed_experts if available
-                if "routed_experts" in batch:
-                    layers_topk_idx = batch["routed_experts"]
-                    set_router_replay_data(layers_topk_idx, attention_mask, self.tf_config, vp_rank)
-                else:
-                    # First step without routed_experts, skip replay (will use natural routing)
-                    logger.warning("[forward_step] R3 replay_forward but routed_experts not in batch. Skipping replay.")
+                layers_topk_idx = batch["routed_experts"]
+                set_router_replay_data(layers_topk_idx, attention_mask, self.tf_config, vp_rank)
+
+                if RouterReplayHelper.is_predictive_compute_loss_action(self.tf_config, vp_rank):
+                    # Read old_inputs and old_logits from non_tensor_batch (per-sample, may contain None)
+                    if "old_inputs" in batch and "old_logits" in batch:
+                        old_inputs = batch["old_inputs"] # list of numpy arrays or None
+                        old_logits = batch["old_logits"] # list of numpy arrays or None
+                        # TODO: convert to torch tensors and filter out None inside set_router_predictive_data
+                        # TODO: also create a valid_mask tensor to indicate which samples are valid
+                        set_router_predictive_data(valid_old_inputs, valid_old_logits, valid_attention_mask, self.tf_config, vp_rank, valid_mask)
 
             from verl.models.mcore import get_mcore_forward_fn, get_mcore_forward_fused_fn
 
@@ -700,9 +768,23 @@ class MegatronPPOActor(BasePPOActor):
                 }
 
             if RouterReplayHelper.is_r2_record_action(self.tf_config, vp_rank):
-                merge_router_topk_indices(
+                packed_seq_params = merge_router_topk_indices(
                     attention_mask, input_ids, self.mini_layer_topk_idx_list, self.tf_config, vp_rank
                 )
+                if RouterReplayHelper.is_predictive_record_action(self.tf_config, vp_rank):
+                    # Use downsample_batch_size to reduce memory usage (1 = keep 1 sequence per micro-batch)
+                    merge_router_predictive_data(
+                        attention_mask,
+                        input_ids,
+                        self.mini_layer_old_inputs_list,
+                        self.mini_layer_old_logits_list,
+                        self.mini_layer_sampled_masks_list,
+                        self.tf_config,
+                        vp_rank,
+                        packed_seq_params=packed_seq_params,
+                        downsample_batch_size=self.config.router_replay.predictive_downsample_batch_size,
+                        storage_dtype=self.config.router_replay.predictive_storage_dtype,
+                    )
 
             # Record token_ids if present and logits saving is enabled
             if self.enable_logits_saving and RouterReplay.current_cache_action is not None:
@@ -766,9 +848,32 @@ class MegatronPPOActor(BasePPOActor):
                 losses_reduced["mini_layer_topk_idx_tensor"] = reorder_and_merge_vpp_layers(
                     self.mini_layer_topk_idx_list, bs, vp_size, microbatch_group_size_per_vp_stage
                 )
+                if RouterReplayHelper.is_predictive_record_action(self.tf_config):
+                    losses_reduced["mini_layer_old_inputs_tensor"] = reorder_and_merge_vpp_layers(
+                        self.mini_layer_old_inputs_list, bs, vp_size, microbatch_group_size_per_vp_stage
+                    )
+                    losses_reduced["mini_layer_old_logits_tensor"] = reorder_and_merge_vpp_layers(
+                        self.mini_layer_old_logits_list, bs, vp_size, microbatch_group_size_per_vp_stage
+                    )
+                    losses_reduced["mini_layer_sampled_masks_tensor"] = reorder_and_merge_vpp_layers(
+                        self.mini_layer_sampled_masks_list, bs, vp_size, microbatch_group_size_per_vp_stage
+                    )
             else:
                 losses_reduced["mini_layer_topk_idx_tensor"] = torch.cat(self.mini_layer_topk_idx_list, dim=0)
+                if RouterReplayHelper.is_predictive_record_action(self.tf_config):
+                    losses_reduced["mini_layer_old_inputs_tensor"] = torch.cat(self.mini_layer_old_inputs_list, dim=0)
+                    losses_reduced["mini_layer_old_logits_tensor"] = torch.cat(self.mini_layer_old_logits_list, dim=0)
+                    losses_reduced["mini_layer_sampled_masks_tensor"] = torch.cat(self.mini_layer_sampled_masks_list, dim=0)
+                    # Memory debug
+                    inputs_mb = losses_reduced["mini_layer_old_inputs_tensor"].numel() * losses_reduced["mini_layer_old_inputs_tensor"].element_size() / 1024 / 1024
+                    logits_mb = losses_reduced["mini_layer_old_logits_tensor"].numel() * losses_reduced["mini_layer_old_logits_tensor"].element_size() / 1024 / 1024
+                    logger.info(f"[Memory] Concatenated predictive tensors: old_inputs={inputs_mb:.2f}MB, old_logits={logits_mb:.2f}MB")
+            # Clear mini-batch storage
             self.mini_layer_topk_idx_list = []
+            if RouterReplayHelper.is_predictive_record_action(self.tf_config):
+                self.mini_layer_old_inputs_list = []
+                self.mini_layer_old_logits_list = []
+                self.mini_layer_sampled_masks_list = []
 
         return losses_reduced
 
@@ -799,6 +904,13 @@ class MegatronPPOActor(BasePPOActor):
 
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+                # Set predictive action based on ministep
+                if self.config.router_replay.enable_bias_predictor:
+                    if mini_step == 0:  # First ministep: skip predictive loss
+                        RouterReplay.set_global_predictive_action(RouterPredictiveAction.SKIP_PREDICTIVE)
+                    else:  # Later ministeps: compute predictive loss
+                        assert mini_step <= 1, "Only 2 ministeps supported for now"
+                        RouterReplay.set_global_predictive_action(RouterPredictiveAction.COMPUTE_PREDICTIVE_LOSS)
 
             self.actor_optimizer.zero_grad()
             # use use_contiguous_buffers_in_local_ddp and no overlap_dp_param_comm
@@ -855,6 +967,10 @@ class MegatronPPOActor(BasePPOActor):
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.clear_global_router_replay_action()
                 RouterReplay.clear_global_indices()
+                # Clear predictive action after each ministep
+                if self.config.router_replay.enable_bias_predictor:
+                    RouterReplay.clear_global_predictive_action()
+                    RouterReplay.clear_global_predictive_data()
 
             # Save logits cache for this mini step (only when should_save)
             if should_save:
@@ -885,6 +1001,14 @@ class MegatronPPOActor(BasePPOActor):
             if global_step is None:
                 self.training_step += 1
             RouterReplay.clear_cache_action()
+        
+        # Collect and log predictive metrics for wandb
+        if self.enable_bias_predictor:
+            predictive_metrics = RouterReplay.get_and_clear_predictive_metrics()
+            if predictive_metrics:
+                for key, value in predictive_metrics.items():
+                    metrics[f"router/{key}"] = value
+                logger.info(f"Predictive metrics: {predictive_metrics}")
 
         # add empty cache after each compute
         if self.use_torch_profiler and self.prof and self.prof.enable:

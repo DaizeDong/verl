@@ -32,6 +32,7 @@ try:
 except ImportError:
     repatch = None
 
+import numpy as np
 from megatron.core import parallel_state as mpu
 
 from verl import DataProto
@@ -51,7 +52,7 @@ from verl.utils.device import (
 from verl.utils.distributed import set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
-from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, RouterReplayCacheAction, apply_router_replay_patch
+from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, RouterReplayCacheAction, apply_router_replay_patch, RouterPredictiveAction
 from verl.utils.megatron_utils import (
     load_megatron_model_to_gpu,
     load_megatron_optimizer,
@@ -578,6 +579,15 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             if self.enable_routing_replay:
                 override_transformer_config["enable_routing_replay"] = True
                 logger.info(f"[Rank {self.rank}] Set enable_routing_replay=True in transformer_config")
+            
+            # Set router bias predictor config if enabled
+            if self.router_replay.enable_bias_predictor:
+                override_transformer_config["enable_router_bias_predictor"] = True
+                override_transformer_config["router_bias_scale"] = self.router_replay.bias_scale
+                override_transformer_config["router_bias_predictor_loss_type"] = self.router_replay.bias_predictor_loss_type
+                logger.info(f"[Rank {self.rank}] Router bias predictor enabled with scale={self.router_replay.bias_scale}, "
+                           f"loss_type={self.router_replay.bias_predictor_loss_type}, "
+                           f"storage_dtype={self.router_replay.predictive_storage_dtype}")
 
             # Log logits_saving status for debugging
             if self.enable_logits_saving:
@@ -856,7 +866,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
-        output, _, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+        output, _, _, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
         output = DataProto.from_dict(tensors={"ref_log_prob": output})
         output = output.to("cpu")
         if self._ref_is_offload_param:
@@ -892,6 +902,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         if self.enable_routing_replay and self.config.actor.router_replay.mode == "R2":
             RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+            # Set predictive action for log_prob phase
+            if self.config.actor.router_replay.enable_bias_predictor:
+                RouterReplay.set_global_predictive_action(RouterPredictiveAction.RECORD)
 
         if self.enable_routing_replay and self.config.actor.router_replay.mode == "R3":
             # R3 mode: Replay if routed_experts available, otherwise Record (for first step)
@@ -901,7 +914,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 logger.info(f"[Rank {self.rank}] R3 mode: routed_experts not in batch (first step). Using RECORD mode this time.")
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-        output, entropys, layers_topk_idx = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+        output, entropys, layers_topk_idx, layers_predictive_states = self.actor.compute_log_prob(data=data, calculate_entropy=True)
         output = DataProto.from_dict(
             tensors={"old_log_probs": output, "entropys": entropys},
             meta_info={"temperature": self.config.rollout.temperature},
@@ -909,6 +922,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # Save routed_experts for R2, or R3 when it recorded this step (for next step's replay)
         if self.config.actor.router_replay.mode == "R2":
             output.batch["routed_experts"] = layers_topk_idx
+            if self.config.actor.router_replay.enable_bias_predictor:
+                if layers_predictive_states is not None:
+                    # Store to non_tensor_batch
+                    output.non_tensor_batch["old_inputs"] = layers_predictive_states[0]  # list of [seq_len, layers, hidden], length = bs
+                    output.non_tensor_batch["old_logits"] = layers_predictive_states[1]  # list of [seq_len, layers, num_experts], length = bs
+                else:
+                    logger.warning(f"[Rank {self.rank}] Bias predictor enabled but layers_predictive_states is None!")
+
         elif self.config.actor.router_replay.mode == "R3":
             # R3: only save if we recorded this step (i.e., routed_experts was not in input batch)
             if "routed_experts" not in data.batch.keys() and layers_topk_idx is not None:
@@ -918,6 +939,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self.config.actor.router_replay.mode in ["R2", "R3"]:
             RouterReplay.clear_global_indices()
             RouterReplay.clear_global_router_replay_action()
+            if self.config.actor.router_replay.enable_bias_predictor:
+                RouterReplay.clear_global_predictive_data()
+                RouterReplay.clear_global_predictive_action()
 
         # Save logits cache for this compute_log_prob call (only if should_save)
         if should_save:

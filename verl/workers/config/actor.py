@@ -46,18 +46,46 @@ class RouterReplayConfig(BaseConfig):
             Required when mode is 'replay'.
         save_frequency (int): Save router logits every N steps. Default is 1 (save every step).
             Set to higher values to reduce I/O overhead (e.g., 10 to save every 10 steps).
+        enable_bias_predictor (bool): Enable router bias predictor for R2-only predicted routing replay.
+            When enabled, an extra nn.Linear(hidden_size -> num_experts) is added next to each router
+            to predict routing biases. Default is False.
+        bias_scale (float): Scaling factor for bias predictor output: z' = z + bias_scale * delta_logits.
+            Only effective when enable_bias_predictor is True. Default is 1.0.
+        bias_predictor_loss_type (str): Loss type for training the bias predictor. Options: 'l2', 'kl'.
+            Only effective when enable_bias_predictor is True. Default is 'kl'.
+        predictive_downsample_batch_size (int): Number of sequences to keep per micro-batch when storing predictive data.
+            Keeps the first N sequences from each micro-batch to reduce memory usage.
+            Data is stored in non_tensor_batch as compact tensors (None for non-sampled samples).
+            Set to None to disable downsampling and keep all sequences.
+            Example: batch_size=8, downsample_batch_size=1 saves ~87.5% memory.
+        predictive_storage_dtype (str): Data type for storing predictive data (old_inputs/old_logits).
+            Options: 'fp32', 'bf16', 'fp16'. Lower precision saves memory with minimal impact on accuracy.
+            Default is 'bf16' (saves 50% memory compared to fp32).
     """
 
     mode: str = "disabled"
     record_file: Optional[str] = None
     replay_file: Optional[str] = None
     save_frequency: int = 1
+    enable_bias_predictor: bool = False
+    bias_scale: float = 1.0
+    bias_predictor_loss_type: str = "kl"
+    predictive_downsample_batch_size: int = None
+    predictive_storage_dtype: str = "bf16"
 
     def __post_init__(self):
         """Validate router replay configuration."""
         valid_modes = ["disabled", "R2", "R3"]
         if self.mode not in valid_modes:
             raise ValueError(f"Invalid router_replay mode: {self.mode}. Must be one of {valid_modes}")
+        
+        valid_loss_types = ["l2", "kl", "kl-post"]
+        if self.bias_predictor_loss_type not in valid_loss_types:
+            raise ValueError(f"Invalid bias_predictor_loss_type: {self.bias_predictor_loss_type}. Must be one of {valid_loss_types}")
+        
+        valid_dtypes = ["fp32", "bf16", "fp16"]
+        if self.predictive_storage_dtype not in valid_dtypes:
+            raise ValueError(f"Invalid predictive_storage_dtype: {self.predictive_storage_dtype}. Must be one of {valid_dtypes}")
 
 
 @dataclass

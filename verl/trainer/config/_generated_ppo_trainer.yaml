@@ -115,6 +115,11 @@ actor_rollout_ref:
       record_file: null
       replay_file: null
       save_frequency: 1
+      enable_bias_predictor: false
+      bias_scale: 1.0
+      bias_predictor_loss_type: kl
+      predictive_downsample_batch_size: null
+      predictive_storage_dtype: bf16
     grad_clip: 1.0
     ulysses_sequence_parallel_size: 1
     entropy_from_logits_with_chunking: false
@@ -159,6 +164,11 @@ actor_rollout_ref:
       record_file: null
       replay_file: null
       save_frequency: 1
+      enable_bias_predictor: false
+      bias_scale: 1.0
+      bias_predictor_loss_type: kl
+      predictive_downsample_batch_size: null
+      predictive_storage_dtype: bf16
     fsdp_config:
       _target_: verl.workers.config.FSDPEngineConfig
       wrap_policy:

@@ -244,3 +244,8 @@ router_replay:
   # Set to higher values to reduce I/O overhead (e.g., 10 to save every 10 steps)
   save_frequency: 1
 
+  enable_bias_predictor: false
+  bias_scale: 1.0
+  bias_predictor_loss_type: kl
+  predictive_downsample_batch_size: null
+  predictive_storage_dtype: bf16

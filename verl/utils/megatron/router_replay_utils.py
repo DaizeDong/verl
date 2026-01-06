@@ -167,7 +167,7 @@ def get_num_layers_to_build(
     return num_layers_to_build
 
 
-def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_list, tf_config, vp_rank=None):
+def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_list, tf_config, vp_rank=None, packed_seq_params=None):
     """
     Merge recorded router top-k indices across sequence-parallel ranks for all router instances,
     then pack/unpack them to align with the original (batch, seq_len) layout and append the result.
@@ -188,12 +188,14 @@ def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_lis
         [1, dynamic_bs_all, layer_num, topk] to mini_layer_topk_idx_list.
     """
     with torch.no_grad():
+        print(f"Packing router top-k indices for vp_rank={vp_rank}")
         router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
         layers_topk_idx = []
         for router in router_instances_list:
             layers_topk_idx.append(router.recorded_topk_idx.to(torch.uint8))  # dynamic_bs, topk
 
         # layer_num, dynamic_bs, topk  -> dynamic_bs, layer_num, topk
+        print(f"Shape of layers_topk_idx before gather: {layers_topk_idx[0].shape}, total layers: {len(layers_topk_idx)}")
         layers_topk_idx = torch.stack(layers_topk_idx).permute(1, 0, 2).to(device_name)
         # dynamic_bs, layer_num, topk -> 1, dynamic_bs_all, layer_num, topk
         layers_topk_idx = (
@@ -201,14 +203,22 @@ def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_lis
             .unsqueeze(0)
             .contiguous()
         )
+        print(f"Shape of layers_topk_idx after gather: {layers_topk_idx.shape}")
 
         batch_size, seq_len = attention_mask.shape[:2]
-        _, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=True)
+        if packed_seq_params is None:
+            _, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=True)
         layers_topk_idx = postprocess_packed_seqs(
             layers_topk_idx, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True
         )
+        print(f"Shape of layers_topk_idx after postprocess: {layers_topk_idx.shape}")
         mini_layer_topk_idx_list.append(layers_topk_idx.cpu())
 
+        # Clear recorded topk indices from router instances to free GPU memory
+        for router in router_instances_list:
+            router.recorded_topk_idx = None
+
+    return packed_seq_params
 
 def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=None):
     """
@@ -247,6 +257,188 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
         router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
         for i, router in enumerate(router_instances_list):
             router.set_target_indices(layers_topk_idx_reshape[i + offset].to(torch.int64))
+
+
+@torch.no_grad()
+def merge_router_predictive_data(
+    attention_mask,
+    input_ids,
+    mini_layer_old_inputs_list,
+    mini_layer_old_logits_list,
+    mini_layer_sampled_masks_list,
+    tf_config,
+    vp_rank=None,
+    packed_seq_params=None,
+    downsample_batch_size=None,
+    storage_dtype='bf16'
+):
+    # TODO: check implementation correctness
+    """
+    Args:
+        downsample_batch_size: Number of sequences to keep per micro-batch. Keeps the first N sequences.
+            Set to None to keep all sequences (no downsampling).
+        storage_dtype: Data type for storage ('fp32', 'bf16', 'fp16'). Lower precision saves memory.
+    
+    Returns:
+        sampled_indices: Tensor of sampled batch indices (0 to downsample_batch_size-1, or 0 to batch_size-1 if no downsampling).
+    """
+    print(f"Packing router old_inputs & old_logits for vp_rank={vp_rank}, downsample_batch_size={downsample_batch_size}, storage_dtype={storage_dtype}")
+    router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+    layers_old_inputs = []
+    layers_old_logits = []
+    for router in router_instances_list:
+        layers_old_inputs.append(router.recorded_old_inputs)  # dynamic_bs, hidden_size
+        layers_old_logits.append(router.recorded_old_logits)  # dynamic_bs, num_experts
+
+    # layer_num, dynamic_bs, hidden_size  -> dynamic_bs, layer_num, hidden_size
+    # layer_num, dynamic_bs, num_experts  -> dynamic_bs, layer_num, num_experts
+    print(f"Shape of layers_old_inputs before gather: {layers_old_inputs[0].shape}, total layers: {len(layers_old_inputs)}")
+    print(f"Shape of layers_old_logits before gather: {layers_old_logits[0].shape}, total layers: {len(layers_old_logits)}")
+    layers_old_inputs = torch.stack(layers_old_inputs).permute(1, 0, 2).to(device_name)
+    layers_old_logits = torch.stack(layers_old_logits).permute(1, 0, 2).to(device_name)
+
+    # Save original shapes before concat
+    hidden_size = layers_old_inputs.shape[-1]
+    num_experts = layers_old_logits.shape[-1]
+
+    # dynamic_bs, layer_num, hidden_size -> 1, dynamic_bs_all, layer_num, hidden_size
+    # dynamic_bs, layer_num, num_experts -> 1, dynamic_bs_all, layer_num, num_experts
+    layers_merged_tensor = torch.cat([layers_old_inputs, layers_old_logits], dim=-1)
+    layers_merged_tensor = (
+        gather_from_sequence_parallel_region(layers_merged_tensor, tensor_parallel_output_grad=False)
+        .unsqueeze(0)
+        .contiguous()
+    )
+    layers_old_inputs, layers_old_logits = torch.split(layers_merged_tensor, [hidden_size, num_experts], dim=-1)
+    print(f"Shape of layers_old_inputs after gather: {layers_old_inputs.shape}")
+    print(f"Shape of layers_old_logits after gather: {layers_old_logits.shape}")
+
+    batch_size, seq_len = attention_mask.shape[:2]
+    if packed_seq_params is None:
+        _, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=True)
+    layers_old_inputs = postprocess_packed_seqs(layers_old_inputs, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True)
+    layers_old_logits = postprocess_packed_seqs(layers_old_logits, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True)
+
+    # Memory usage debug info BEFORE downsampling
+    inputs_size_mb = layers_old_inputs.numel() * layers_old_inputs.element_size() / 1024 / 1024
+    logits_size_mb = layers_old_logits.numel() * layers_old_logits.element_size() / 1024 / 1024
+    print(f"[Downsample] BEFORE downsample - layers_old_inputs shape: {layers_old_inputs.shape}, size: {inputs_size_mb:.2f} MB, dtype: {layers_old_inputs.dtype}")
+    print(f"[Downsample] BEFORE downsample - layers_old_logits shape: {layers_old_logits.shape}, size: {logits_size_mb:.2f} MB, dtype: {layers_old_logits.dtype}")
+
+    # Batch-level downsampling to reduce memory usage
+    bs, seq_len_actual, num_layers, hidden_size = layers_old_inputs.shape
+    num_experts = layers_old_logits.shape[-1]
+
+    if downsample_batch_size is not None and downsample_batch_size >= bs:
+        downsample_batch_size = None  # No downsampling needed
+
+    if downsample_batch_size is None:
+        # No downsampling needed - keep all batches
+        downsample_mask = torch.ones((bs,), dtype=torch.bool)
+        layers_old_inputs_sampled = layers_old_inputs  # [bs, seq_len, layers, hidden]
+        layers_old_logits_sampled = layers_old_logits  # [bs, seq_len, layers, experts]
+        inputs_size_mb_after = inputs_size_mb
+        logits_size_mb_after = logits_size_mb
+        print(f"[Downsample] No downsampling: batch_size ({bs}) <= downsample_batch_size ({downsample_batch_size})")
+    else:
+        # Simply take the first N batches
+        downsample_mask = torch.cat([
+            torch.ones((downsample_batch_size,), dtype=torch.bool),
+            torch.zeros((bs - downsample_batch_size,), dtype=torch.bool),
+        ], dim=0)
+        layers_old_inputs_sampled = layers_old_inputs[:downsample_batch_size, ...]  # [downsample_batch_size, seq_len, layers, hidden]
+        layers_old_logits_sampled = layers_old_logits[:downsample_batch_size, ...]  # [downsample_batch_size, seq_len, layers, experts]
+        inputs_size_mb_after = layers_old_inputs_sampled.numel() * layers_old_inputs_sampled.element_size() / 1024 / 1024
+        logits_size_mb_after = layers_old_logits_sampled.numel() * layers_old_logits_sampled.element_size() / 1024 / 1024
+        print(f"[Downsample] Batch downsampling: kept first {downsample_batch_size}/{bs} sequences")
+        print(f"[Downsample] AFTER downsample - shape: {layers_old_inputs_sampled.shape}, size: {inputs_size_mb_after:.2f} MB (saved {inputs_size_mb - inputs_size_mb_after:.2f} MB)")
+
+    # Lower precision storage to save memory
+    dtype_map = {'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}
+    target_dtype = dtype_map.get(storage_dtype, torch.bfloat16)
+
+    if target_dtype != layers_old_inputs_sampled.dtype:
+        layers_old_inputs_sampled = layers_old_inputs_sampled.to(target_dtype)
+        layers_old_logits_sampled = layers_old_logits_sampled.to(target_dtype)
+
+        inputs_size_mb_final = layers_old_inputs_sampled.numel() * layers_old_inputs_sampled.element_size() / 1024 / 1024
+        logits_size_mb_final = layers_old_logits_sampled.numel() * layers_old_logits_sampled.element_size() / 1024 / 1024
+        print(f"[Memory] Reduced precision to {target_dtype}: old_inputs {inputs_size_mb_after:.2f}MB → {inputs_size_mb_final:.2f}MB, "
+              f"old_logits {logits_size_mb_after:.2f}MB → {logits_size_mb_final:.2f}MB")
+
+    # Store sampled data
+    mini_layer_old_inputs_list.append(layers_old_inputs_sampled.cpu())
+    mini_layer_old_logits_list.append(layers_old_logits_sampled.cpu())
+    mini_layer_sampled_masks_list.append(downsample_mask.cpu())
+
+    # Calculate cumulative memory
+    total_size_mb = sum(t.numel() * t.element_size() for t in mini_layer_old_inputs_list) / 1024 / 1024
+    total_size_mb += sum(t.numel() * t.element_size() for t in mini_layer_old_logits_list) / 1024 / 1024
+    print(f"[Memory] Cumulative predictive data in list: {total_size_mb:.2f} MB ({len(mini_layer_old_inputs_list)} micro-batches)")
+
+    # Clear recorded data from router instances to free GPU memory
+    for router in router_instances_list:
+        router.recorded_old_inputs = None
+        router.recorded_old_logits = None
+
+
+def set_router_predictive_data(layers_old_inputs, layers_old_logits, attention_mask, tf_config, vp_rank=None, valid_mask=None):
+    # TODO: check implementation correctness
+    """
+    Args:
+        layers_old_inputs (torch.Tensor): Router inputs with shape [bs, max_seq_len, layer_num, hidden_size].
+            This should be the merged output produced by merge_router_old_inputs.
+        layers_old_logits (torch.Tensor): Router inputs with shape [bs, max_seq_len, layer_num, num_experts].
+            This should be the merged output produced by merge_router_old_logits.
+        valid_mask (Optional[torch.Tensor]): Boolean mask of shape [full_batch_size] indicating which samples
+            have valid predictive data. If provided, only valid samples will be used for loss computation.
+    """
+    with torch.no_grad():
+        # Get the actual dtype from bias_predictor weights to ensure type matching
+        # This allows model weights to be fp32 while storage is bf16
+        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+        if router_instances_list and hasattr(router_instances_list[0], 'bias_predictor') and router_instances_list[0].bias_predictor is not None:
+            # Get dtype from the actual bias_predictor weights
+            compute_dtype = router_instances_list[0].bias_predictor.weight.dtype
+            print(f"[Memory] Detected bias_predictor weight dtype: {compute_dtype}")
+        else:
+            # Fallback to model's params_dtype
+            compute_dtype = tf_config.params_dtype
+            print(f"[Memory] Using tf_config.params_dtype: {compute_dtype}")
+        
+        if layers_old_inputs.dtype != compute_dtype:
+            print(f"[Memory] Converting predictive data from {layers_old_inputs.dtype} to {compute_dtype} for computation")
+            layers_old_inputs = layers_old_inputs.to(compute_dtype)
+            layers_old_logits = layers_old_logits.to(compute_dtype)
+        
+        layers_old_inputs_rmpad, _ = preprocess_packed_seqs(layers_old_inputs, attention_mask, pre_process=True)
+        layers_old_inputs_rmpad = layers_old_inputs_rmpad.contiguous()  # dynamic_bs_all, layer_num, hidden_size
+        layers_old_logits_rmpad, _ = preprocess_packed_seqs(layers_old_logits, attention_mask, pre_process=True)
+        layers_old_logits_rmpad = layers_old_logits_rmpad.contiguous()  # dynamic_bs_all, layer_num, num_experts
+
+        # dynamic_bs_split, layer_num, hidden_size
+        layers_old_inputs_rmpad_split = scatter_to_sequence_parallel_region(
+            layers_old_inputs_rmpad.to(device_name).squeeze(dim=0)
+        ).unsqueeze(dim=0)
+        # dynamic_bs_split, layer_num, num_experts
+        layers_old_logits_rmpad_split = scatter_to_sequence_parallel_region(
+            layers_old_logits_rmpad.to(device_name).squeeze(dim=0)
+        ).unsqueeze(dim=0)
+
+        # dynamic_bs_split, layer_num, hidden_size -> layer_num, dynamic_bs_split, hidden_size
+        layers_old_inputs_reshape = layers_old_inputs_rmpad_split.permute(0, 2, 1, 3).squeeze(
+            dim=0
+        )  # layer_num, dynamic_bs_all, hidden_size
+        # dynamic_bs_split, layer_num, num_experts -> layer_num, dynamic_bs_split, num_experts
+        layers_old_logits_reshape = layers_old_logits_rmpad_split.permute(0, 2, 1, 3).squeeze(
+            dim=0
+        )  # layer_num, dynamic_bs_all, num_experts
+
+        local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
+        offset, _ = local_rank_info["start"], local_rank_info["end"]
+        # router_instances_list already obtained above for dtype detection, reuse it
+        for i, router in enumerate(router_instances_list):
+            router.set_predictive_data(layers_old_inputs_reshape[i + offset], layers_old_logits_reshape[i + offset], valid_mask=valid_mask)
 
 
 def reorder_and_merge_vpp_layers(
@@ -441,4 +633,49 @@ class RouterReplayHelper:
         return (
             router_instances_list
             and router_instances_list[0].router_replay_action == RouterReplayAction.REPLAY_BACKWARD
+        )
+
+    @staticmethod
+    def is_predictive_record_action(tf_config, vp_rank=None) -> bool:
+        """Check if current action is RECORD_FOR_PREDICTIVE (log_prob phase).
+        
+        This inspects the first local RouterReplay instance's predictive_action and compares it to
+        RouterPredictiveAction.RECORD_FOR_PREDICTIVE.
+        """
+        from verl.utils.megatron.router_replay_patch import RouterPredictiveAction
+
+        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+        return (
+            router_instances_list
+            and router_instances_list[0].predictive_action == RouterPredictiveAction.RECORD
+        )
+
+    @staticmethod
+    def is_predictive_compute_loss_action(tf_config, vp_rank=None) -> bool:
+        """Check if current action is COMPUTE_PREDICTIVE_LOSS (training ministep>=1).
+        
+        This inspects the first local RouterReplay instance's predictive_action and compares it to
+        RouterPredictiveAction.COMPUTE_PREDICTIVE_LOSS.
+        """
+        from verl.utils.megatron.router_replay_patch import RouterPredictiveAction
+
+        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+        return (
+            router_instances_list
+            and router_instances_list[0].predictive_action == RouterPredictiveAction.COMPUTE_PREDICTIVE_LOSS
+        )
+
+    @staticmethod
+    def is_predictive_skip_action(tf_config, vp_rank=None) -> bool:
+        """Check if current action is SKIP_PREDICTIVE (training ministep==0).
+        
+        This inspects the first local RouterReplay instance's predictive_action and compares it to
+        RouterPredictiveAction.SKIP_PREDICTIVE.
+        """
+        from verl.utils.megatron.router_replay_patch import RouterPredictiveAction
+
+        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+        return (
+            router_instances_list
+            and router_instances_list[0].predictive_action == RouterPredictiveAction.SKIP_PREDICTIVE
         )
