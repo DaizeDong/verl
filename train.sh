@@ -6,7 +6,7 @@ set -x
 # Basic (match reference style)
 ############################################
 NNODES=${NNODES:-1}
-NGPUS_PER_NODES=${NGPUS_PER_NODES:-6}
+NGPUS_PER_NODES=${NGPUS_PER_NODES:-8}
 
 # In Slurm, prefer Slurm envs if present
 SLURM_NNODES=${SLURM_NNODES:-$NNODES}
@@ -15,10 +15,10 @@ SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE:-$NGPUS_PER_NODES}
 ############################################
 # Data paths
 ############################################
-export TRAIN_FILE=${TRAIN_FILE:-"/common/users/jc3585/olmoe/data/gsm8k/train.parquet"}
-export TEST_FILE=${TEST_FILE:-"/common/users/jc3585/olmoe/data/gsm8k/test.parquet"}
-# export TRAIN_FILE=${TRAIN_FILE:-"/common/users/jc3585/olmoe/data/DAPO-Math-17k/train.parquet"}
-# export TEST_FILE=${TEST_FILE:-"/common/users/jc3585/olmoe/data/aime-2024-full/train.parquet"}
+export TRAIN_FILE=${TRAIN_FILE:-"/common/users/jc3585/verl/data/gsm8k/train.parquet"}
+export TEST_FILE=${TEST_FILE:-"/common/users/jc3585/verl/data/gsm8k/test.parquet"}
+# export TRAIN_FILE=${TRAIN_FILE:-"/common/users/jc3585/verl/data/DAPO-Math-17k/train.parquet"}
+# export TEST_FILE=${TEST_FILE:-"/common/users/jc3585/verl/data/aime-2024-full/train.parquet"}
 
 ############################################
 # Safer NCCL defaults (single-node PCIe)
@@ -32,15 +32,15 @@ export TORCH_NCCL_BLOCKING_WAIT=${TORCH_NCCL_BLOCKING_WAIT:-1}
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
-export WANDB_DIR=/common/users/jc3585/olmoe/wandb
-export WANDB_CACHE_DIR=/common/users/jc3585/olmoe/wandb/cache
-export WANDB_ARTIFACTS_DIR=/common/users/jc3585/olmoe/wandb/artifacts
+export WANDB_DIR=/common/users/jc3585/verl/wandb
+export WANDB_CACHE_DIR=/common/users/jc3585/verl/wandb/cache
+export WANDB_ARTIFACTS_DIR=/common/users/jc3585/verl/wandb/artifacts
 
 
 ############################################
 # Python path (Ray workers import verl.*)
 ############################################
-export PYTHONPATH="/common/users/jc3585/olmoe/verl${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="/common/users/jc3585/verl${PYTHONPATH:+:$PYTHONPATH}"
 
 ############################################
 # W&B (do NOT hardcode key here)
@@ -87,7 +87,7 @@ fi
 ############################################
 # Dist checkpoint (TP1)
 ############################################
-CKPT_TP1=${CKPT_TP1:-"/common/users/jc3585/olmoe/megatron_ckpt/olmoe_1b7b_0125_Instruct_tp1_pp1_mcore_fullqk"}
+CKPT_TP1=${CKPT_TP1:-"/common/users/jc3585/verl/megatron_ckpt/olmoe_1b7b_0125_Instruct_tp1_pp1_mcore_fullqk"}
 
 ############################################
 # Parallel (keep your minimal-memory TP=1)
@@ -138,7 +138,7 @@ use_kl_loss=${use_kl_loss:-False}
 kl_loss_coef=${kl_loss_coef:-0.0}
 
 clip_ratio_low=${clip_ratio_low:-0.2}
-clip_ratio_high=${clip_ratio_high:-0.4}
+clip_ratio_high=${clip_ratio_high:-0.2}
 clip_ratio_c=${clip_ratio_c:-10.0}
 # You currently had max_prompt_length=1024 and no max_response_length.
 # Reference uses much longer; keep conservative defaults, but expose knobs:
@@ -158,13 +158,13 @@ loss_agg_mode=${loss_agg_mode:-"token-mean"}
 ############################################
 # Batch sizes (align names to reference style)
 ############################################
-train_prompt_bsz=${train_prompt_bsz:-24}  # your data.train_batch_size=24
+train_prompt_bsz=${train_prompt_bsz:-32}  # your data.train_batch_size=24
 if [ "${USE_PPO}" -eq 1 ]; then
   n_resp_per_prompt=${n_resp_per_prompt:-4}
 else
   n_resp_per_prompt=${n_resp_per_prompt:-8}  # your rollout.n=8
 fi
-train_prompt_mini_bsz=${train_prompt_mini_bsz:-24}  # your ppo_mini_batch_size=24
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-32}  # your ppo_mini_batch_size=24
 train_ppo_micro_batch_size_per_gpu=${train_ppo_micro_batch_size_per_gpu:-1}  # your micro=1
 infer_ppo_micro_batch_size_per_gpu=${infer_ppo_micro_batch_size_per_gpu:-1}  # your logprob micro=1
 critic_ppo_micro_batch_size_per_gpu=${critic_ppo_micro_batch_size_per_gpu:-$train_ppo_micro_batch_size_per_gpu}
@@ -213,7 +213,7 @@ if [ -z "${SKIP_RAY_START:-}" ]; then
     --head \
     --port=9339 \
     --num-cpus=128 \
-    --num-gpus=6 \
+    --num-gpus=8 \
     --include-dashboard=false \
     --disable-usage-stats
 fi
@@ -295,6 +295,7 @@ python3 -m verl.trainer.main_ppo "${CFG_ARGS[@]}" \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${train_ppo_micro_batch_size_per_gpu} \
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
   actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
+  actor_rollout_ref.actor.optim.lr=5e-7 \
   \
   actor_rollout_ref.actor.megatron.use_mbridge=False \
   actor_rollout_ref.actor.megatron.sequence_parallel=False \
@@ -339,12 +340,12 @@ python3 -m verl.trainer.main_ppo "${CFG_ARGS[@]}" \
   trainer.logger='["console","wandb"]' \
   trainer.project_name="${WANDB_PROJECT}" \
   trainer.experiment_name="${WANDB_NAME}" \
-  trainer.n_gpus_per_node=6 \
+  trainer.n_gpus_per_node=8 \
   trainer.nnodes=1 \
   trainer.test_freq=10 \
   trainer.total_epochs=1 \
-  +trainer.rollout_data_dir="/common/users/jc3585/olmoe/outputs/${TIME}/rollout_logs" \
-  +trainer.validation_data_dir="/common/users/jc3585/olmoe/outputs/${TIME}/val_logs" \
+  +trainer.rollout_data_dir="/common/users/jc3585/verl/outputs/${TIME}/rollout_logs" \
+  +trainer.validation_data_dir="/common/users/jc3585/verl/outputs/${TIME}/val_logs" \
   trainer.log_val_generations=10 \
   trainer.save_freq=200 \
   +trainer.save_freq_final=1 \
