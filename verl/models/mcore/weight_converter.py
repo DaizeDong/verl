@@ -32,6 +32,23 @@ class McoreToHFWeightConverterBase:
 
 
 class McoreToHFWeightConverterDense(McoreToHFWeightConverterBase):
+    def _expand_qk_layernorm(self, param: torch.Tensor, *, is_k: bool) -> torch.Tensor:
+        hidden_size = getattr(self.hf_config, "hidden_size", None)
+        num_heads = getattr(self.hf_config, "num_attention_heads", None)
+        num_kv_heads = getattr(self.hf_config, "num_key_value_heads", num_heads)
+        if hidden_size is None or num_heads is None:
+            return param
+
+        if param.dim() == 2:
+            return param.reshape(-1).contiguous()
+
+        if param.dim() == 1 and param.numel() != hidden_size:
+            repeat_factor = num_kv_heads if is_k else num_heads
+            if repeat_factor and param.numel() * repeat_factor == hidden_size:
+                return param.repeat(repeat_factor)
+
+        return param
+
     def _convert_attention_param(self, name: str, params: list[torch.Tensor]) -> tuple[list[str], list[torch.Tensor]]:
         # 'decoder.layers.0.self_attention.linear_proj.weight'
         # 'decoder.layers.0.self_attention.linear_qkv.layer_norm_weight'
@@ -55,9 +72,11 @@ class McoreToHFWeightConverterDense(McoreToHFWeightConverterBase):
         elif "self_attention.q_layernorm.weight" in name:
             convert_names.append(f"model.layers.{layer_number}.self_attn.q_norm.weight")
             assert len(params) == 1
+            params = [self._expand_qk_layernorm(params[0], is_k=False)]
         elif "self_attention.k_layernorm.weight" in name:
             convert_names.append(f"model.layers.{layer_number}.self_attn.k_norm.weight")
             assert len(params) == 1
+            params = [self._expand_qk_layernorm(params[0], is_k=True)]
         else:
             raise NotImplementedError(f"Unsupported parameter name: {name}")
         return convert_names, params
@@ -477,3 +496,8 @@ class McoreToHFWeightConverterQwen3Moe(McoreToHFWeightConverterDense):
         else:
             raise NotImplementedError(f"Unsupported parameter name: {name}")
         return convert_names, params
+
+
+class McoreToHFWeightConverterOlmoe(McoreToHFWeightConverterQwen3Moe):
+    """OLMoE shares the same MoE projection layout as Qwen-style MoE (gate/up/down per expert)."""
+    pass

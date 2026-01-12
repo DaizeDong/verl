@@ -147,6 +147,86 @@ class MixtralModel(BaseModelInitializer):
         return model
 
 
+class OlmoeModel(BaseModelInitializer):
+    """Initializer for OLMoE models."""
+
+    def get_transformer_layer_spec(self, vp_stage=None):
+        assert self.tfconfig.normalization == "RMSNorm", "only RMSNorm is supported for now"
+        extra_kwargs = {} if not self.has_vp_stage else {"vp_stage": vp_stage}
+        return get_gpt_decoder_block_spec(self.tfconfig, use_transformer_engine=True, **extra_kwargs)
+
+    def initialize(self, **kwargs):
+        def _replace_qk_layernorms_full_hidden(model):
+            import torch
+            import torch.nn as nn
+            from megatron.core import parallel_state as mpu
+            from megatron.core import tensor_parallel
+
+            class FullHiddenQKNorm(nn.Module):
+                """Apply RMSNorm over full hidden size with TP gather/split."""
+
+                def __init__(self, hidden_size: int, eps: float):
+                    super().__init__()
+                    self.weight = nn.Parameter(torch.ones(hidden_size))
+                    self.eps = eps
+
+                def forward(self, x: torch.Tensor) -> torch.Tensor:
+                    tp_size = mpu.get_tensor_model_parallel_world_size()
+                    tp_rank = mpu.get_tensor_model_parallel_rank()
+
+                    orig_shape = x.shape
+                    if x.dim() == 4:
+                        # [s, b, n, h] -> [s, b, n*h] for full-hidden RMSNorm
+                        x = x.reshape(orig_shape[0], orig_shape[1], -1)
+
+                    if tp_size > 1:
+                        x_full = tensor_parallel.gather_from_tensor_model_parallel_region(x)
+                    else:
+                        x_full = x
+
+                    variance = x_full.pow(2).mean(dim=-1, keepdim=True)
+                    x_norm = x_full * torch.rsqrt(variance + self.eps)
+                    x_norm = x_norm * self.weight
+
+                    if tp_size > 1:
+                        x_chunks = torch.chunk(x_norm, tp_size, dim=-1)
+                        x_norm = x_chunks[tp_rank].contiguous()
+
+                    if len(orig_shape) == 4:
+                        x_norm = x_norm.view(orig_shape)
+
+                    return x_norm
+
+            if not hasattr(model, "decoder"):
+                return
+
+            for layer in model.decoder.layers:
+                attn = layer.self_attention
+                if hasattr(attn, "q_layernorm"):
+                    device = attn.q_layernorm.weight.device
+                    dtype = attn.q_layernorm.weight.dtype
+                    attn.q_layernorm = FullHiddenQKNorm(self.hf_config.hidden_size, self.hf_config.rms_norm_eps).to(
+                        device=device,
+                        dtype=dtype,
+                    )
+                if hasattr(attn, "k_layernorm"):
+                    device = attn.k_layernorm.weight.device
+                    dtype = attn.k_layernorm.weight.dtype
+                    attn.k_layernorm = FullHiddenQKNorm(self.hf_config.hidden_size, self.hf_config.rms_norm_eps).to(
+                        device=device,
+                        dtype=dtype,
+                    )
+
+        model = super().initialize(**kwargs)
+        _replace_qk_layernorms_full_hidden(model)
+        freeze_moe_router = kwargs.get("freeze_moe_router", False)
+        if freeze_moe_router:
+            for layer in model.decoder.layers:
+                if hasattr(layer.mlp, "router"):
+                    layer.mlp.router.weight.requires_grad = False
+        return model
+
+
 class Qwen3MoEModel(BaseModelInitializer):
     """Initializer for Qwen3 MoE models."""
 
