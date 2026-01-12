@@ -11,11 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import warnings
+import logging
 from enum import Enum
 
 import torch
 from torch import no_grad
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 try:
     from megatron.core.transformer.moe.moe_utils import (
@@ -30,6 +37,24 @@ except ImportError:
     pass
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _get_system_memory_info():
+    """Get system memory information (total and available) in GB."""
+    if psutil is None:
+        return "N/A (psutil not available)"
+    try:
+        mem = psutil.virtual_memory()
+        total_gb = mem.total / (1024 ** 3)
+        available_gb = mem.available / (1024 ** 3)
+        used_gb = mem.used / (1024 ** 3)
+        return f"System: {used_gb:.2f}GB/{total_gb:.2f}GB used, {available_gb:.2f}GB available"
+    except Exception as e:
+        return f"N/A (error: {e})"
+
 
 # https://github.com/THUDM/slime/blob/main/slime/utils/routing_replay.py
 
@@ -164,14 +189,6 @@ class RouterReplay:
         Get the current logits cache and clear it.
         Returns a dict with 'compute_log_prob', 'training', 'router_weights' and 'global_token_ids' keys.
         """
-        # Debug: check cache before clearing
-        print(f"[get_and_clear_logits_cache] Before clear - "
-              f"compute_log_prob: {len(RouterReplay.logits_cache['compute_log_prob'])} items, "
-              f"training: {len(RouterReplay.logits_cache['training'])} items, "
-              f"router_weights: {len(RouterReplay.logits_cache['router_weights'])} items, "
-              f"global_token_ids: {len(RouterReplay.logits_cache['global_token_ids'])} items, "
-              f"predictive_bias: {len(RouterReplay.logits_cache['predictive_bias'])} items")
-
         cache = RouterReplay.logits_cache
         RouterReplay.logits_cache = {"compute_log_prob": [], "training": [], "router_weights": {}, "global_token_ids": [], "predictive_bias": []}
         return cache
@@ -258,7 +275,7 @@ class RouterReplay:
         Args:
             inputs: Old router inputs
             logits: Old router logits
-            valid_mask: Optional boolean mask indicating which samples have valid predictive data
+            valid_mask: Optional boolean mask of shape [total_tokens] indicating which tokens belong to valid samples
         """
         self.recorded_old_inputs = inputs
         self.recorded_old_logits = logits
@@ -267,19 +284,29 @@ class RouterReplay:
 
     def get_predictive_data(self):
         """Get old inputs and logits for this layer."""
-        return self.recorded_old_inputs, self.recorded_old_logits
+        return self.recorded_old_inputs, self.recorded_old_logits, self.predictive_valid_mask
 
     def record_predictive_data(self, inputs: torch.Tensor, logits: torch.Tensor):
         """Record inputs and logits for this layer (like record_indices)."""
         # Keep on GPU for merge function, which will handle CPU transfer uniformly
-        # TODO: Maybe we should move to CPU to save GPU memory (needs testing)
-        self.recorded_old_inputs = inputs.squeeze().detach()
-        self.recorded_old_logits = logits.squeeze().detach()
+        # Use .detach() to break gradient graph and reduce memory footprint
+        
+        # Check if inputs are non-zero (for debugging zero data issue)
+        input_sum = inputs.sum().item()
+        if input_sum == 0:
+            logger.warning(f"[RouterReplayLayer] [Debug] Recording ALL-ZERO inputs for layer {self.layer_idx}!")
+        else:
+            logger.info(f"[RouterReplayLayer] [Debug] Recording inputs with sum {input_sum} for layer {self.layer_idx}.")
+        
+        # Detach and create contiguous copies to allow original tensors to be freed
+        self.recorded_old_inputs = inputs.squeeze().detach().contiguous()
+        self.recorded_old_logits = logits.squeeze().detach().contiguous()
 
     def clear_predictive_data(self):
         """Clear predictive data for this layer."""
         self.recorded_old_inputs = None
         self.recorded_old_logits = None
+        self.predictive_valid_mask = None
 
     @staticmethod
     def clear_global_predictive_data():
@@ -684,31 +711,40 @@ def patched_forward(self, input: torch.Tensor):
             elif predictive_routing_action == RouterPredictiveAction.SKIP_PREDICTIVE:
                 # Training phase ministep=0
                 # Skip predictive loss, use normal routing
+                if self.layer_number == 1 and self.router_replay and self.router_replay.layer_idx == 0:
+                     print(f"[Predictive Routing Replay] Action is SKIP_PREDICTIVE. Skipping loss computation.")
                 probs, routing_map = self.routing(logits)
 
             elif predictive_routing_action == RouterPredictiveAction.COMPUTE_PREDICTIVE_LOSS:
                 # Training phase ministep>=1: compute predictive loss
-                print(f"[Memory] (layer {self.layer_number}) Total GPU memory allocated before predictive loss computation: {torch.cuda.memory_allocated() / (1024 ** 3):.2f} GB")
-                old_inputs, old_logits = self.router_replay.get_predictive_data()
+                if self.layer_number == 1 and self.router_replay and self.router_replay.layer_idx == 0:
+                     print(f"[Predictive Routing Replay] Action is COMPUTE_PREDICTIVE_LOSS. Computing loss...")
+
+                gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3)
+                print(f"[Memory] (layer {self.layer_number}) Total GPU memory allocated before predictive loss computation: {gpu_mem:.2f} GB, {_get_system_memory_info()}")
+                old_inputs, old_logits, valid_mask = self.router_replay.get_predictive_data()
 
                 if old_inputs is not None and old_logits is not None:
                     old_inputs = old_inputs.to(input.device)
                     old_logits = old_logits.to(logits.device)
-                    print(f"[Memory] (layer {self.layer_number}) Total GPU memory allocated after loading predictive data: {torch.cuda.memory_allocated() / (1024 ** 3):.2f} GB")
+                    gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3)
+                    print(f"[Memory] (layer {self.layer_number}) Total GPU memory allocated after loading predictive data: {gpu_mem:.2f} GB, {_get_system_memory_info()}")
 
                     # Debug asserts: check shape matching
                     assert old_inputs.shape[-1] == input.shape[-1], f"hidden_size mismatch: old={old_inputs.shape[-1]}, current={input.shape[-1]}"
                     assert old_logits.shape[-1] == logits.shape[-1], f"num_experts mismatch: old={old_logits.shape[-1]}, current={logits.shape[-1]}"
 
-                    # Apply mask if provided (for downsampled data)
-                    current_input = input
+                    # Apply token-level mask if provided (for downsampled data)
+                    # valid_mask is at token level, matching the unpacked input/logits shape
+                    current_input = input # TODO: this is not used, it is preserved for future algorithm enhancement
                     current_logits = logits
-                    if self.router_replay.predictive_valid_mask is not None:
-                        valid_mask = self.router_replay.predictive_valid_mask
-                        # Filter current input and logits to match old_inputs/old_logits
+                    if valid_mask is not None:
+                        # Filter current input and logits at token level to match old_inputs/old_logits
                         current_input = input[valid_mask]
                         current_logits = logits[valid_mask]
-                        print(f"[Predictive] Applied mask: {valid_mask.sum().item()}/{valid_mask.size(0)} valid samples")
+                        print(f"[Predictive Routing Replay] Applied token-level mask: {valid_mask.sum().item()}/{valid_mask.size(0)} valid tokens")
+                        assert current_input.shape[0] == old_inputs.shape[0], f"Token count mismatch after masking: old={old_inputs.shape[0]}, current={current_input.shape[0]}"
+                        assert current_logits.shape[0] == old_logits.shape[0], f"Token count mismatch after masking: old={old_logits.shape[0]}, current={current_logits.shape[0]}"
 
                     # Compute delta_logits and logits_diff
                     # Use old_inputs with current weights to get delta_logits
@@ -734,7 +770,7 @@ def patched_forward(self, input: torch.Tensor):
                         # KL divergence on corrected vs uncorrected routing distributions
                         # This measures the KL between final routing decisions
                         pred_log = torch.log_softmax(old_logits + delta_logits, dim=-1)
-                        target_log = torch.log_softmax(logits, dim=-1)
+                        target_log = torch.log_softmax(current_logits, dim=-1)
                         predictive_loss = torch.sum(torch.exp(pred_log) * (pred_log - target_log), dim=-1).mean()
 
                     else:
@@ -749,8 +785,8 @@ def patched_forward(self, input: torch.Tensor):
                         # Predicted top-k: use old_inputs + current bias predictor
                         _, predicted_topk_indices = torch.topk(old_logits + delta_logits, k=self.topk, dim=-1)
 
-                        # True top-k: current logits
-                        _, true_topk_indices = torch.topk(logits, k=self.topk, dim=-1)
+                        # True top-k: use current_logits if valid_mask is applied, otherwise use logits
+                        _, true_topk_indices = torch.topk(current_logits, k=self.topk, dim=-1)
 
                         # Compute accuracy: percentage of matches
                         # Expand dims for broadcasting comparison
@@ -761,7 +797,8 @@ def patched_forward(self, input: torch.Tensor):
 
                         RouterReplay.record_topk_accuracy(layer_idx, accuracy)
 
-                    print(f"[Memory] (layer {self.layer_number}) Total GPU memory allocated after predictive loss computation: {torch.cuda.memory_allocated() / (1024 ** 3):.2f} GB")
+                    gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3)
+                    print(f"[Memory] (layer {self.layer_number}) Total GPU memory allocated after predictive loss computation: {gpu_mem:.2f} GB, {_get_system_memory_info()}")
                 else:
                     print("Warning: Missing predictive data for router bias predictor loss computation.")
 

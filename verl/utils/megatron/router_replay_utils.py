@@ -23,6 +23,11 @@ from typing import Optional
 import torch
 
 try:
+    import psutil
+except ImportError:
+    psutil = None
+
+try:
     from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 except ImportError:
     warnings.warn("NPU not support router replay for now.", stacklevel=2)
@@ -39,6 +44,20 @@ from verl.utils.device import get_device_name
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction
 
 device_name = get_device_name()
+
+
+def _get_system_memory_info():
+    """Get system memory information (total and available) in GB."""
+    if psutil is None:
+        return "N/A (psutil not available)"
+    try:
+        mem = psutil.virtual_memory()
+        total_gb = mem.total / (1024 ** 3)
+        available_gb = mem.available / (1024 ** 3)
+        used_gb = mem.used / (1024 ** 3)
+        return f"System: {used_gb:.2f}GB/{total_gb:.2f}GB used, {available_gb:.2f}GB available"
+    except Exception as e:
+        return f"N/A (error: {e})"
 
 
 # from megatron.core.transformer.transformer_block import get_num_layers_to_build
@@ -212,7 +231,14 @@ def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_lis
             layers_topk_idx, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True
         )
         print(f"Shape of layers_topk_idx after postprocess: {layers_topk_idx.shape}")
-        mini_layer_topk_idx_list.append(layers_topk_idx.cpu())
+        # Move to CPU and explicitly delete GPU tensor
+        cpu_topk_idx = layers_topk_idx.cpu()
+        mini_layer_topk_idx_list.append(cpu_topk_idx)
+        
+        # Explicitly delete GPU tensors to free memory
+        del layers_topk_idx
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Clear recorded topk indices from router instances to free GPU memory
         for router in router_instances_list:
@@ -282,6 +308,7 @@ def merge_router_predictive_data(
     Returns:
         sampled_indices: Tensor of sampled batch indices (0 to downsample_batch_size-1, or 0 to batch_size-1 if no downsampling).
     """
+    print(f"Merging router predictive data...")
     print(f"Packing router old_inputs & old_logits for vp_rank={vp_rank}, downsample_batch_size={downsample_batch_size}, storage_dtype={storage_dtype}")
     router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
     layers_old_inputs = []
@@ -292,8 +319,8 @@ def merge_router_predictive_data(
 
     # layer_num, dynamic_bs, hidden_size  -> dynamic_bs, layer_num, hidden_size
     # layer_num, dynamic_bs, num_experts  -> dynamic_bs, layer_num, num_experts
-    print(f"Shape of layers_old_inputs before gather: {layers_old_inputs[0].shape}, total layers: {len(layers_old_inputs)}")
-    print(f"Shape of layers_old_logits before gather: {layers_old_logits[0].shape}, total layers: {len(layers_old_logits)}")
+    print(f"[Predictive Routing Replay] [Debug] Shape of layers_old_inputs before gather: {layers_old_inputs[0].shape}, sum: {layers_old_inputs[0].sum()}, last element: {layers_old_inputs[0][-1, :]}, total layers: {len(layers_old_inputs)}")
+    print(f"[Predictive Routing Replay] [Debug] Shape of layers_old_logits before gather: {layers_old_logits[0].shape}, sum: {layers_old_logits[0].sum()}, last element: {layers_old_logits[0][-1, :]}, total layers: {len(layers_old_logits)}")
     layers_old_inputs = torch.stack(layers_old_inputs).permute(1, 0, 2).to(device_name)
     layers_old_logits = torch.stack(layers_old_logits).permute(1, 0, 2).to(device_name)
 
@@ -310,8 +337,8 @@ def merge_router_predictive_data(
         .contiguous()
     )
     layers_old_inputs, layers_old_logits = torch.split(layers_merged_tensor, [hidden_size, num_experts], dim=-1)
-    print(f"Shape of layers_old_inputs after gather: {layers_old_inputs.shape}")
-    print(f"Shape of layers_old_logits after gather: {layers_old_logits.shape}")
+    print(f"[Predictive Routing Replay] [Debug] Shape of layers_old_inputs after gather: {layers_old_inputs.shape}, sum: {layers_old_inputs.sum()}, last element: {layers_old_inputs[-1, -1, -1, :]}")
+    print(f"[Predictive Routing Replay] [Debug] Shape of layers_old_logits after gather: {layers_old_logits.shape}, sum: {layers_old_logits.sum()}, last element: {layers_old_logits[-1, -1, -1, :]}")
 
     batch_size, seq_len = attention_mask.shape[:2]
     if packed_seq_params is None:
@@ -319,11 +346,14 @@ def merge_router_predictive_data(
     layers_old_inputs = postprocess_packed_seqs(layers_old_inputs, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True)
     layers_old_logits = postprocess_packed_seqs(layers_old_logits, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True)
 
+    print(f"[Predictive Routing Replay] [Debug] layers_old_inputs after postprocess: {layers_old_inputs.shape}, sum: {layers_old_inputs.sum()}, last element: {layers_old_inputs[-1, -1, -1, :]}")
+    print(f"[Predictive Routing Replay] [Debug] layers_old_logits after postprocess: {layers_old_logits.shape}, sum: {layers_old_logits.sum()}, last element: {layers_old_logits[-1, -1, -1, :]}")
+
     # Memory usage debug info BEFORE downsampling
     inputs_size_mb = layers_old_inputs.numel() * layers_old_inputs.element_size() / 1024 / 1024
     logits_size_mb = layers_old_logits.numel() * layers_old_logits.element_size() / 1024 / 1024
-    print(f"[Downsample] BEFORE downsample - layers_old_inputs shape: {layers_old_inputs.shape}, size: {inputs_size_mb:.2f} MB, dtype: {layers_old_inputs.dtype}")
-    print(f"[Downsample] BEFORE downsample - layers_old_logits shape: {layers_old_logits.shape}, size: {logits_size_mb:.2f} MB, dtype: {layers_old_logits.dtype}")
+    print(f"[Predictive Routing Replay] [Memory] BEFORE downsample - layers_old_inputs shape: {layers_old_inputs.shape}, dtype: {layers_old_inputs.dtype}, size: {inputs_size_mb:.2f} MB, {_get_system_memory_info()}")
+    print(f"[Predictive Routing Replay] [Memory] BEFORE downsample - layers_old_logits shape: {layers_old_logits.shape}, dtype: {layers_old_logits.dtype}, size: {logits_size_mb:.2f} MB, {_get_system_memory_info()}")
 
     # Batch-level downsampling to reduce memory usage
     bs, seq_len_actual, num_layers, hidden_size = layers_old_inputs.shape
@@ -339,7 +369,7 @@ def merge_router_predictive_data(
         layers_old_logits_sampled = layers_old_logits  # [bs, seq_len, layers, experts]
         inputs_size_mb_after = inputs_size_mb
         logits_size_mb_after = logits_size_mb
-        print(f"[Downsample] No downsampling: batch_size ({bs}) <= downsample_batch_size ({downsample_batch_size})")
+        print(f"[Predictive Routing Replay] [Downsample] No downsampling: batch_size ({bs}) <= downsample_batch_size ({downsample_batch_size})")
     else:
         # Simply take the first N batches
         downsample_mask = torch.cat([
@@ -350,8 +380,11 @@ def merge_router_predictive_data(
         layers_old_logits_sampled = layers_old_logits[:downsample_batch_size, ...]  # [downsample_batch_size, seq_len, layers, experts]
         inputs_size_mb_after = layers_old_inputs_sampled.numel() * layers_old_inputs_sampled.element_size() / 1024 / 1024
         logits_size_mb_after = layers_old_logits_sampled.numel() * layers_old_logits_sampled.element_size() / 1024 / 1024
-        print(f"[Downsample] Batch downsampling: kept first {downsample_batch_size}/{bs} sequences")
-        print(f"[Downsample] AFTER downsample - shape: {layers_old_inputs_sampled.shape}, size: {inputs_size_mb_after:.2f} MB (saved {inputs_size_mb - inputs_size_mb_after:.2f} MB)")
+        print(f"[Predictive Routing Replay] [Downsample] Batch downsampling: kept first {downsample_batch_size}/{bs} sequences")
+        print(f"[Predictive Routing Replay] [Memory] AFTER downsample - shape: {layers_old_inputs_sampled.shape}, size: {inputs_size_mb_after:.2f} MB (saved {inputs_size_mb - inputs_size_mb_after:.2f} MB), {_get_system_memory_info()}")
+        print(f"[Predictive Routing Replay] [Debug] layers_old_inputs after downsample: {layers_old_inputs_sampled.shape}, sum: {layers_old_inputs_sampled.sum()}, last element: {layers_old_inputs_sampled[-1, -1, -1, :]}")
+        print(f"[Predictive Routing Replay] [Debug] layers_old_logits after downsample: {layers_old_logits_sampled.shape}, sum: {layers_old_logits_sampled.sum()}, last element: {layers_old_logits_sampled[-1, -1, -1, :]}")
+        print(f"[Predictive Routing Replay] [Debug] downsample_mask: {downsample_mask.shape}, {downsample_mask}")
 
     # Lower precision storage to save memory
     dtype_map = {'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}
@@ -363,18 +396,28 @@ def merge_router_predictive_data(
 
         inputs_size_mb_final = layers_old_inputs_sampled.numel() * layers_old_inputs_sampled.element_size() / 1024 / 1024
         logits_size_mb_final = layers_old_logits_sampled.numel() * layers_old_logits_sampled.element_size() / 1024 / 1024
-        print(f"[Memory] Reduced precision to {target_dtype}: old_inputs {inputs_size_mb_after:.2f}MB → {inputs_size_mb_final:.2f}MB, "
-              f"old_logits {logits_size_mb_after:.2f}MB → {logits_size_mb_final:.2f}MB")
+        print(f"[Predictive Routing Replay] [Memory] Reduced precision to {target_dtype}: old_inputs {inputs_size_mb_after:.2f}MB → {inputs_size_mb_final:.2f}MB, "
+              f"old_logits {logits_size_mb_after:.2f}MB → {logits_size_mb_final:.2f}MB, {_get_system_memory_info()}")
+        print(f"[Predictive Routing Replay] [Debug] layers_old_inputs after precision reduction: {layers_old_inputs_sampled.shape}, sum: {layers_old_inputs_sampled.sum()}, last element: {layers_old_inputs_sampled[-1, -1, -1, :]}")
+        print(f"[Predictive Routing Replay] [Debug] layers_old_logits after precision reduction: {layers_old_logits_sampled.shape}, sum: {layers_old_logits_sampled.sum()}, last element: {layers_old_logits_sampled[-1, -1, -1, :]}")
 
-    # Store sampled data
+    # Store sampled data (move to CPU)
     mini_layer_old_inputs_list.append(layers_old_inputs_sampled.cpu())
     mini_layer_old_logits_list.append(layers_old_logits_sampled.cpu())
     mini_layer_sampled_masks_list.append(downsample_mask.cpu())
 
+    # Explicitly delete GPU tensors to free memory immediately
+    # This ensures GPU memory is released before the next micro-batch
+    del layers_old_inputs_sampled, layers_old_logits_sampled
+    del layers_merged_tensor, layers_old_inputs, layers_old_logits
+    del downsample_mask
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     # Calculate cumulative memory
     total_size_mb = sum(t.numel() * t.element_size() for t in mini_layer_old_inputs_list) / 1024 / 1024
     total_size_mb += sum(t.numel() * t.element_size() for t in mini_layer_old_logits_list) / 1024 / 1024
-    print(f"[Memory] Cumulative predictive data in list: {total_size_mb:.2f} MB ({len(mini_layer_old_inputs_list)} micro-batches)")
+    print(f"[Predictive Routing Replay] [Memory] Cumulative predictive data in list: {total_size_mb:.2f} MB ({len(mini_layer_old_inputs_list)} micro-batches), {_get_system_memory_info()}")
 
     # Clear recorded data from router instances to free GPU memory
     for router in router_instances_list:
@@ -386,31 +429,42 @@ def set_router_predictive_data(layers_old_inputs, layers_old_logits, attention_m
     # TODO: check implementation correctness
     """
     Args:
-        layers_old_inputs (torch.Tensor): Router inputs with shape [bs, max_seq_len, layer_num, hidden_size].
-            This should be the merged output produced by merge_router_old_inputs.
-        layers_old_logits (torch.Tensor): Router inputs with shape [bs, max_seq_len, layer_num, num_experts].
-            This should be the merged output produced by merge_router_old_logits.
-        valid_mask (Optional[torch.Tensor]): Boolean mask of shape [full_batch_size] indicating which samples
-            have valid predictive data. If provided, only valid samples will be used for loss computation.
+        layers_old_inputs (torch.Tensor): Router inputs with shape [valid_bs, max_seq_len, layer_num, hidden_size].
+            This contains only valid (downsampled) samples.
+        layers_old_logits (torch.Tensor): Router inputs with shape [valid_bs, max_seq_len, layer_num, num_experts].
+            This contains only valid (downsampled) samples.
+        attention_mask (torch.Tensor): Attention mask for valid samples only, shape [valid_bs, seq_len].
+            Used for unpacking the downsampled old_inputs/old_logits.
+        valid_mask (Optional[torch.Tensor]): Boolean mask of shape [total_all_tokens] indicating which tokens
+            belong to valid samples in the full unpacked batch. This is used to filter current input/logits
+            at token level in router_replay_patch to match old_inputs/old_logits.
     """
     with torch.no_grad():
+        # Check sequence parallel support
+        if tf_config.sequence_parallel:
+            raise NotImplementedError(
+                "Sequence parallel is not supported for predictive routing replay. "
+                "valid_mask creation after scatter needs additional implementation."
+            )
         # Get the actual dtype from bias_predictor weights to ensure type matching
         # This allows model weights to be fp32 while storage is bf16
         router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
         if router_instances_list and hasattr(router_instances_list[0], 'bias_predictor') and router_instances_list[0].bias_predictor is not None:
             # Get dtype from the actual bias_predictor weights
             compute_dtype = router_instances_list[0].bias_predictor.weight.dtype
-            print(f"[Memory] Detected bias_predictor weight dtype: {compute_dtype}")
+            print(f"[Memory] Detected bias_predictor weight dtype: {compute_dtype}, {_get_system_memory_info()}")
         else:
             # Fallback to model's params_dtype
             compute_dtype = tf_config.params_dtype
-            print(f"[Memory] Using tf_config.params_dtype: {compute_dtype}")
-        
+            print(f"[Memory] Using tf_config.params_dtype: {compute_dtype}, {_get_system_memory_info()}")
+
         if layers_old_inputs.dtype != compute_dtype:
-            print(f"[Memory] Converting predictive data from {layers_old_inputs.dtype} to {compute_dtype} for computation")
+            print(f"[Memory] Converting predictive data from {layers_old_inputs.dtype} to {compute_dtype} for computation, {_get_system_memory_info()}")
             layers_old_inputs = layers_old_inputs.to(compute_dtype)
             layers_old_logits = layers_old_logits.to(compute_dtype)
-        
+
+        # Unpack old_inputs/old_logits using attention_mask (which is for valid samples only)
+        # layers_old_inputs/layers_old_logits only contain valid (downsampled) samples
         layers_old_inputs_rmpad, _ = preprocess_packed_seqs(layers_old_inputs, attention_mask, pre_process=True)
         layers_old_inputs_rmpad = layers_old_inputs_rmpad.contiguous()  # dynamic_bs_all, layer_num, hidden_size
         layers_old_logits_rmpad, _ = preprocess_packed_seqs(layers_old_logits, attention_mask, pre_process=True)
@@ -438,6 +492,7 @@ def set_router_predictive_data(layers_old_inputs, layers_old_logits, attention_m
         offset, _ = local_rank_info["start"], local_rank_info["end"]
         # router_instances_list already obtained above for dtype detection, reuse it
         for i, router in enumerate(router_instances_list):
+            # valid_mask is token-level and applies to all layers, so we pass the same mask to each layer
             router.set_predictive_data(layers_old_inputs_reshape[i + offset], layers_old_logits_reshape[i + offset], valid_mask=valid_mask)
 
 

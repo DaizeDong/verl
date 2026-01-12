@@ -942,7 +942,20 @@ class DataProto:
 
         non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
         for key, val in non_tensor_batch.items():
-            non_tensor_batch[key] = np.concatenate(val, axis=0)
+            if len(val) > 0 and isinstance(val[0], list):
+                # Debug info (check first non-None element)
+                first_non_none = next((item for sublist in val for item in sublist if item is not None), None)
+                if first_non_none is not None:
+                    print(f"len of non-tensor key {key}: {len(non_tensor_batch)}, len of first element: {len(val[0])}, first sub-element type: {type(first_non_none)}, shape: {first_non_none.shape if hasattr(first_non_none, 'shape') else 'N/A'}")
+                
+                # Flatten list of lists and create 1D object array to preserve elements
+                # Elements can be torch tensors or None
+                flattened = [item for sublist in val for item in sublist]
+                arr = np.empty(len(flattened), dtype=object)
+                arr[:] = flattened
+                non_tensor_batch[key] = arr
+            else:
+                non_tensor_batch[key] = np.concatenate(val, axis=0)
 
         # Merge meta_info with special handling for metrics
         merged_meta_info = {}
@@ -1250,4 +1263,14 @@ def all_gather_data_proto(data: DataProto, process_group):
     # all gather non_tensor_batch
     all_non_tensor_batch = [None for _ in range(group_size)]
     torch.distributed.all_gather_object(all_non_tensor_batch, data.non_tensor_batch, group=process_group)
-    data.non_tensor_batch = {k: np.concatenate([d[k] for d in all_non_tensor_batch]) for k in data.non_tensor_batch}
+    data.non_tensor_batch = {}
+    for k in all_non_tensor_batch[0].keys():
+        val = [d[k] for d in all_non_tensor_batch]
+        if len(val) > 0 and isinstance(val[0], list):
+            # Flatten list of lists and create 1D object array
+            flattened = [item for sublist in val for item in sublist]
+            arr = np.empty(len(flattened), dtype=object)
+            arr[:] = flattened
+            data.non_tensor_batch[k] = arr
+        else:
+            data.non_tensor_batch[k] = np.concatenate(val)

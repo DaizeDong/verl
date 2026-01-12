@@ -84,6 +84,19 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _get_system_memory_info():
+    """Get system memory information (total and available) in GB."""
+    if psutil is None:
+        return "N/A (psutil not available)"
+    try:
+        mem = psutil.virtual_memory()
+        total_gb = mem.total / (1024 ** 3)
+        available_gb = mem.available / (1024 ** 3)
+        used_gb = mem.used / (1024 ** 3)
+        return f"System: {used_gb:.2f}GB/{total_gb:.2f}GB used, {available_gb:.2f}GB available"
+    except Exception as e:
+        return f"N/A (error: {e})"
+
 def set_random_seed(seed, only_rollout=False):
     import random
 
@@ -637,7 +650,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 actor_module=self.actor_module,
                 actor_optimizer=self.actor_optimizer,
             )
-            print(f"routing replay layers: {len(RouterReplay.router_instances)}")
+            logger.info(f"routing replay layers: {len(RouterReplay.router_instances)}")
             if self.enable_routing_replay and len(RouterReplay.router_instances) == 0:
                 logger.error(f"[Rank {self.rank}] ❌ Router replay is enabled but no router instances found! Check if enable_routing_replay is set in transformer_config.")
             log_gpu_memory_usage("After MegatronPPOActor init", logger=logger)
@@ -924,9 +937,22 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             output.batch["routed_experts"] = layers_topk_idx
             if self.config.actor.router_replay.enable_bias_predictor:
                 if layers_predictive_states is not None:
-                    # Store to non_tensor_batch
-                    output.non_tensor_batch["old_inputs"] = layers_predictive_states[0]  # list of [seq_len, layers, hidden], length = bs
-                    output.non_tensor_batch["old_logits"] = layers_predictive_states[1]  # list of [seq_len, layers, num_experts], length = bs
+                    # Store to non_tensor_batch (as torch tensors to avoid double memory allocation)
+                    # Check for non-zero data (handle both torch tensors and numpy arrays)
+                    def get_sum(t):
+                        if isinstance(t, torch.Tensor):
+                            return t.sum().item()
+                        else:
+                            return 0
+                    
+                    inputs_sum = sum(get_sum(t) for t in layers_predictive_states[0])
+                    logits_sum = sum(get_sum(t) for t in layers_predictive_states[1])
+                    logger.info(f"[Rank {self.rank}] [Bias Predictor] Storing predictive states (as torch tensors). Inputs sum: {inputs_sum}, Logits sum: {logits_sum}")
+                    if inputs_sum == 0 and logits_sum == 0:
+                         logger.warning(f"[Rank {self.rank}] [Bias Predictor] Warning: Storing all-zero predictive states!")
+
+                    output.non_tensor_batch["old_inputs"] = layers_predictive_states[0]  # list of torch.Tensor [seq_len, layers, hidden], length = bs
+                    output.non_tensor_batch["old_logits"] = layers_predictive_states[1]  # list of torch.Tensor [seq_len, layers, num_experts], length = bs
                 else:
                     logger.warning(f"[Rank {self.rank}] Bias predictor enabled but layers_predictive_states is None!")
 
@@ -954,22 +980,17 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     if isinstance(layer, TopKRouter):
                         layer_idx = layer.layer_number
                         RouterReplay.logits_cache["router_weights"][layer_idx] = layer.weight.detach().cpu().contiguous()
-                        print(f"[compute_log_prob] Post-forward: Recorded router_weights for layer {layer_idx}, shape={layer.weight.shape}")
+                        logger.info(f"[compute_log_prob] Post-forward: Recorded router_weights for layer {layer_idx}, shape={layer.weight.shape}")
                     else:
-                        # print(f"[compute_log_prob] Module {name} is not TopKRouter, skipping.")
+                        # logger.info(f"[compute_log_prob] Module {name} is not TopKRouter, skipping.")
                         pass
 
             # Debug: Check state before getting cache
             debug_info = RouterReplay.get_debug_info()
             logger.info(f"[Rank {self.rank}] Before get_and_clear_logits_cache: {debug_info}")
-
+            logger.info(f"[Memory] Before get_and_clear_logits_cache: GPU memory: allocated {get_torch_device().memory_allocated() / (1024**3):.2f} GB, CPU memory: {_get_system_memory_info()}")
             logits_cache = RouterReplay.get_and_clear_logits_cache()
-            logger.info(
-                f"[Rank {self.rank}] Logits cache sizes - compute_log_prob: {len(logits_cache['compute_log_prob'])}, "
-                f"training: {len(logits_cache['training'])}, "
-                f"router_weights: {len(logits_cache['router_weights'])}, "
-                f"global_token_ids: {len(logits_cache.get('global_token_ids', []))}"
-            )
+            logger.info(f"[Memory] After get_and_clear_logits_cache: GPU memory: allocated {get_torch_device().memory_allocated() / (1024**3):.2f} GB, CPU memory: {_get_system_memory_info()}")
 
             step_name = f"log_prob_{global_step}"
             if should_save:
