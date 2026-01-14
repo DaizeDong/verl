@@ -469,6 +469,8 @@ def set_router_predictive_data(layers_old_inputs, layers_old_logits, attention_m
         layers_old_inputs_rmpad = layers_old_inputs_rmpad.contiguous()  # dynamic_bs_all, layer_num, hidden_size
         layers_old_logits_rmpad, _ = preprocess_packed_seqs(layers_old_logits, attention_mask, pre_process=True)
         layers_old_logits_rmpad = layers_old_logits_rmpad.contiguous()  # dynamic_bs_all, layer_num, num_experts
+        print(f"[Predictive Routing Replay] [Debug] layers_old_inputs_rmpad after preprocess: {layers_old_inputs_rmpad.shape}, sum: {layers_old_inputs_rmpad.sum()}, last element: {layers_old_inputs_rmpad[-1, -1, :]}")
+        print(f"[Predictive Routing Replay] [Debug] layers_old_logits_rmpad after preprocess: {layers_old_logits_rmpad.shape}, sum: {layers_old_logits_rmpad.sum()}, last element: {layers_old_logits_rmpad[-1, -1, :]}")
 
         # dynamic_bs_split, layer_num, hidden_size
         layers_old_inputs_rmpad_split = scatter_to_sequence_parallel_region(
@@ -487,13 +489,24 @@ def set_router_predictive_data(layers_old_inputs, layers_old_logits, attention_m
         layers_old_logits_reshape = layers_old_logits_rmpad_split.permute(0, 2, 1, 3).squeeze(
             dim=0
         )  # layer_num, dynamic_bs_all, num_experts
+        print(f"[Predictive Routing Replay] [Debug] layers_old_inputs_reshape after reshape: {layers_old_inputs_reshape.shape}, sum: {layers_old_inputs_reshape.sum()}, last element: {layers_old_inputs_reshape[-1, -1, :]}")
+        print(f"[Predictive Routing Replay] [Debug] layers_old_logits_reshape after reshape: {layers_old_logits_reshape.shape}, sum: {layers_old_logits_reshape.sum()}, last element: {layers_old_logits_reshape[-1, -1, :]}")
 
         local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
         offset, _ = local_rank_info["start"], local_rank_info["end"]
         # router_instances_list already obtained above for dtype detection, reuse it
         for i, router in enumerate(router_instances_list):
             # valid_mask is token-level and applies to all layers, so we pass the same mask to each layer
-            router.set_predictive_data(layers_old_inputs_reshape[i + offset], layers_old_logits_reshape[i + offset], valid_mask=valid_mask)
+            router.set_predictive_data(layers_old_inputs_reshape[i + offset].unsqueeze(1), layers_old_logits_reshape[i + offset].unsqueeze(1), valid_mask=valid_mask)
+        
+        # Explicitly delete large intermediate tensors to free GPU memory
+        del layers_old_inputs, layers_old_logits
+        del layers_old_inputs_rmpad, layers_old_logits_rmpad
+        del layers_old_inputs_rmpad_split, layers_old_logits_rmpad_split
+        del layers_old_inputs_reshape, layers_old_logits_reshape
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(f"[Memory] After set_router_predictive_data cleanup: {_get_system_memory_info()}")
 
 
 def reorder_and_merge_vpp_layers(

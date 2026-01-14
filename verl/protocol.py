@@ -30,12 +30,14 @@ import ray
 import tensordict
 import torch
 import torch.distributed
+import psutil
 from packaging import version
 from packaging.version import parse as parse_version
 from tensordict import TensorDict
 from torch.utils.data import DataLoader
 
 from verl.utils.device import get_device_id, get_torch_device
+from verl.utils.memory_utils import get_system_memory_info
 from verl.utils.py_functional import union_two_dict
 from verl.utils.torch_functional import allgather_dict_tensors
 
@@ -305,6 +307,11 @@ def deserialize_tensordict(arr: Any) -> TensorDict:
 
 
 def collate_fn(x: list["DataProtoItem"]):
+    from verl.utils.memory_utils import get_system_memory_info
+    
+    mem_before = psutil.virtual_memory()
+    print(f"[collate_fn] START: {get_system_memory_info()}, processing {len(x)} items")
+    
     batch = []
     non_tensor_batch = []
     for data in x:
@@ -312,8 +319,33 @@ def collate_fn(x: list["DataProtoItem"]):
         non_tensor_batch.append(data.non_tensor_batch)
     batch = torch.stack(batch).contiguous()
     non_tensor_batch = list_of_dict_to_dict_of_list(non_tensor_batch)
+    
+    # Use np.empty + assignment for large predictive data keys to avoid memory explosion
+    # np.array(val, dtype=object) recursively processes nested lists → 300GB spike
+    # np.empty + [:] assignment only creates references → stable memory
+    LARGE_DATA_KEYS = {'old_inputs', 'old_logits'}
+    
     for key, val in non_tensor_batch.items():
-        non_tensor_batch[key] = np.array(val, dtype=object)
+        mem_before_key = psutil.virtual_memory()
+        print(f"[collate_fn] Before processing key '{key}': {get_system_memory_info()}")
+        
+        if key in LARGE_DATA_KEYS:
+            # Use np.empty to avoid recursive processing of nested lists (Ray deserialization artifact)
+            # This preserves np.ndarray requirement while avoiding 300GB memory spike
+            print(f"[collate_fn] Using np.empty for large key '{key}' (type: {type(val)}, len: {len(val)})")
+            arr = np.empty(len(val), dtype=object)
+            arr[:] = val  # Direct assignment, no recursion
+            non_tensor_batch[key] = arr
+        else:
+            non_tensor_batch[key] = np.array(val, dtype=object)
+        
+        mem_after_key = psutil.virtual_memory()
+        delta_gb = (mem_after_key.used - mem_before_key.used) / (1024**3)
+        print(f"[collate_fn] After processing key '{key}': {get_system_memory_info()}, delta={delta_gb:.2f}GB")
+    
+    mem_after = psutil.virtual_memory()
+    total_delta_gb = (mem_after.used - mem_before.used) / (1024**3)
+    print(f"[collate_fn] END: {get_system_memory_info()}, total_delta={total_delta_gb:.2f}GB")
     return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
 
@@ -824,6 +856,10 @@ class DataProto:
             Iterator: an iterator that yields a mini-batch data at a time. The total number of iteration
                 steps is ``self.batch.batch_size * epochs // mini_batch_size``
         """
+        mem_start = psutil.virtual_memory()
+        print(f"[make_iterator] START: {get_system_memory_info()}, batch_size={self.batch.batch_size[0]}, mini_batch_size={mini_batch_size}, epochs={epochs}")
+        print(f"[make_iterator] non_tensor_batch keys: {list(self.non_tensor_batch.keys())}")
+        
         assert self.batch.batch_size[0] % mini_batch_size == 0, f"{self.batch.batch_size[0]} % {mini_batch_size} != 0"
         # we can directly create a dataloader from TensorDict
         if dataloader_kwargs is None:
@@ -836,9 +872,17 @@ class DataProto:
             generator = None
 
         assert isinstance(dataloader_kwargs, dict)
+        
+        mem_before_dataloader = psutil.virtual_memory()
+        print(f"[make_iterator] Before DataLoader creation: {get_system_memory_info()}")
+        
         train_dataloader = DataLoader(
             dataset=self, batch_size=mini_batch_size, collate_fn=collate_fn, generator=generator, **dataloader_kwargs
         )
+        
+        mem_after_dataloader = psutil.virtual_memory()
+        delta_gb = (mem_after_dataloader.used - mem_before_dataloader.used) / (1024**3)
+        print(f"[make_iterator] After DataLoader creation: {get_system_memory_info()}, delta={delta_gb:.2f}GB")
 
         def get_data():
             for _ in range(epochs):
@@ -942,12 +986,13 @@ class DataProto:
 
         non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
         for key, val in non_tensor_batch.items():
+            print(f"[DataProto] [Memory] Before concatenation of non-tensor key '{key}': {get_system_memory_info()}")
             if len(val) > 0 and isinstance(val[0], list):
                 # Debug info (check first non-None element)
                 first_non_none = next((item for sublist in val for item in sublist if item is not None), None)
                 if first_non_none is not None:
                     print(f"len of non-tensor key {key}: {len(non_tensor_batch)}, len of first element: {len(val[0])}, first sub-element type: {type(first_non_none)}, shape: {first_non_none.shape if hasattr(first_non_none, 'shape') else 'N/A'}")
-                
+
                 # Flatten list of lists and create 1D object array to preserve elements
                 # Elements can be torch tensors or None
                 flattened = [item for sublist in val for item in sublist]
@@ -956,6 +1001,7 @@ class DataProto:
                 non_tensor_batch[key] = arr
             else:
                 non_tensor_batch[key] = np.concatenate(val, axis=0)
+            print(f"[DataProto] [Memory] After concatenation of non-tensor key '{key}': {get_system_memory_info()}")
 
         # Merge meta_info with special handling for metrics
         merged_meta_info = {}

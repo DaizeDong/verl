@@ -55,6 +55,7 @@ from verl.utils.megatron.router_replay_utils import (
 )
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
 from verl.utils.megatron_utils import get_model_config, unwrap_model
+from verl.utils.memory_utils import get_system_memory_info
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.profiler.profile import Profiler
 from verl.utils.py_functional import append_to_dict
@@ -66,20 +67,6 @@ __all__ = ["MegatronPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-
-def _get_system_memory_info():
-    """Get system memory information (total and available) in GB."""
-    if psutil is None:
-        return "N/A (psutil not available)"
-    try:
-        mem = psutil.virtual_memory()
-        total_gb = mem.total / (1024 ** 3)
-        available_gb = mem.available / (1024 ** 3)
-        used_gb = mem.used / (1024 ** 3)
-        return f"System: {used_gb:.2f}GB/{total_gb:.2f}GB used, {available_gb:.2f}GB available"
-    except Exception as e:
-        return f"N/A (error: {e})"
 
 
 class MegatronPPOActor(BasePPOActor):
@@ -363,7 +350,7 @@ class MegatronPPOActor(BasePPOActor):
                         # Memory debug - before reordering
                         inputs_mb = layers_old_inputs.numel() * layers_old_inputs.element_size() / 1024 / 1024
                         logits_mb = layers_old_logits.numel() * layers_old_logits.element_size() / 1024 / 1024
-                        logger.info(f"[Predictive Routing Replay] [Memory] compute_log_prob: old_inputs={inputs_mb:.2f}MB ({layers_old_inputs.shape}), old_logits={logits_mb:.2f}MB ({layers_old_logits.shape}), {_get_system_memory_info()}")
+                        logger.info(f"[Predictive Routing Replay] [Memory] compute_log_prob: old_inputs={inputs_mb:.2f}MB ({layers_old_inputs.shape}), old_logits={logits_mb:.2f}MB ({layers_old_logits.shape}), {get_system_memory_info()}")
 
                         # Note: dynamic_bsz reordering is skipped for downsampled data
                         # The reordering will be handled in megatron_workers.py when splitting per-sample
@@ -386,20 +373,30 @@ class MegatronPPOActor(BasePPOActor):
                         layers_merged = pp_gather(layers_merged, self.tf_config)  # [num_batches * downsampled_batch_size, seq_len, layers, hidden + experts]
                         layers_old_inputs, layers_old_logits = torch.split(layers_merged, [hidden_size, num_experts], dim=-1)
 
-                        # Split into per-sample list WITHOUT converting to numpy (avoid double memory allocation)
-                        # Keep as CPU torch tensors to save memory - will convert to numpy only when needed for serialization
+                        # Convert to numpy with ZERO-COPY to avoid double allocation while being Ray-friendly
+                        # Torch tensors have huge serialization overhead in Ray (255GB spilling observed!)
+                        # Using numpy() on CPU contiguous tensors is zero-copy and Ray-efficient
                         downsampled_batch_size = layers_old_inputs.shape[0]
-                        # Ensure data is on CPU before splitting
+                        # Ensure data is on CPU before converting
                         if layers_old_inputs.device.type != 'cpu':
                             layers_old_inputs = layers_old_inputs.cpu()
                             layers_old_logits = layers_old_logits.cpu()
-
-                        # Split along batch dimension, keep as torch tensors
-                        layers_old_inputs_list = list(layers_old_inputs.split(1, dim=0))  # list of [1, seq_len, layers, hidden]
-                        layers_old_logits_list = list(layers_old_logits.split(1, dim=0))  # list of [1, seq_len, layers, experts]
-                        # Squeeze the first dimension to get [seq_len, layers, hidden/experts]
-                        layers_old_inputs_list = [t.squeeze(0) for t in layers_old_inputs_list]  # list of [seq_len, layers, hidden]
-                        layers_old_logits_list = [t.squeeze(0) for t in layers_old_logits_list]  # list of [seq_len, layers, experts]
+                        
+                        # Make contiguous to ensure zero-copy numpy conversion
+                        layers_old_inputs = layers_old_inputs.contiguous().numpy()  # Zero-copy view
+                        layers_old_logits = layers_old_logits.contiguous().numpy()  # Zero-copy view
+                        
+                        # Split into per-sample numpy arrays
+                        layers_old_inputs_list = [layers_old_inputs[i].copy() for i in range(downsampled_batch_size)]
+                        layers_old_logits_list = [layers_old_logits[i].copy() for i in range(downsampled_batch_size)]
+                        
+                        # Delete the full numpy arrays
+                        print(f"[Predictive Routing Replay] [Memory] Deleted layers_old_inputs and layers_old_logits")
+                        print(f"[Predictive Routing Replay] [Memory] Before deletion: {get_system_memory_info()}")
+                        del layers_old_inputs, layers_old_logits, layers_merged
+                        import gc
+                        gc.collect()
+                        print(f"[Predictive Routing Replay] [Memory] After deletion: {get_system_memory_info()}")
 
                         # Insert None for unsampled entries
                         for i in range(len(sampled_masks)):
@@ -410,10 +407,6 @@ class MegatronPPOActor(BasePPOActor):
                         logger.info(f"[Predictive Routing Replay] [Downsample] Restored predictive data to full batch size: {full_batch_size} (downsampled from {downsampled_batch_size})")
 
                         layers_predictive_states = (layers_old_inputs_list, layers_old_logits_list)
-
-                        # Explicitly delete intermediate tensors to free CPU memory
-                        del layers_merged, layers_old_inputs, layers_old_logits
-                        # Note: layers_old_inputs_list and layers_old_logits_list are returned, so don't delete them here
 
         # add empty cache after each compute
         get_torch_device().empty_cache()
@@ -481,18 +474,26 @@ class MegatronPPOActor(BasePPOActor):
         if self.enable_bias_predictor:
             if "old_inputs" in data.non_tensor_batch.keys():
                 non_tensor_batch_keys.append("old_inputs")
+                logger.info(f"[Memory] [make_minibatch_iterator] Including old_inputs in non_tensor_batch")
             if "old_logits" in data.non_tensor_batch.keys():
                 non_tensor_batch_keys.append("old_logits")
+                logger.info(f"[Memory] [make_minibatch_iterator] Including old_logits in non_tensor_batch")
+        
+        logger.info(f"[Memory] [make_minibatch_iterator] Before data.select(): {get_system_memory_info()}")
         if self.has_multi_modal_inputs:
             data = data.select(select_keys, non_tensor_batch_keys=non_tensor_batch_keys + ["multi_modal_inputs"])
         else:
             data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_batch_keys)
+        logger.info(f"[Memory] [make_minibatch_iterator] After data.select(): {get_system_memory_info()}")
 
-        return data.make_iterator(
+        logger.info(f"[Memory] [make_minibatch_iterator] Before data.make_iterator(): {get_system_memory_info()}")
+        iterator = data.make_iterator(
             mini_batch_size=self.config.ppo_mini_batch_size,
             epochs=self.config.ppo_epochs,
             seed=self.config.data_loader_seed,
         )
+        logger.info(f"[Memory] [make_minibatch_iterator] After data.make_iterator(): {get_system_memory_info()}")
+        return iterator
 
     def forward_backward_batch(
         self,
@@ -755,6 +756,7 @@ class MegatronPPOActor(BasePPOActor):
                 # TODO: support VLM with MoE
                 from verl.models.mcore.model_forward_1f1b_overlap import gptmodel_forward_1f1b_overlap
 
+            logger.info(f"[Memory] [forward_step] Before data generation (batch): {get_system_memory_info()}")
             batch: DataProto = next(batch_iter)
             batch.batch = batch.batch.contiguous()
             batch.batch = batch.batch.to(get_device_id())
@@ -782,11 +784,13 @@ class MegatronPPOActor(BasePPOActor):
             label_mask = attention_mask.clone()
             label_mask[:, : -response_length - 1] = False
             label_mask[:, -1] = False
+            logger.info(f"[Memory] [forward_step] After data generation (batch): {get_system_memory_info()}")
 
             if RouterReplayHelper.is_replay_backward_action(self.tf_config, vp_rank):
                 router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
                 for router in router_instance_list:
                     router.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+                # TODO: check if predictive routing replay needs to be set here
 
             if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
                 # R3 mode: use routed_experts if available
@@ -794,16 +798,20 @@ class MegatronPPOActor(BasePPOActor):
                 set_router_replay_data(layers_topk_idx, attention_mask, self.tf_config, vp_rank)
 
                 if RouterReplayHelper.is_predictive_compute_loss_action(self.tf_config, vp_rank):
+                    logger.info(f"[Memory] [forward_step] Loading predictive data: {get_system_memory_info()}")
+
                     # Read old_inputs and old_logits from batch (per-sample, may contain None)
                     if "old_inputs" in batch.non_tensor_batch and "old_logits" in batch.non_tensor_batch:
-                        old_inputs_list = batch.non_tensor_batch["old_inputs"]  # list of torch tensors or None
-                        old_logits_list = batch.non_tensor_batch["old_logits"]  # list of torch tensors or None
-                        
-                        # Safety check: if they are numpy arrays (e.g. object array), convert to list
+                        old_inputs_list = batch.non_tensor_batch["old_inputs"]  # list of ndarray or None
+                        old_logits_list = batch.non_tensor_batch["old_logits"]  # list of ndarray or None
+
+                        # Handle multiple possible formats after Ray serialization
+                        # Case 1: np.ndarray(dtype=object) - convert to list
+                        # Case 2: already a list (direct from DataProto without collate_fn conversion)
                         if isinstance(old_inputs_list, np.ndarray):
-                            old_inputs_list = old_inputs_list.tolist()
+                            old_inputs_list = list(old_inputs_list)
                         if isinstance(old_logits_list, np.ndarray):
-                            old_logits_list = old_logits_list.tolist()
+                            old_logits_list = list(old_logits_list)
 
                         logger.info(f"old_inputs_list: type {type(old_inputs_list)}, length {len(old_inputs_list) if isinstance(old_inputs_list, list) else 'N/A'}")
                         if isinstance(old_inputs_list, list) and len(old_inputs_list) > 0 and old_inputs_list[0] is not None:
@@ -820,36 +828,40 @@ class MegatronPPOActor(BasePPOActor):
                         for i, (old_input, old_logit) in enumerate(zip(old_inputs_list, old_logits_list)):
                             if old_input is not None and old_logit is not None:
                                 valid_indices.append(i)
-                                # Handle both torch tensors (new format) and numpy arrays (legacy format)
-                                if isinstance(old_input, torch.Tensor):
-                                    valid_old_inputs.append(old_input)  # [seq_len, layers, hidden]
-                                elif isinstance(old_input, np.ndarray):
-                                    valid_old_inputs.append(torch.from_numpy(old_input))  # [seq_len, layers, hidden]
-                                else:
-                                    raise TypeError(f"Unexpected type for old_input: {type(old_input)}")
-                                
-                                if isinstance(old_logit, torch.Tensor):
-                                    valid_old_logits.append(old_logit)  # [seq_len, layers, num_experts]
-                                elif isinstance(old_logit, np.ndarray):
-                                    valid_old_logits.append(torch.from_numpy(old_logit))  # [seq_len, layers, num_experts]
-                                else:
-                                    raise TypeError(f"Unexpected type for old_logit: {type(old_logit)}")
+
+                                # Handle case where Ray converted np.ndarray to nested list during serialization
+                                # This happens when Ray deserializes numpy object arrays
+                                if isinstance(old_input, list):
+                                    logger.info(f"[Ray Deserialization] Converting old_input from list to np.ndarray (Ray serialization artifact)")
+                                    old_input = np.array(old_input, dtype=np.float32)
+                                if isinstance(old_logit, list):
+                                    logger.info(f"[Ray Deserialization] Converting old_logit from list to np.ndarray (Ray serialization artifact)")
+                                    old_logit = np.array(old_logit, dtype=np.float32)
+
+                                # Convert numpy array to torch tensor (numpy is used for Ray efficiency)
+                                assert isinstance(old_input, np.ndarray), f"Expected numpy array after conversion, got {type(old_input)}"
+                                assert isinstance(old_logit, np.ndarray), f"Expected numpy array after conversion, got {type(old_logit)}"
+                                valid_old_inputs.append(torch.from_numpy(old_input))  # [seq_len, layers, hidden]
+                                valid_old_logits.append(torch.from_numpy(old_logit))  # [seq_len, layers, num_experts]
 
                         if len(valid_old_inputs) > 0:
                             # Stack into [bs, seq_len, layers, hidden_size] and [bs, seq_len, layers, num_experts]
-                            valid_old_inputs_tensor = torch.stack(valid_old_inputs)  # [valid_bs, seq_len, layers, hidden]
-                            valid_old_logits_tensor = torch.stack(valid_old_logits)  # [valid_bs, seq_len, layers, num_experts]
+                            valid_old_inputs_tensor = torch.stack(valid_old_inputs).to(attention_mask.device)  # [valid_bs, seq_len, layers, hidden]
+                            valid_old_logits_tensor = torch.stack(valid_old_logits).to(attention_mask.device)  # [valid_bs, seq_len, layers, num_experts]
+                            logger.info(f"[Predictive Routing Replay] Loaded valid old_inputs/old_logits for {len(valid_old_inputs)} samples in batch of size {input_ids.size(0)}, shapes: {valid_old_inputs_tensor.shape}, {valid_old_logits_tensor.shape}")
 
                             # Create token-level valid_mask for filtering current input/logits
                             # input/logits in router are unpacked from full batch, so we need to create
                             # a mask that marks tokens from valid samples in the unpacked full batch
                             seq_lens = attention_mask.sum(dim=1, dtype=torch.int32)  # [batch_size]
                             cumsum_lens = torch.cumsum(seq_lens, dim=0)  # [batch_size]
-                            
+
                             # Create mask for all tokens (unpacked shape, padding already removed)
+                            total_tokens = attention_mask.numel()
                             total_valid_tokens = cumsum_lens[-1].item()  # total valid tokens (padding removed)
                             valid_mask = torch.zeros(total_valid_tokens, dtype=torch.bool, device=attention_mask.device)
-                            
+                            logger.info(f"[Predictive Routing Replay] Creating valid_mask for total_tokens={total_tokens}, total_valid_tokens={total_valid_tokens}")
+
                             # Mark tokens from valid samples using tensor operations (avoid GPU-CPU sync)
                             if len(valid_indices) > 0:
                                 valid_indices_tensor = torch.tensor(valid_indices, device=attention_mask.device, dtype=torch.long)
@@ -860,7 +872,7 @@ class MegatronPPOActor(BasePPOActor):
                                 ])[valid_indices_tensor]
                                 # Get end indices: cumsum_lens[i]
                                 end_indices = cumsum_lens[valid_indices_tensor]
-                                
+
                                 # Create index ranges for all valid samples using tensor operations
                                 # Calculate lengths for each range
                                 range_lengths = end_indices - start_indices
@@ -869,7 +881,7 @@ class MegatronPPOActor(BasePPOActor):
                                 if non_zero_mask.any():
                                     filtered_starts = start_indices[non_zero_mask]
                                     filtered_lengths = range_lengths[non_zero_mask]
-                                    
+
                                     # Create all indices at once: for each range [start, end), create indices
                                     # Use repeat_interleave to expand start indices, then add offsets
                                     expanded_starts = torch.repeat_interleave(filtered_starts, filtered_lengths)
@@ -881,9 +893,13 @@ class MegatronPPOActor(BasePPOActor):
                                     # Final indices: start + offset for each token
                                     all_indices = expanded_starts + range_offsets
                                     valid_mask[all_indices] = True
+                            logger.info(f"[Predictive Routing Replay] "
+                                        f"(total_tokens={total_tokens}, total_valid_tokens={total_valid_tokens}) "
+                                        f"Created valid_mask with {valid_mask.sum().item()} valid tokens, values: {valid_mask}")
 
                             # Select attention_mask for valid samples for unpacking old_inputs/old_logits
                             valid_attention_mask = attention_mask[valid_indices]  # [valid_bs, seq_len]
+                            logger.info(f"[Predictive Routing Replay] Selected valid_attention_mask shape: {valid_attention_mask.shape}")
 
                             set_router_predictive_data(
                                 valid_old_inputs_tensor,
@@ -894,11 +910,18 @@ class MegatronPPOActor(BasePPOActor):
                                 valid_mask=valid_mask  # Token-level mask for filtering full batch
                             )
                             
+                            logger.info(f"[Memory] [forward_step] After set_router_predictive_data: {get_system_memory_info()}")
+                            
                             # Explicitly delete intermediate tensors after setting predictive data
                             del valid_old_inputs_tensor, valid_old_logits_tensor, valid_attention_mask
                             del valid_mask, valid_indices_tensor
+                            import gc
+                            gc.collect()
+                            logger.info(f"[Memory] [forward_step] After cleanup of intermediate tensors: {get_system_memory_info()}")
                         else:
                             logger.warning(f"[Predictive Routing Replay] No valid old_inputs/old_logits found in batch for predictive compute loss")
+
+            logger.info(f"[Memory] [forward_step] After data generation (non_tensor_batch): {get_system_memory_info()}")
 
             from verl.models.mcore import get_mcore_forward_fn, get_mcore_forward_fused_fn
 
@@ -954,6 +977,8 @@ class MegatronPPOActor(BasePPOActor):
                     data_format="thd" if self.config.megatron.use_remove_padding else "bshd",
                 )
 
+            logger.info(f"[Memory] [forward_step] After model forward: {get_system_memory_info()}")
+
             if forward_only:
                 meta_info = None
             else:
@@ -982,6 +1007,7 @@ class MegatronPPOActor(BasePPOActor):
                         downsample_batch_size=self.config.router_replay.predictive_downsample_batch_size,
                         storage_dtype=self.config.router_replay.predictive_storage_dtype,
                     )
+                    logger.info(f"[Memory] [forward_step] After merging predictive routing replay data: {get_system_memory_info()}")
 
             # Record token_ids if present and logits saving is enabled
             if self.enable_logits_saving and RouterReplay.current_cache_action is not None:
@@ -998,6 +1024,7 @@ class MegatronPPOActor(BasePPOActor):
                 router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
                 for router in router_instance_list:
                     router.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+                # TODO: check if predictive router replay action needs to be set
 
             return output, partial(loss_func, data=batch.batch, meta_info=meta_info)
 
@@ -1006,6 +1033,7 @@ class MegatronPPOActor(BasePPOActor):
 
         # TODO: we may use the new schedule instead
         # for flash-attn: (seq_len, batch_size, hidden_size) = (mbs*seq_len, 1, hidden_size)
+        logger.info(f"[Memory] [forward_backward_batch] Start {get_system_memory_info()}")
         if mpu.get_pipeline_model_parallel_world_size() > 1:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step,
@@ -1026,6 +1054,7 @@ class MegatronPPOActor(BasePPOActor):
                 micro_batch_size=1,  # in use for pp = 1
                 forward_only=forward_only,
             )
+        logger.info(f"[Memory] [forward_backward_batch] End {get_system_memory_info()}")
         # loss_reduces contains the stats returned from loss_func
 
         if self.has_multi_modal_inputs:
@@ -1057,7 +1086,7 @@ class MegatronPPOActor(BasePPOActor):
                     # Memory debug
                     inputs_mb = losses_reduced["mini_layer_old_inputs_tensor"].numel() * losses_reduced["mini_layer_old_inputs_tensor"].element_size() / 1024 / 1024
                     logits_mb = losses_reduced["mini_layer_old_logits_tensor"].numel() * losses_reduced["mini_layer_old_logits_tensor"].element_size() / 1024 / 1024
-                    logger.info(f"[Predictive Routing Replay] [Memory] Concatenated predictive tensors: old_inputs={inputs_mb:.2f}MB, old_logits={logits_mb:.2f}MB, {_get_system_memory_info()}")
+                    logger.info(f"[Predictive Routing Replay] [Memory] Concatenated predictive tensors: old_inputs={inputs_mb:.2f}MB, old_logits={logits_mb:.2f}MB, {get_system_memory_info()}")
             else:
                 losses_reduced["mini_layer_topk_idx_tensor"] = torch.cat(self.mini_layer_topk_idx_list, dim=0)
                 if RouterReplayHelper.is_predictive_record_action(self.tf_config):
@@ -1074,7 +1103,7 @@ class MegatronPPOActor(BasePPOActor):
                     # Memory debug
                     inputs_mb = losses_reduced["mini_layer_old_inputs_tensor"].numel() * losses_reduced["mini_layer_old_inputs_tensor"].element_size() / 1024 / 1024
                     logits_mb = losses_reduced["mini_layer_old_logits_tensor"].numel() * losses_reduced["mini_layer_old_logits_tensor"].element_size() / 1024 / 1024
-                    logger.info(f"[Predictive Routing Replay] [Memory] Concatenated predictive tensors: old_inputs={inputs_mb:.2f}MB, old_logits={logits_mb:.2f}MB, {_get_system_memory_info()}")
+                    logger.info(f"[Predictive Routing Replay] [Memory] Concatenated predictive tensors: old_inputs={inputs_mb:.2f}MB, old_logits={logits_mb:.2f}MB, {get_system_memory_info()}")
             # Clear mini-batch storage and explicitly free memory
             self.mini_layer_topk_idx_list.clear()
             if RouterReplayHelper.is_predictive_record_action(self.tf_config):
@@ -1108,7 +1137,21 @@ class MegatronPPOActor(BasePPOActor):
         if self.use_torch_profiler and self.prof and self.prof.enable:
             self.prof.start()
         for mini_step, data in enumerate(dataloader):
+            logger.info(f"[Memory] [update_policy] Mini step {mini_step} START (after dataloader.next()): {get_system_memory_info()}")
             logger.info(f"[Data] [update_policy] Mini step {mini_step}, batch size: {data.batch['input_ids'].size(0)}")
+
+            # OPTIMIZATION: Mini-step 0 uses SKIP_PREDICTIVE, doesn't need old_inputs/old_logits
+            # Remove them to save memory during forward/backward
+            if mini_step == 0 and self.config.router_replay.enable_bias_predictor:
+                if "old_inputs" in data.non_tensor_batch or "old_logits" in data.non_tensor_batch:
+                    logger.info(f"[Memory] [update_policy] Mini-step 0: Removing old_inputs/old_logits to save memory (SKIP_PREDICTIVE doesn't need them)")
+                    logger.info(f"[Memory] Before removal: {get_system_memory_info()}")
+                    data.non_tensor_batch.pop("old_inputs", None)
+                    data.non_tensor_batch.pop("old_logits", None)
+                    import gc
+                    gc.collect()
+                    logger.info(f"[Memory] After removal and GC: {get_system_memory_info()}")
+            
             should_save = self.enable_logits_saving and (step_for_save % self.save_frequency == 0)
             if should_save:
                 RouterReplay.set_cache_action(RouterReplayCacheAction.TRAINING)
@@ -1152,7 +1195,20 @@ class MegatronPPOActor(BasePPOActor):
                 # Note that o[0] is metrics, o[1] is entropy, o[2] is response_mask
                 append_to_dict(metrics, metric[0])  # append the metric from this micro-batch to global metrics.
 
+            logger.info(f"[Memory] [update_policy] Before optimizer.step(): {get_system_memory_info()}")
+            if torch.cuda.is_available():
+                gpu_mem = torch.cuda.memory_allocated() / (1024**3)
+                gpu_reserved = torch.cuda.max_memory_reserved() / (1024**3)
+                logger.info(f"[GPU Memory] Before optimizer.step() - Allocated: {gpu_mem:.2f}GB, Reserved: {gpu_reserved:.2f}GB")
+            
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
+            
+            logger.info(f"[Memory] [update_policy] After optimizer.step(): {get_system_memory_info()}, grad_norm={grad_norm}")
+            if torch.cuda.is_available():
+                gpu_mem = torch.cuda.memory_allocated() / (1024**3)
+                gpu_reserved = torch.cuda.max_memory_reserved() / (1024**3)
+                logger.info(f"[GPU Memory] After optimizer.step() - Allocated: {gpu_mem:.2f}GB, Reserved: {gpu_reserved:.2f}GB")
+            
             data = {"actor/grad_norm": grad_norm}
             append_to_dict(metrics, data)
 
@@ -1178,12 +1234,15 @@ class MegatronPPOActor(BasePPOActor):
                 self.prof.step()
 
             if self.config.router_replay.mode in ["R2", "R3"]:
+                logger.info(f"[Memory] [update_policy] Before clear router replay: {get_system_memory_info()}")
                 RouterReplay.clear_global_router_replay_action()
                 RouterReplay.clear_global_indices()
                 # Clear predictive action after each ministep
                 if self.config.router_replay.enable_bias_predictor:
                     RouterReplay.clear_global_predictive_action()
+                    logger.info(f"[Memory] [update_policy] Before clear_global_predictive_data: {get_system_memory_info()}")
                     RouterReplay.clear_global_predictive_data()
+                    logger.info(f"[Memory] [update_policy] After clear_global_predictive_data: {get_system_memory_info()}")
 
             # Save logits cache for this mini step (only when should_save)
             if should_save:
@@ -1208,6 +1267,11 @@ class MegatronPPOActor(BasePPOActor):
                             logger.info(f"[Routing Replay] Scheduled async save for training step {step_for_save}, mini {mini_step}")
                 else:
                     logger.debug(f"[Routing Replay] Skipping save for training step {step_for_save}, mini {mini_step} (frequency={self.save_frequency})")
+            
+            logger.info(f"[Memory] [update_policy] Mini step {mini_step} END: {get_system_memory_info()}")
+            if torch.cuda.is_available():
+                gpu_mem = torch.cuda.memory_allocated() / (1024**3)
+                logger.info(f"[GPU Memory] Mini step {mini_step} END - Allocated: {gpu_mem:.2f}GB")
 
         # Increment training step after all mini steps
         if self.enable_logits_saving:

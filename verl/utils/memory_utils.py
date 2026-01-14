@@ -17,6 +17,7 @@ import gc
 import inspect
 import logging
 import os
+import psutil
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +27,20 @@ from verl.utils.device import get_torch_device, is_cuda_available
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def get_system_memory_info():
+    """Get system memory information (total and available) in GB."""
+    if psutil is None:
+        return "N/A (psutil not available)"
+    try:
+        mem = psutil.virtual_memory()
+        total_gb = mem.total / (1024 ** 3)
+        available_gb = mem.available / (1024 ** 3)
+        used_gb = mem.used / (1024 ** 3)
+        return f"System: {used_gb:.2f}GB/{total_gb:.2f}GB used, {available_gb:.2f}GB available"
+    except Exception as e:
+        return f"N/A (error: {e})"
 
 
 def aggressive_empty_cache(force_sync: bool = True, max_retries: int = 3) -> None:

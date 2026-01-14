@@ -61,7 +61,7 @@ from verl.utils.megatron_utils import (
     per_tensor_generator,
     register_megatron_training_hooks,
 )
-from verl.utils.memory_utils import aggressive_empty_cache
+from verl.utils.memory_utils import aggressive_empty_cache, get_system_memory_info
 from verl.utils.model import get_hf_model_path, load_mcore_dist_weights, load_megatron_gptmodel_weights
 from verl.utils.profiler import (
     DistProfiler,
@@ -83,19 +83,6 @@ from verl.workers.rollout import get_rollout_class
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-
-def _get_system_memory_info():
-    """Get system memory information (total and available) in GB."""
-    if psutil is None:
-        return "N/A (psutil not available)"
-    try:
-        mem = psutil.virtual_memory()
-        total_gb = mem.total / (1024 ** 3)
-        available_gb = mem.available / (1024 ** 3)
-        used_gb = mem.used / (1024 ** 3)
-        return f"System: {used_gb:.2f}GB/{total_gb:.2f}GB used, {available_gb:.2f}GB available"
-    except Exception as e:
-        return f"N/A (error: {e})"
 
 def set_random_seed(seed, only_rollout=False):
     import random
@@ -785,9 +772,16 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             load_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
 
+        from verl.utils.memory_utils import get_system_memory_info
+        
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
+        
+        logger.info(f"[Memory] [update_actor] Before make_minibatch_iterator: {get_system_memory_info()}")
+        data.print_size(prefix="[Memory] Input data size")
         dataloader = self.actor.make_minibatch_iterator(data=data)
+        logger.info(f"[Memory] [update_actor] After make_minibatch_iterator: {get_system_memory_info()}")
+        
         with Timer(name="update_policy", logger=None) as timer:
             metrics = self.actor.update_policy(dataloader=dataloader, global_step=global_step)
         delta_time = timer.last
@@ -937,22 +931,16 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             output.batch["routed_experts"] = layers_topk_idx
             if self.config.actor.router_replay.enable_bias_predictor:
                 if layers_predictive_states is not None:
-                    # Store to non_tensor_batch (as torch tensors to avoid double memory allocation)
-                    # Check for non-zero data (handle both torch tensors and numpy arrays)
-                    def get_sum(t):
-                        if isinstance(t, torch.Tensor):
-                            return t.sum().item()
-                        else:
-                            return 0
-                    
-                    inputs_sum = sum(get_sum(t) for t in layers_predictive_states[0])
-                    logits_sum = sum(get_sum(t) for t in layers_predictive_states[1])
-                    logger.info(f"[Rank {self.rank}] [Bias Predictor] Storing predictive states (as torch tensors). Inputs sum: {inputs_sum}, Logits sum: {logits_sum}")
+                    # Store to non_tensor_batch (as numpy arrays for Ray serialization efficiency)
+                    # Check for non-zero data
+                    inputs_sum = sum(t.sum() if t is not None else 0 for t in layers_predictive_states[0])
+                    logits_sum = sum(t.sum() if t is not None else 0 for t in layers_predictive_states[1])
+                    logger.info(f"[Rank {self.rank}] [Bias Predictor] Storing predictive states (numpy format). Inputs sum: {inputs_sum}, Logits sum: {logits_sum}")
                     if inputs_sum == 0 and logits_sum == 0:
                          logger.warning(f"[Rank {self.rank}] [Bias Predictor] Warning: Storing all-zero predictive states!")
 
-                    output.non_tensor_batch["old_inputs"] = layers_predictive_states[0]  # list of torch.Tensor [seq_len, layers, hidden], length = bs
-                    output.non_tensor_batch["old_logits"] = layers_predictive_states[1]  # list of torch.Tensor [seq_len, layers, num_experts], length = bs
+                    output.non_tensor_batch["old_inputs"] = layers_predictive_states[0]  # list of numpy array [seq_len, layers, hidden], length = bs
+                    output.non_tensor_batch["old_logits"] = layers_predictive_states[1]  # list of numpy array [seq_len, layers, num_experts], length = bs
                 else:
                     logger.warning(f"[Rank {self.rank}] Bias predictor enabled but layers_predictive_states is None!")
 
@@ -988,9 +976,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             # Debug: Check state before getting cache
             debug_info = RouterReplay.get_debug_info()
             logger.info(f"[Rank {self.rank}] Before get_and_clear_logits_cache: {debug_info}")
-            logger.info(f"[Memory] Before get_and_clear_logits_cache: GPU memory: allocated {get_torch_device().memory_allocated() / (1024**3):.2f} GB, CPU memory: {_get_system_memory_info()}")
+            logger.info(f"[Memory] Before get_and_clear_logits_cache: GPU memory: allocated {get_torch_device().memory_allocated() / (1024**3):.2f} GB, CPU memory: {get_system_memory_info()}")
             logits_cache = RouterReplay.get_and_clear_logits_cache()
-            logger.info(f"[Memory] After get_and_clear_logits_cache: GPU memory: allocated {get_torch_device().memory_allocated() / (1024**3):.2f} GB, CPU memory: {_get_system_memory_info()}")
+            logger.info(f"[Memory] After get_and_clear_logits_cache: GPU memory: allocated {get_torch_device().memory_allocated() / (1024**3):.2f} GB, CPU memory: {get_system_memory_info()}")
 
             step_name = f"log_prob_{global_step}"
             if should_save:
