@@ -15,6 +15,7 @@
 The main entry point to run the PPO algorithm
 """
 
+import copy
 import datetime
 import logging
 import os
@@ -34,6 +35,7 @@ except ImportError:
 
 import numpy as np
 from megatron.core import parallel_state as mpu
+from megatron.core.optimizer import ParamKey
 
 from verl import DataProto
 from verl.models.mcore import get_mcore_weight_converter
@@ -295,7 +297,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             self.router_replay = self.config.actor.router_replay
             self.enable_routing_replay = self.router_replay.mode != "disabled"
 
-            # Initialize logits saver if record_file is specified (独立于 router_replay)
+            # Initialize logits saver if record_file is specified (This is independent of router_replay)
             if self.router_replay.record_file not in [None, ""]:
                 from verl.utils.megatron.router_replay_saver import RouterReplayLogitsSaver
                 self.logits_saver = RouterReplayLogitsSaver(self.router_replay.record_file)
@@ -488,7 +490,26 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 use_distributed_optimizer=wrap_config.use_distributed_optimizer,
                 fp16=self.dtype == torch.float16,
             )
-            actor_optimizer = get_megatron_optimizer(model=actor_module, config=optim_config_megatron)
+            
+            # Build config_overrides for bias_predictor if enabled
+            config_overrides = None
+            if self.tf_config.enable_router_bias_predictor:
+                # Create specialized optimizer config for bias_predictor
+                bias_predictor_optim_config = copy.deepcopy(optim_config_megatron)
+                bias_predictor_optim_config.lr = optim_config_megatron.lr * self.tf_config.bias_predictor_lr_mult
+                
+                # Use ParamKey to match parameters by attribute
+                bias_predictor_key = ParamKey(attr='is_bias_predictor')
+                config_overrides = {bias_predictor_key: bias_predictor_optim_config}
+                
+                logger.info(f"[Bias Predictor] Setting separate learning rate: base_lr={optim_config_megatron.lr}, "
+                           f"lr_mult={self.tf_config.bias_predictor_lr_mult}, bias_predictor_lr={bias_predictor_optim_config.lr}")
+            
+            actor_optimizer = get_megatron_optimizer(
+                model=actor_module, 
+                config=optim_config_megatron,
+                config_overrides=config_overrides
+            )
             actor_optimizer_scheduler = get_megatron_optimizer_param_scheduler(
                 optimizer=actor_optimizer, config=optim_config
             )
@@ -583,11 +604,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             # Set router bias predictor config if enabled
             if self.router_replay.enable_bias_predictor:
                 override_transformer_config["enable_router_bias_predictor"] = True
-                override_transformer_config["router_bias_scale"] = self.router_replay.bias_scale
-                override_transformer_config["router_bias_predictor_loss_type"] = self.router_replay.bias_predictor_loss_type
-                logger.info(f"[Rank {self.rank}] Router bias predictor enabled with scale={self.router_replay.bias_scale}, "
-                           f"loss_type={self.router_replay.bias_predictor_loss_type}, "
-                           f"storage_dtype={self.router_replay.predictive_storage_dtype}")
+                override_transformer_config["bias_predictor_loss_type"] = self.router_replay.bias_predictor_loss_type
+                override_transformer_config["bias_predictor_lr_mult"] = self.router_replay.bias_predictor_lr_mult
+                logger.info(f"[Rank {self.rank}] Router bias predictor enabled with loss_type={self.router_replay.bias_predictor_loss_type}, lr_mult={self.router_replay.bias_predictor_lr_mult}, storage_dtype={self.router_replay.predictive_storage_dtype}")
 
             # Log logits_saving status for debugging
             if self.enable_logits_saving:
@@ -777,10 +796,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
         
-        logger.info(f"[Memory] [update_actor] Before make_minibatch_iterator: {get_system_memory_info()}")
+        # logger.info(f"[Memory] [update_actor] Before make_minibatch_iterator: {get_system_memory_info()}")
         data.print_size(prefix="[Memory] Input data size")
         dataloader = self.actor.make_minibatch_iterator(data=data)
-        logger.info(f"[Memory] [update_actor] After make_minibatch_iterator: {get_system_memory_info()}")
+        # logger.info(f"[Memory] [update_actor] After make_minibatch_iterator: {get_system_memory_info()}")
         
         with Timer(name="update_policy", logger=None) as timer:
             metrics = self.actor.update_policy(dataloader=dataloader, global_step=global_step)
@@ -933,14 +952,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 if layers_predictive_states is not None:
                     # Store to non_tensor_batch (as numpy arrays for Ray serialization efficiency)
                     # Check for non-zero data
-                    inputs_sum = sum(t.sum() if t is not None else 0 for t in layers_predictive_states[0])
-                    logits_sum = sum(t.sum() if t is not None else 0 for t in layers_predictive_states[1])
-                    logger.info(f"[Rank {self.rank}] [Bias Predictor] Storing predictive states (numpy format). Inputs sum: {inputs_sum}, Logits sum: {logits_sum}")
-                    if inputs_sum == 0 and logits_sum == 0:
-                         logger.warning(f"[Rank {self.rank}] [Bias Predictor] Warning: Storing all-zero predictive states!")
+                    # inputs_sum = sum(t.sum() if t is not None else 0 for t in layers_predictive_states[0])
+                    # logits_sum = sum(t.sum() if t is not None else 0 for t in layers_predictive_states[1])
+                    # logger.info(f"[Rank {self.rank}] [Bias Predictor] Storing predictive states (numpy format). Inputs sum: {inputs_sum}, Logits sum: {logits_sum}")
+                    # if inputs_sum == 0 and logits_sum == 0:
+                    #      logger.warning(f"[Rank {self.rank}] [Bias Predictor] Warning: Storing all-zero predictive states!")
 
-                    output.non_tensor_batch["old_inputs"] = layers_predictive_states[0]  # list of numpy array [seq_len, layers, hidden], length = bs
-                    output.non_tensor_batch["old_logits"] = layers_predictive_states[1]  # list of numpy array [seq_len, layers, num_experts], length = bs
+                    output.non_tensor_batch["old_inputs"] = layers_predictive_states[0]  # list of numpy array [num_tokens_i, layers, hidden] (variable shape), length = bs
+                    output.non_tensor_batch["old_logits"] = layers_predictive_states[1]  # list of numpy array [num_tokens_i, layers, num_experts] (variable shape), length = bs
                 else:
                     logger.warning(f"[Rank {self.rank}] Bias predictor enabled but layers_predictive_states is None!")
 
@@ -975,10 +994,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
             # Debug: Check state before getting cache
             debug_info = RouterReplay.get_debug_info()
-            logger.info(f"[Rank {self.rank}] Before get_and_clear_logits_cache: {debug_info}")
-            logger.info(f"[Memory] Before get_and_clear_logits_cache: GPU memory: allocated {get_torch_device().memory_allocated() / (1024**3):.2f} GB, CPU memory: {get_system_memory_info()}")
+            # logger.info(f"[Rank {self.rank}] Before get_and_clear_logits_cache: {debug_info}")
+            # logger.info(f"[Memory] Before get_and_clear_logits_cache: GPU memory: allocated {get_torch_device().memory_allocated() / (1024**3):.2f} GB, CPU memory: {get_system_memory_info()}")
             logits_cache = RouterReplay.get_and_clear_logits_cache()
-            logger.info(f"[Memory] After get_and_clear_logits_cache: GPU memory: allocated {get_torch_device().memory_allocated() / (1024**3):.2f} GB, CPU memory: {get_system_memory_info()}")
+            # logger.info(f"[Memory] After get_and_clear_logits_cache: GPU memory: allocated {get_torch_device().memory_allocated() / (1024**3):.2f} GB, CPU memory: {get_system_memory_info()}")
 
             step_name = f"log_prob_{global_step}"
             if should_save:

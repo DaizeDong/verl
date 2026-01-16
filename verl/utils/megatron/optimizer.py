@@ -65,11 +65,13 @@ def init_megatron_optim_config(
 def get_megatron_optimizer(
     model,
     config: OptimizerConfig,
+    config_overrides=None,
 ):
     # Base optimizer.
     return get_megatron_optimizer_native(
         config=config,
         model_chunks=model,
+        config_overrides=config_overrides,
     )
 
 

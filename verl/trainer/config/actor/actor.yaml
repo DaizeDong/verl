@@ -245,7 +245,7 @@ router_replay:
   save_frequency: 1
 
   enable_bias_predictor: false
-  bias_scale: 1.0
   bias_predictor_loss_type: kl
+  bias_predictor_lr_mult: 1000.0
   predictive_downsample_batch_size: null
   predictive_storage_dtype: bf16

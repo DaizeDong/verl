@@ -474,6 +474,11 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 assert async_save_request is None, "Async save request should be None when not using async save."
                 torch.distributed.barrier()
 
+        # Delete state_dict immediately after save operation
+        del state_dict
+        import gc
+        gc.collect()
+
         if self.should_save_model:
             # Save adapter-only checkpoint if PEFT is enabled
             if self.peft_cls is not None:
@@ -657,3 +662,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             finalize_save_fn()
 
         self.previous_saved_paths.append(local_path)
+        
+        # Explicit memory cleanup after checkpoint save to prevent memory accumulation
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        log_with_rank(f"Memory cleanup completed after checkpoint save", rank=self.rank, logger=logger)

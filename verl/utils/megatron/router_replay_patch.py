@@ -93,9 +93,10 @@ class RouterReplay:
     current_token_indices = None
 
     # Predictive loss tracking for wandb logging
+    replay_topk_accuracy_tracker = []  # List of (layer_idx, accuracy_value)
     predictive_loss_tracker = []  # List of (layer_idx, loss_value)
-    bias_ratio_tracker = []  # List of (layer_idx, ratio_value)
-    topk_accuracy_tracker = []  # List of (layer_idx, accuracy_value)
+    predictive_bias_ratio_tracker = []  # List of (layer_idx, ratio_value)
+    predictive_topk_accuracy_tracker = []  # List of (layer_idx, accuracy_value)
 
     @staticmethod
     def clear_global_indices():
@@ -264,9 +265,9 @@ class RouterReplay:
             logits: Old router logits
             valid_mask: Optional boolean mask of shape [total_tokens] indicating which tokens belong to valid samples
         """
-        self.recorded_old_inputs = inputs
-        self.recorded_old_logits = logits
-        self.predictive_valid_mask = valid_mask
+        self.recorded_old_inputs = inputs.detach()
+        self.recorded_old_logits = logits.detach()
+        self.predictive_valid_mask = valid_mask.detach()
         # For now this is the same as record_predictive_data, as we don't have backward yet.
 
     def get_predictive_data(self):
@@ -277,13 +278,6 @@ class RouterReplay:
         """Record inputs and logits for this layer (like record_indices)."""
         # Keep on GPU for merge function, which will handle CPU transfer uniformly
         # Use .detach() to break gradient graph and reduce memory footprint
-        
-        # Check if inputs are non-zero (for debugging zero data issue)
-        input_sum = inputs.sum().item()
-        if input_sum == 0:
-            logger.warning(f"[RouterReplayLayer] [Debug] Recording ALL-ZERO inputs for layer {self.layer_idx}!")
-        else:
-            logger.info(f"[RouterReplayLayer] [Debug] Recording inputs with sum {input_sum} for layer {self.layer_idx}.")
         
         # Detach and create contiguous copies to allow original tensors to be freed
         self.recorded_old_inputs = inputs.squeeze().detach().contiguous()
@@ -322,39 +316,49 @@ class RouterReplay:
             router.clear_predictive_action()
 
     @staticmethod
+    def record_replay_topk_accuracy(layer_idx: int, accuracy_value: float):
+        """Record routing replay top-k accuracy for wandb logging."""
+        RouterReplay.replay_topk_accuracy_tracker.append((layer_idx, accuracy_value))
+
+    @staticmethod
     def record_predictive_loss(layer_idx: int, loss_value: float):
         """Record predictive loss for wandb logging."""
         RouterReplay.predictive_loss_tracker.append((layer_idx, loss_value))
 
     @staticmethod
-    def record_bias_ratio(layer_idx: int, ratio_value: float):
-        """Record bias-to-logits ratio for wandb logging."""
-        RouterReplay.bias_ratio_tracker.append((layer_idx, ratio_value))
+    def record_predictive_bias_ratio(layer_idx: int, ratio_value: float):
+        """Record predictive bias-to-logits ratio for wandb logging."""
+        RouterReplay.predictive_bias_ratio_tracker.append((layer_idx, ratio_value))
 
     @staticmethod
-    def record_topk_accuracy(layer_idx: int, accuracy_value: float):
-        """Record top-k prediction accuracy for wandb logging."""
-        RouterReplay.topk_accuracy_tracker.append((layer_idx, accuracy_value))
+    def record_predictive_topk_accuracy(layer_idx: int, accuracy_value: float):
+        """Record predictive top-k prediction accuracy for wandb logging."""
+        RouterReplay.predictive_topk_accuracy_tracker.append((layer_idx, accuracy_value))
 
     @staticmethod
     def get_and_clear_predictive_metrics():
         """Get aggregated predictive metrics and clear trackers."""
         metrics = {}
 
+        if RouterReplay.replay_topk_accuracy_tracker:
+            avg_accuracy = sum(acc for _, acc in RouterReplay.replay_topk_accuracy_tracker) / len(RouterReplay.replay_topk_accuracy_tracker)
+            metrics['replay_topk_accuracy'] = avg_accuracy
+            RouterReplay.replay_topk_accuracy_tracker.clear()
+
         if RouterReplay.predictive_loss_tracker:
             avg_loss = sum(loss for _, loss in RouterReplay.predictive_loss_tracker) / len(RouterReplay.predictive_loss_tracker)
             metrics['predictive_loss'] = avg_loss
             RouterReplay.predictive_loss_tracker.clear()
 
-        if RouterReplay.bias_ratio_tracker:
-            avg_ratio = sum(ratio for _, ratio in RouterReplay.bias_ratio_tracker) / len(RouterReplay.bias_ratio_tracker)
-            metrics['bias_to_logits_ratio'] = avg_ratio
-            RouterReplay.bias_ratio_tracker.clear()
+        if RouterReplay.predictive_bias_ratio_tracker:
+            avg_ratio = sum(ratio for _, ratio in RouterReplay.predictive_bias_ratio_tracker) / len(RouterReplay.predictive_bias_ratio_tracker)
+            metrics['predictive_bias_to_logits_ratio'] = avg_ratio
+            RouterReplay.predictive_bias_ratio_tracker.clear()
 
-        if RouterReplay.topk_accuracy_tracker:
-            avg_accuracy = sum(acc for _, acc in RouterReplay.topk_accuracy_tracker) / len(RouterReplay.topk_accuracy_tracker)
-            metrics['topk_prediction_accuracy'] = avg_accuracy
-            RouterReplay.topk_accuracy_tracker.clear()
+        if RouterReplay.predictive_topk_accuracy_tracker:
+            avg_accuracy = sum(acc for _, acc in RouterReplay.predictive_topk_accuracy_tracker) / len(RouterReplay.predictive_topk_accuracy_tracker)
+            metrics['predictive_topk_accuracy'] = avg_accuracy
+            RouterReplay.predictive_topk_accuracy_tracker.clear()
 
         return metrics
 
@@ -378,6 +382,25 @@ class RouterReplay:
         # Record to predictive_bias cache (only during compute_log_prob phase)
         if RouterReplay.current_cache_action == RouterReplayCacheAction.COMPUTE_LOG_PROB:
             RouterReplay.logits_cache["predictive_bias"].append((layer_idx, delta_logits_cpu))
+
+
+@torch.no_grad()
+def calculate_topk_accuracy(
+    topk: int,
+    logits1: torch.Tensor=None,
+    logits2: torch.Tensor=None,
+    topk_indices1: torch.Tensor=None,
+    topk_indices2: torch.Tensor=None,
+):
+    if topk_indices1 is None:
+        _, topk_indices1 = torch.topk(logits1, k=topk, dim=-1)
+    if topk_indices2 is None:
+        _, topk_indices2 = torch.topk(logits2, k=topk, dim=-1)
+    topk_indices1_expanded = topk_indices1.unsqueeze(-1)  # [tokens, topk, 1]
+    topk_indices2_expanded = topk_indices2.unsqueeze(-2)  # [tokens, 1, topk]
+    matches = (topk_indices1_expanded == topk_indices2_expanded).any(dim=-1)  # [tokens, topk]
+    accuracy = matches.float().mean().item()
+    return accuracy
 
 
 def _patched_topk_routing_with_score_function(
@@ -448,14 +471,19 @@ def _patched_topk_routing_with_score_function(
         elif routing_action == RouterReplayAction.REPLAY_FORWARD:
             if router_replay is None or router_replay.target_topk_idx is None:
                 # Fallback if replay data is not available
-                return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
-
-            # Use the provided indices for replay
-            top_indices = router_replay.target_topk_idx
-            # Ensure indices are on the correct device
-            top_indices = top_indices.to(scores.device)
-            # Gather the scores for the replayed indices to get the probabilities
-            probs = scores.gather(1, top_indices)
+                probs, top_indices = _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+                return probs, top_indices
+            else:
+                # Use the provided indices for replay
+                top_indices = router_replay.target_topk_idx
+                # Ensure indices are on the correct device
+                top_indices = top_indices.to(scores.device)
+                # Gather the scores for the replayed indices to get the probabilities
+                probs = scores.gather(1, top_indices)
+                # Calculate current top-k indices for accuracy calculation
+                _, current_top_indices = _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+                accuracy = calculate_topk_accuracy(topk=topk, logits1=top_indices, logits2=current_top_indices)
+                RouterReplay.record_replay_topk_accuracy(layer_idx, accuracy)
             return probs, top_indices
         elif routing_action == RouterReplayAction.REPLAY_BACKWARD:
             if router_replay is None or not router_replay.replay_backward_list:
@@ -635,8 +663,6 @@ class MoEPredictiveLossAutoScaler(torch.autograd.Function):
 
 
 def apply_predictive_loss(self, probs: torch.Tensor, predictive_loss: torch.Tensor):
-    if predictive_loss is None:
-        return probs
     # Attach predictive loss for backprop
     return MoEPredictiveLossAutoScaler.apply(probs, predictive_loss)
 
@@ -661,7 +687,7 @@ def patched_forward(self, input: torch.Tensor):
     # Router bias predictor
     # Managed by RouterReplay class for proper phase control
     if self.config.enable_router_bias_predictor:
-        logger.info(f"[Predictive Routing] Layer {self.layer_number}: {get_system_memory_info()}")
+        # logger.info(f"[Predictive Routing Replay] Layer {self.layer_number}: {get_system_memory_info()}")
         assert self.router_replay is not None and self.bias_predictor is not None
 
         predictive_routing_action = self.router_replay.predictive_action if self.router_replay is not None else None
@@ -673,27 +699,23 @@ def patched_forward(self, input: torch.Tensor):
             probs, routing_map = self.routing(logits)
         else:
             if predictive_routing_action == RouterPredictiveAction.RECORD:
-                # Log_prob phase: record inputs and logits, apply bias correction
-                self.router_replay.record_predictive_data(input, logits)
-
-                # Apply bias correction (linear output, controlled by bias_scale)
-                # Note: Can be changed to tanh or other activation if needed
                 with torch.no_grad():
-                    delta_logits = self.config.router_bias_scale * self.bias_predictor(input)
-                corrected_logits = logits + delta_logits
+                    # Log_prob phase: record inputs and logits, apply bias correction
+                    self.router_replay.record_predictive_data(input, logits)
 
-                # Track bias ratio: |delta_logits|_mean / |logits|_mean
-                with torch.no_grad():
-                    bias_abs_mean = torch.abs(delta_logits).mean().item()
-                    logits_abs_mean = torch.abs(logits).mean().item()
-                    bias_ratio = bias_abs_mean / (logits_abs_mean + 1e-10)
+                    # Apply bias correction (linear output)
+                    delta_logits = self.bias_predictor(input)
+
+                    # Track bias ratio: |delta_logits|_mean / |logits|_mean
                     layer_idx = self.router_replay.layer_idx if self.router_replay else 0
-                    RouterReplay.record_bias_ratio(layer_idx, bias_ratio)
+                    bias_ratio = (torch.abs(delta_logits).mean() / (torch.abs(logits).mean() + 1e-10)).item()
+                    RouterReplay.record_predictive_bias_ratio(layer_idx, bias_ratio)
 
                     # Record predictive bias to logits cache if saving is enabled
                     if RouterReplay.enable_logits_recording:
                         RouterReplay.record_predictive_bias(delta_logits, layer_idx)
-
+                
+                corrected_logits = logits + delta_logits
                 probs, routing_map = self.routing(corrected_logits)
 
             elif predictive_routing_action == RouterPredictiveAction.SKIP_PREDICTIVE:
@@ -708,15 +730,16 @@ def patched_forward(self, input: torch.Tensor):
                 if self.layer_number == 1 and self.router_replay and self.router_replay.layer_idx == 0:
                      logger.info(f"[Predictive Routing Replay] Action is COMPUTE_PREDICTIVE_LOSS. Computing loss...")
 
-                gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3)
-                logger.info(f"[Memory] (layer {self.layer_number}) Total GPU memory allocated before predictive loss computation: {gpu_mem:.2f} GB, {get_system_memory_info()}")
+                # gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3)
+                # logger.info(f"[Predictive Routing Replay] [Memory] (layer {self.layer_number}) Total GPU memory allocated before predictive loss computation: {gpu_mem:.2f} GB, {get_system_memory_info()}")
                 old_inputs, old_logits, valid_mask = self.router_replay.get_predictive_data()
 
                 if old_inputs is not None and old_logits is not None:
                     old_inputs = old_inputs.to(input.device)
                     old_logits = old_logits.to(logits.device)
-                    gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3)
-                    logger.info(f"[Memory] (layer {self.layer_number}) Total GPU memory allocated after loading predictive data: {gpu_mem:.2f} GB, {get_system_memory_info()}")
+                    valid_mask = valid_mask.to(input.device)
+                    # gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3)
+                    # logger.info(f"[Predictive Routing Replay] [Memory] (layer {self.layer_number}) Total GPU memory allocated after loading predictive data: {gpu_mem:.2f} GB, {get_system_memory_info()}")
 
                     # Debug asserts: check shape matching
                     assert old_inputs.shape[-1] == input.shape[-1], f"hidden_size mismatch: old={old_inputs.shape[-1]}, current={input.shape[-1]}"
@@ -730,21 +753,21 @@ def patched_forward(self, input: torch.Tensor):
                         # Filter current input and logits at token level to match old_inputs/old_logits
                         current_input = input[valid_mask]
                         current_logits = logits[valid_mask]
-                        logger.info(f"[Predictive Routing Replay] Applied token-level mask: {valid_mask.sum().item()}/{valid_mask.size(0)} valid tokens")
+                        # logger.info(f"[Predictive Routing Replay] Applied token-level mask: {valid_mask.sum().item()}/{valid_mask.size(0)} valid tokens")
                         assert current_input.shape[0] == old_inputs.shape[0], f"Token count mismatch after masking: old={old_inputs.shape[0]}, current={current_input.shape[0]}"
                         assert current_logits.shape[0] == old_logits.shape[0], f"Token count mismatch after masking: old={old_logits.shape[0]}, current={current_logits.shape[0]}"
 
                     # Compute delta_logits and logits_diff
                     # Use old_inputs with current weights to get delta_logits
-                    delta_logits = self.config.router_bias_scale * self.bias_predictor(old_inputs)
+                    delta_logits = self.bias_predictor(old_inputs)
                     logits_diff = current_logits - old_logits
 
                     # Compute loss between delta_logits and logits_diff
-                    if self.config.router_bias_predictor_loss_type == "l2":
+                    if self.config.bias_predictor_loss_type == "l2":
                         # L2 loss on raw logits difference
                         predictive_loss = torch.nn.functional.mse_loss(delta_logits, logits_diff.detach(), reduction='mean')
 
-                    elif self.config.router_bias_predictor_loss_type == "kl":
+                    elif self.config.bias_predictor_loss_type == "kl":
                         # KL divergence on logits_diff vs delta_logits distributions
                         ##############
                         # DEBUG
@@ -773,7 +796,7 @@ def patched_forward(self, input: torch.Tensor):
                             reduction='batchmean'
                         )
 
-                    elif self.config.router_bias_predictor_loss_type == "kl-post":
+                    elif self.config.bias_predictor_loss_type == "kl-post":
                         # KL divergence on corrected vs uncorrected routing distributions
                         # This measures the KL between final routing decisions
                         pred_log = torch.log_softmax(old_logits + delta_logits, dim=-1)
@@ -781,33 +804,21 @@ def patched_forward(self, input: torch.Tensor):
                         predictive_loss = torch.sum(torch.exp(pred_log) * (pred_log - target_log.detach()), dim=-1).mean()
 
                     else:
-                        raise ValueError(f"Invalid loss type: {self.config.router_bias_predictor_loss_type}")
+                        raise ValueError(f"Invalid loss type: {self.config.bias_predictor_loss_type}")
 
-                    # Record predictive loss for wandb logging
+                    # Record predictive loss
                     layer_idx = self.router_replay.layer_idx if self.router_replay else 0
                     RouterReplay.record_predictive_loss(layer_idx, predictive_loss.item())
 
-                    # Compute top-k prediction accuracy
-                    with torch.no_grad():
-                        # Predicted top-k: use old_inputs + current bias predictor
-                        _, predicted_topk_indices = torch.topk(old_logits + delta_logits, k=self.topk, dim=-1)
+                    # Record top-k prediction accuracy
+                    accuracy = calculate_topk_accuracy(topk=self.topk, logits1=old_logits + delta_logits, logits2=current_logits)
+                    RouterReplay.record_predictive_topk_accuracy(layer_idx, accuracy)
 
-                        # True top-k: use current_logits if valid_mask is applied, otherwise use logits
-                        _, true_topk_indices = torch.topk(current_logits, k=self.topk, dim=-1)
-
-                        # Compute accuracy: percentage of matches
-                        # Expand dims for broadcasting comparison
-                        predicted_expanded = predicted_topk_indices.unsqueeze(-1)  # [tokens, topk, 1]
-                        true_expanded = true_topk_indices.unsqueeze(-2)  # [tokens, 1, topk]
-                        matches = (predicted_expanded == true_expanded).any(dim=-1)  # [tokens, topk]
-                        accuracy = matches.float().mean().item()
-
-                        RouterReplay.record_topk_accuracy(layer_idx, accuracy)
-
-                    gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3)
-                    logger.info(f"[Memory] (layer {self.layer_number}) Total GPU memory allocated after predictive loss computation: {gpu_mem:.2f} GB, {get_system_memory_info()}")
+                    # gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3)
+                    # logger.info(f"[Predictive Routing Replay] [Memory] (layer {self.layer_number}) Total GPU memory allocated after predictive loss computation: {gpu_mem:.2f} GB, {get_system_memory_info()}")
                 else:
-                    logger.info("Warning: Missing predictive data for router bias predictor loss computation.")
+                    if self.layer_number == 1:
+                        logger.warning("[Predictive Routing Replay] Missing predictive data for router bias predictor loss computation.")
 
                 probs, routing_map = self.routing(logits)
 
@@ -815,7 +826,15 @@ def patched_forward(self, input: torch.Tensor):
                 # DISABLED : normal routing
                 probs, routing_map = self.routing(logits)
 
-        probs = self.apply_predictive_loss(probs, predictive_loss)
+        if predictive_loss is not None:
+            # probs = self.apply_predictive_loss(probs, predictive_loss)
+            predictive_loss.backward(retain_graph=False)
+            self.router_replay.clear_predictive_data()
+            del old_inputs, old_logits, valid_mask
+
+            # Optional: Periodic cache cleanup every N layers to prevent accumulation
+            # if self.layer_number % 12 == 0:
+            #     torch.cuda.empty_cache()
 
     else:
         # Standard routing without bias predictor
@@ -850,8 +869,8 @@ def apply_router_replay_patch():
 
             # Also handle router bias predictor parameters
             enable_router_bias_predictor = kwargs.pop("enable_router_bias_predictor", False)
-            router_bias_scale = kwargs.pop("router_bias_scale", 1.0)
-            router_bias_predictor_loss_type = kwargs.pop("router_bias_predictor_loss_type", "kl")
+            bias_predictor_loss_type = kwargs.pop("bias_predictor_loss_type", "kl")
+            bias_predictor_lr_mult = kwargs.pop("bias_predictor_lr_mult", 10.0)
 
             # Call original constructor with remaining kwargs
             original_tf_config_init(self, *args, **kwargs)
@@ -859,8 +878,8 @@ def apply_router_replay_patch():
             # Set the instance attributes
             self.enable_routing_replay = enable_routing_replay
             self.enable_router_bias_predictor = enable_router_bias_predictor
-            self.router_bias_scale = router_bias_scale
-            self.router_bias_predictor_loss_type = router_bias_predictor_loss_type
+            self.bias_predictor_loss_type = bias_predictor_loss_type
+            self.bias_predictor_lr_mult = bias_predictor_lr_mult
 
         # Apply the patch
         TransformerConfig.__init__ = patched_tf_config_init
@@ -888,4 +907,4 @@ def apply_router_replay_patch():
 
     logger.info(f"Router Replay Patch applied successfully. "
                 f"enable_routing_replay={TransformerConfig.enable_routing_replay}, "
-                f"enable_router_bias_predictor={getattr(TransformerConfig, 'enable_router_bias_predictor', False)}")
+                f"enable_router_bias_predictor={TransformerConfig.enable_router_bias_predictor}")

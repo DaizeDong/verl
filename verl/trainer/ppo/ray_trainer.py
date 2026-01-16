@@ -1307,6 +1307,14 @@ class RayPPOTrainer:
                     with marked_timer("save_checkpoint", timing_raw, color="green"):
                         self._save_checkpoint()
 
+                        # CRITICAL: Force memory cleanup after checkpoint save
+                        # Checkpoint creates large state dicts and mbridge copies that must be freed
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        print(f"[Memory] After checkpoint save and cleanup: CPU memory usage may have temporarily increased")
+
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (
                         self.global_steps + 1 in self.config.global_profiler.steps
