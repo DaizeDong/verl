@@ -1304,10 +1304,55 @@ class RayPPOTrainer:
                 ):
                     if esi_close_to_expiration:
                         print("Force saving checkpoint: ESI instance expiration approaching.")
+                    
+                    # CRITICAL: Aggressive memory cleanup BEFORE checkpoint save
+                    # Problem: CPU memory exhaustion (Ray spilled 240GB) caused by:
+                    # - batch.non_tensor_batch containing old_inputs/old_logits (~16GB per process)
+                    # - actor_output, critic_output (~2-5GB)
+                    # - Intermediate tensors (reward_tensor, etc.)
+                    # When checkpoint generates state_dict, total memory exceeds limit → OOM
+                    print(f"[Memory] Pre-checkpoint cleanup: releasing batch data and intermediate results...")
+                    
+                    # Clear large data from batch.non_tensor_batch (but keep batch object itself)
+                    # batch is still needed after checkpoint save for metrics computation (Line 1387-1396)
+                    if 'batch' in locals():
+                        # Explicitly clear non_tensor_batch containing old_inputs/old_logits
+                        # This is the primary memory hog (~16GB per process, 512GB total across 32 processes)
+                        if hasattr(batch, 'non_tensor_batch') and batch.non_tensor_batch is not None:
+                            batch.non_tensor_batch.clear()
+                        # DO NOT delete batch itself - it's needed for metrics after checkpoint save
+                    
+                    # Delete intermediate outputs from actor/critic updates
+                    if 'actor_output' in locals():
+                        del actor_output
+                    if 'critic_output' in locals():
+                        del critic_output
+                    
+                    # Delete intermediate computation results
+                    if 'old_log_prob' in locals():
+                        del old_log_prob
+                    if 'reward_tensor' in locals():
+                        del reward_tensor
+                    if 'gen_batch_output' in locals():
+                        del gen_batch_output
+                    if 'ref_log_prob' in locals():
+                        del ref_log_prob
+                    if 'values' in locals():
+                        del values
+                    if 'gen_batch' in locals():
+                        del gen_batch
+                    
+                    # Force garbage collection to release memory immediately
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
+                    print(f"[Memory] Pre-checkpoint cleanup completed, proceeding with checkpoint save...")
+                    
                     with marked_timer("save_checkpoint", timing_raw, color="green"):
                         self._save_checkpoint()
 
-                        # CRITICAL: Force memory cleanup after checkpoint save
                         # Checkpoint creates large state dicts and mbridge copies that must be freed
                         import gc
                         gc.collect()

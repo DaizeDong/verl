@@ -875,7 +875,6 @@ class MegatronPPOActor(BasePPOActor):
                     # Use downsample_batch_size to reduce memory usage (1 = keep 1 sequence per micro-batch)
                     # logger.info(f"[Memory] [forward_step] Before merging predictive data: {get_system_memory_info()}")
                     # logger.info(f"[Memory] [forward_step] Current mini_layer lists sizes: inputs={len(self.mini_layer_old_inputs_list)}, logits={len(self.mini_layer_old_logits_list)}")
-
                     merge_router_predictive_data(
                         attention_mask,
                         input_ids,
@@ -887,6 +886,7 @@ class MegatronPPOActor(BasePPOActor):
                         packed_seq_params=packed_seq_params,
                         downsample_batch_size=self.config.router_replay.predictive_downsample_batch_size,
                         storage_dtype=self.config.router_replay.predictive_storage_dtype,
+                        max_len_limit=self.config.router_replay.predictive_downsample_max_len_limit,
                     )
                     # logger.info(f"[Memory] [forward_step] After merging predictive routing replay data: {get_system_memory_info()}")
 
@@ -905,7 +905,6 @@ class MegatronPPOActor(BasePPOActor):
                 router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
                 for router in router_instance_list:
                     router.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
-                # TODO: check if predictive router replay action needs to be set
 
             return output, partial(loss_func, data=batch.batch, meta_info=meta_info)
 

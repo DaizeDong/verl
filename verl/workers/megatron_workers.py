@@ -957,7 +957,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     # logger.info(f"[Rank {self.rank}] [Bias Predictor] Storing predictive states (numpy format). Inputs sum: {inputs_sum}, Logits sum: {logits_sum}")
                     # if inputs_sum == 0 and logits_sum == 0:
                     #      logger.warning(f"[Rank {self.rank}] [Bias Predictor] Warning: Storing all-zero predictive states!")
-
                     output.non_tensor_batch["old_inputs"] = layers_predictive_states[0]  # list of numpy array [num_tokens_i, layers, hidden] (variable shape), length = bs
                     output.non_tensor_batch["old_logits"] = layers_predictive_states[1]  # list of numpy array [num_tokens_i, layers, num_experts] (variable shape), length = bs
                 else:
@@ -967,6 +966,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             # R3: only save if we recorded this step (i.e., routed_experts was not in input batch)
             if "routed_experts" not in data.batch.keys() and layers_topk_idx is not None:
                 output.batch["routed_experts"] = layers_topk_idx
+                # TODO: implement selected_union_mask for R3
                 logger.info(f"[Rank {self.rank}] R3 first step: recorded routed_experts for next step's replay")
 
         if self.config.actor.router_replay.mode in ["R2", "R3"]:

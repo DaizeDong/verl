@@ -46,19 +46,23 @@ class RouterReplayConfig(BaseConfig):
             Required when mode is 'replay'.
         save_frequency (int): Save router logits every N steps. Default is 1 (save every step).
             Set to higher values to reduce I/O overhead (e.g., 10 to save every 10 steps).
-        enable_bias_predictor (bool): Enable router bias predictor for R2-only predicted routing replay.
+        enable_bias_predictor (bool): Enable router bias predictor for predicted routing replay.
             When enabled, an extra nn.Linear(hidden_size -> num_experts) is added next to each router
             to predict routing biases. Default is False.
         bias_predictor_loss_type (str): Loss type for training the bias predictor. Options: 'l2', 'kl'.
             Only effective when enable_bias_predictor is True. Default is 'kl'.
         bias_predictor_lr_mult (float): Learning rate multiplier for bias predictor parameters.
             The bias predictor will use lr = base_lr * bias_predictor_lr_mult.
-            Only effective when enable_bias_predictor is True. Default is 10.0.
+            Only effective when enable_bias_predictor is True. Default is 1000.0.
         predictive_downsample_batch_size (int): Number of sequences to keep per micro-batch when storing predictive data.
             Keeps the first N sequences from each micro-batch to reduce memory usage.
             Data is stored in non_tensor_batch as compact tensors (None for non-sampled samples).
             Set to None to disable downsampling and keep all sequences.
             Example: batch_size=8, downsample_batch_size=1 saves ~87.5% memory.
+        predictive_downsample_max_len_limit (int): Maximum sequence length threshold for downsampling.
+            Sequences longer than this threshold will be filtered out during sampling to reduce memory usage.
+            If valid sequences are insufficient, the shortest sequences from all samples will be selected.
+            Set to None to disable length-based filtering. Default is None.
         predictive_storage_dtype (str): Data type for storing predictive data (old_inputs/old_logits).
             Options: 'fp32', 'bf16', 'fp16'. Lower precision saves memory with minimal impact on accuracy.
             Default is 'bf16' (saves 50% memory compared to fp32).
@@ -70,8 +74,9 @@ class RouterReplayConfig(BaseConfig):
     save_frequency: int = 1
     enable_bias_predictor: bool = False
     bias_predictor_loss_type: str = "kl"
-    bias_predictor_lr_mult: float = 10.0
+    bias_predictor_lr_mult: float = 1000.0
     predictive_downsample_batch_size: int = None
+    predictive_downsample_max_len_limit: int = None
     predictive_storage_dtype: str = "bf16"
 
     def __post_init__(self):

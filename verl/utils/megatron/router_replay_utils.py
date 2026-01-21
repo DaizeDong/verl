@@ -305,7 +305,8 @@ def merge_router_predictive_data(
     vp_rank=None,
     packed_seq_params=None,
     downsample_batch_size=None,
-    storage_dtype='bf16'
+    max_len_limit=None,
+    storage_dtype='bf16',
 ):
     # TODO: check implementation correctness
     """
@@ -313,6 +314,8 @@ def merge_router_predictive_data(
         downsample_batch_size: Number of sequences to keep per micro-batch. Keeps the first N sequences.
             Set to None to keep all sequences (no downsampling).
         storage_dtype: Data type for storage ('fp32', 'bf16', 'fp16'). Lower precision saves memory.
+        max_len_limit: Maximum sequence length threshold for filtering. Sequences longer than this will be filtered out.
+            Set to None to disable length-based filtering.
     
     Returns:
         sampled_indices: Tensor of sampled batch indices (0 to downsample_batch_size-1, or 0 to batch_size-1 if no downsampling).
@@ -435,14 +438,37 @@ def merge_router_predictive_data(
         layers_old_logits_sampled = layers_old_logits_list
         # print(f"[Predictive Routing Replay] [Downsample] No downsampling: batch_size ({bs}) <= downsample_batch_size ({downsample_batch_size})")
     else:
-        # uniformly sample first N sequences
-        step = bs // downsample_batch_size
-        sampled_indices = [i * step for i in range(downsample_batch_size)]
+        # Length-aware sampling: filter by sequence length threshold to avoid OOM from long sequences
+        # Calculate sequence lengths (num_tokens per sample)
+        seq_lengths = torch.tensor([t.shape[0] for t in layers_old_inputs_list], dtype=torch.long)
+        
+        # Use max_len_limit parameter (default to no limit if None)
+        if max_len_limit is not None:
+            max_seq_len_threshold = max_len_limit
+        else:
+            max_seq_len_threshold = float('inf')  # No filtering
+        
+        # Filter sequences by length threshold
+        valid_indices = (seq_lengths <= max_seq_len_threshold).nonzero(as_tuple=True)[0].tolist()
+        
+        if len(valid_indices) >= downsample_batch_size:
+            # Sufficient valid sequences: randomly sample from them
+            sampled_indices = torch.tensor(valid_indices)[torch.randperm(len(valid_indices))[:downsample_batch_size]].tolist()
+            sampled_indices.sort()
+            logger.info(f"[Predictive Routing Replay] Length-filtered sampling: selected {len(sampled_indices)} from {len(valid_indices)} valid sequences (threshold={max_seq_len_threshold}, filtered out {bs - len(valid_indices)} long sequences)")
+        else:
+            # Insufficient valid sequences: select shortest ones from all sequences
+            _, sorted_indices = torch.sort(seq_lengths)
+            sampled_indices = sorted_indices[:downsample_batch_size].tolist()
+            sampled_indices.sort()
+            selected_lengths = seq_lengths[sorted_indices[:downsample_batch_size]]
+            logger.info(f"[Predictive Routing Replay] Shortest-first sampling: selected {len(sampled_indices)} shortest sequences (lengths: min={selected_lengths.min().item()}, max={selected_lengths.max().item()}, mean={selected_lengths.float().mean().item():.1f})")
+        
         downsample_mask = torch.zeros((bs,), dtype=torch.bool, device='cpu')
         downsample_mask[sampled_indices] = True
         layers_old_inputs_sampled = [layers_old_inputs_list[i] for i in sampled_indices]
         layers_old_logits_sampled = [layers_old_logits_list[i] for i in sampled_indices]
-        
+
         # inputs_size_mb_after = sum(t.numel() * t.element_size() for t in layers_old_inputs_sampled) / 1024 / 1024
         # logits_size_mb_after = sum(t.numel() * t.element_size() for t in layers_old_logits_sampled) / 1024 / 1024
         # print(f"[Predictive Routing Replay] [Downsample] Batch downsampling: kept first {downsample_batch_size}/{bs} sequences")
@@ -453,15 +479,15 @@ def merge_router_predictive_data(
     target_dtype = dtype_map.get(storage_dtype, torch.bfloat16)
 
     if len(layers_old_inputs_sampled) > 0 and target_dtype != layers_old_inputs_sampled[0].dtype:
-        total_size_before = sum(t.numel() * t.element_size() for t in layers_old_inputs_sampled) / 1024 / 1024
-        total_size_before += sum(t.numel() * t.element_size() for t in layers_old_logits_sampled) / 1024 / 1024
+        # total_size_before = sum(t.numel() * t.element_size() for t in layers_old_inputs_sampled) / 1024 / 1024
+        # total_size_before += sum(t.numel() * t.element_size() for t in layers_old_logits_sampled) / 1024 / 1024
         
         for i in range(len(layers_old_inputs_sampled)):
             layers_old_inputs_sampled[i] = layers_old_inputs_sampled[i].to(target_dtype)
             layers_old_logits_sampled[i] = layers_old_logits_sampled[i].to(target_dtype)
         
-        total_size_after = sum(t.numel() * t.element_size() for t in layers_old_inputs_sampled) / 1024 / 1024
-        total_size_after += sum(t.numel() * t.element_size() for t in layers_old_logits_sampled) / 1024 / 1024
+        # total_size_after = sum(t.numel() * t.element_size() for t in layers_old_inputs_sampled) / 1024 / 1024
+        # total_size_after += sum(t.numel() * t.element_size() for t in layers_old_logits_sampled) / 1024 / 1024
         # print(f"[Predictive Routing Replay] [Memory] Reduced precision to {target_dtype}: {total_size_before:.2f}MB → {total_size_after:.2f}MB (saved {total_size_before - total_size_after:.2f} MB), {_get_system_memory_info()}")
 
     # Append per-sample arrays to mini-batch lists
@@ -480,8 +506,8 @@ def merge_router_predictive_data(
         torch.cuda.empty_cache()
     
     # Calculate cumulative memory
-    total_size_mb = sum(t.numel() * t.element_size() for t in mini_layer_old_inputs_list) / 1024 / 1024
-    total_size_mb += sum(t.numel() * t.element_size() for t in mini_layer_old_logits_list) / 1024 / 1024
+    # total_size_mb = sum(t.numel() * t.element_size() for t in mini_layer_old_inputs_list) / 1024 / 1024
+    # total_size_mb += sum(t.numel() * t.element_size() for t in mini_layer_old_logits_list) / 1024 / 1024
     # print(f"[Predictive Routing Replay] [Memory] Cumulative predictive data in list: {total_size_mb:.2f} MB ({len(mini_layer_old_inputs_list)} micro-batches), {_get_system_memory_info()}")
 
     # Clear recorded data from router instances to free GPU memory
@@ -614,11 +640,11 @@ def set_router_predictive_data(
         offset = local_rank_info["start"]
         for i, router in enumerate(router_instances_list):
             router.set_predictive_data(
-                layers_old_inputs_concat[:, i + offset, :].unsqueeze(1).contiguous(),  # [total_valid_tokens, 1, hidden]
-                layers_old_logits_concat[:, i + offset, :].unsqueeze(1).contiguous(),  # [total_valid_tokens, 1, num_experts]
+                inputs=layers_old_inputs_concat[:, i + offset, :].unsqueeze(1).contiguous(),  # [total_valid_tokens, 1, hidden]
+                logits=layers_old_logits_concat[:, i + offset, :].unsqueeze(1).contiguous(),  # [total_valid_tokens, 1, num_experts]
                 valid_mask=valid_mask  # Token-level mask to filter current_input in router_replay_patch
             )
-            logger.info(f"[Predictive Routing Replay] Set layer {i} predictive data with layers_old_inputs_concat shape {layers_old_inputs_concat.shape}, layers_old_logits_concat shape {layers_old_logits_concat.shape}, valid_mask {valid_mask}")
+            logger.info(f"[Predictive Routing Replay] Set layer {i} predictive data with layers_old_inputs_concat shape {router.recorded_old_inputs.shape}, layers_old_logits_concat shape {router.recorded_old_logits.shape}")
 
         # Explicitly delete large intermediate tensors to free GPU memory
         del layers_old_inputs_concat, layers_old_logits_concat
@@ -628,7 +654,112 @@ def set_router_predictive_data(
         # logger.info(f"[Memory] [forward_step] After set_router_predictive_data: {get_system_memory_info()}")
 
     else:
-        logger.warning(f"[Predictive Routing Replay] No valid old_inputs/old_logits found in batch")
+        # For processes without valid samples, also set empty predictive data
+        logger.warning(f"[Predictive Routing Replay] No valid old_inputs/old_logits found. Setting None to all routers.")
+        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+        for i, router in enumerate(router_instances_list):
+            router.set_predictive_data(
+                inputs=None,
+                logits=None,
+                valid_mask=None
+            )
+
+
+def combine_topk_indices(
+    original_top_indices,
+    Corrected_top_indices,
+    scores=None,
+    use_pre_softmax=False,
+    *,
+    scores_shape=None,
+    scores_device=None,
+):
+    """Combine recorded and current top-k indices with union semantics.
+
+    This function computes the union of recorded and current expert selections,
+    then ensures all tokens select exactly ``max_select`` experts (the maximum union size).
+
+    Args:
+        original_top_indices: Previously recorded expert indices ``[num_tokens, topk]``.
+        Corrected_top_indices: Expert indices with bias correction applied ``[num_tokens, topk]``.
+        scores: Router scores ``[num_tokens, num_experts]``. Optional.
+            If ``None``, the caller must provide ``scores_shape`` and ``scores_device`` so
+            synthetic scores can be created for padding/randomization. In that case the
+            returned ``probs`` will be ``None``.
+        use_pre_softmax: If ``True``, return probs & selected union mask for pre-softmax masking.
+        scores_shape: Shape tuple ``(num_tokens, num_experts)`` to use when ``scores`` is ``None``.
+        scores_device: Torch device for the synthetic scores / union mask when ``scores`` is ``None``.
+
+    Returns:
+        probs: Scores for selected experts ``[num_tokens, max_select]`` or ``None`` if ``scores`` is ``None``.
+        top_indices: Selected expert indices ``[num_tokens, max_select]``.
+        selected_union_mask: Mask indicating which experts are in union ``[num_tokens, max_select]``.
+    """
+    if scores is None:
+        if scores_shape is None or scores_device is None:
+            raise ValueError("scores_shape and scores_device must be provided when scores is None.")
+        base_scores = torch.rand(scores_shape, dtype=torch.float32, device=scores_device)
+        return_probs = False
+    else:
+        base_scores = scores
+        return_probs = True
+        if scores_shape is None:
+            scores_shape = scores.shape
+        if scores_device is None:
+            scores_device = scores.device
+
+    # Step 1: Compute union of recorded and current expert selections
+    union_indices = torch.cat([Corrected_top_indices, original_top_indices], dim=-1)
+    union_mask = torch.zeros(scores_shape, dtype=torch.bool, device=scores_device)
+    union_mask.scatter_(dim=-1, index=union_indices, value=True)
+
+    num_selects = union_mask.sum(-1)  # [num_tokens], number of experts in union per token
+    max_select = num_selects.max().item()  # Maximum union size across all tokens
+
+    # Step 2: Ensure all tokens select exactly max_select experts
+    # Use score boosting to guarantee all union experts are selected first,
+    # then pad with highest-scoring non-union experts for tokens with union_size < max_select
+    masked_scores = base_scores.clone()
+    boost_value = base_scores.abs().max() + 100.0  # Large enough to ensure union experts rank highest
+    masked_scores = torch.where(union_mask, masked_scores + boost_value, masked_scores)
+
+    # Select top max_select experts (includes all union experts + padding)
+    _, original_top_indices = torch.topk(masked_scores, k=max_select, dim=1, sorted=False)
+
+    # Step 3: Gather probs & selected_union_mask if needed
+    if use_pre_softmax:  # probs already softmaxed before, mask should be 1/0
+        # selected_union_mask: 1.0 for experts that are in the union, 0.0 for padding
+        selected_union_mask = union_mask.gather(1, original_top_indices).float()  # [num_tokens, max_select]
+        # adjust scores for the selected experts
+        if return_probs:
+            probs = base_scores.gather(1, original_top_indices)
+            probs = probs * selected_union_mask  # Zero out padding experts
+        else:
+            probs = None
+
+    else:  # probs will be softmaxed later, mask should be 0/-inf
+        # selected_union_mask: 0.0 for experts that are in the union, -inf for padding
+        selected_union_mask = torch.where(
+            union_mask.gather(1, original_top_indices),
+            torch.zeros_like(original_top_indices, dtype=torch.float32, device=scores_device),
+            torch.full_like(original_top_indices, float('-inf'), dtype=torch.float32, device=scores_device)
+        )  # [num_tokens, max_select]
+        # adjust scores for the selected experts
+        if return_probs:
+            probs = base_scores.gather(1, original_top_indices)
+            probs = probs + selected_union_mask  # Set padding experts to -inf
+        else:
+            probs = None
+
+    # Sanity check: detect NaN/Inf early (only in debug mode)
+    # if torch.isnan(probs).any() or torch.isinf(probs).any():
+    #     import torch.distributed as dist
+    #     rank = dist.get_rank() if dist.is_initialized() else 0
+    #     print(f"[WARNING] Rank {rank}: Detected NaN/Inf in routing probs after combine_topk_indices!")
+    #     print(f"  probs stats: min={probs.min()}, max={probs.max()}, nan={torch.isnan(probs).sum()}, inf={torch.isinf(probs).sum()}")
+
+    return probs, original_top_indices, selected_union_mask
+
 
 def reorder_list_for_vpp(
     micro_batch_list,
