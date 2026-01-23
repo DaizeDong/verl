@@ -27,28 +27,46 @@ def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     - If the key contains "max", np.max is used
     - If the key contains "min", np.min is used
     - Otherwise, np.mean is used
+    
+    Note: None values in lists are filtered out before computing statistics.
+    This handles cases where some workers don't have certain metrics due to downsampling.
+    If all values for a metric are None, np.nan is used to maintain consistent keys across steps.
 
     Args:
         metrics: A dictionary mapping metric names to lists of metric values.
+                Values in lists can be None (will be filtered out).
 
     Returns:
         A dictionary with the same keys but with each list replaced by its reduced value.
+        Keys with all None values will have np.nan as their value.
 
     Example:
         >>> metrics = {
         ...     "loss": [1.0, 2.0, 3.0],
-        ...     "accuracy": [0.8, 0.9, 0.7],
+        ...     "accuracy": [0.8, None, 0.7],  # None is filtered out
         ...     "max_reward": [5.0, 8.0, 6.0],
-        ...     "min_error": [0.1, 0.05, 0.2]
+        ...     "min_error": [0.1, 0.05, None],
+        ...     "missing": [None, None, None]  # All None -> np.nan
         ... }
         >>> reduce_metrics(metrics)
-        {"loss": 2.0, "accuracy": 0.8, "max_reward": 8.0, "min_error": 0.05}
+        {"loss": 2.0, "accuracy": 0.75, "max_reward": 8.0, "min_error": 0.05, "missing": nan}
     """
+    reduced = {}
     for key, val in metrics.items():
+        # Filter out None values
+        valid_vals = [v for v in val if v is not None]
+
+        # Use nan if all values are None to maintain consistent keys across steps
+        if not valid_vals:
+            reduced[key] = np.nan
+            continue
+
+        # Compute statistics on valid values
         if "max" in key:
-            metrics[key] = np.max(val)
+            reduced[key] = np.max(valid_vals)
         elif "min" in key:
-            metrics[key] = np.min(val)
+            reduced[key] = np.min(valid_vals)
         else:
-            metrics[key] = np.mean(val)
-    return metrics
+            reduced[key] = np.mean(valid_vals)
+
+    return reduced

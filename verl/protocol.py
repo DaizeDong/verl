@@ -201,14 +201,45 @@ def union_numpy_dict(tensor_dict1: dict[str, np.ndarray], tensor_dict2: dict[str
 
 
 def list_of_dict_to_dict_of_list(list_of_dict: list[dict]):
+    """Convert list of dicts to dict of lists, handling varying keys across dicts.
+    
+    When dicts have different keys, missing values are filled with None.
+    This is common when some workers lack certain metrics due to downsampling.
+    
+    Args:
+        list_of_dict: List of dictionaries to merge
+        
+    Returns:
+        Dictionary mapping keys to lists of values (with None for missing entries)
+        
+    Example:
+        >>> list_of_dict = [
+        ...     {"a": 1, "b": 2},
+        ...     {"a": 3, "c": 4},
+        ...     {"b": 5}
+        ... ]
+        >>> list_of_dict_to_dict_of_list(list_of_dict)
+        {"a": [1, 3, None], "b": [2, None, 5], "c": [None, 4, None]}
+    """
     if len(list_of_dict) == 0:
         return {}
-    keys = list_of_dict[0].keys()
-    output = {key: [] for key in keys}
+
+    # Collect all unique keys from all dicts
+    all_keys = set()
     for data in list_of_dict:
-        for key, item in data.items():
-            assert key in output
-            output[key].append(item)
+        all_keys.update(data.keys())
+
+    # Initialize output with all keys
+    output = {key: [] for key in all_keys}
+
+    # Populate lists, using None for missing keys
+    for data in list_of_dict:
+        for key in all_keys:
+            if key in data:
+                output[key].append(data[key])
+            else:
+                output[key].append(None)  # Fill missing values with None
+
     return output
 
 

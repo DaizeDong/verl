@@ -120,10 +120,6 @@ class RouterReplay:
         self.target_topk_idx = topk_indices
         self.replay_backward_list.append(topk_indices)
 
-    def get_recorded_indices(self):
-        """Returns the recorded topk indices."""
-        return self.recorded_topk_idx
-
     def record_indices(self, topk_indices: torch.Tensor):
         """Records the topk indices."""
         self.recorded_topk_idx = topk_indices

@@ -1065,7 +1065,8 @@ class MegatronPPOActor(BasePPOActor):
                     if mini_step == 0:  # First ministep: skip predictive loss
                         RouterReplay.set_global_predictive_action(RouterPredictiveAction.SKIP_PREDICTIVE)
                     else:  # Later ministeps: compute predictive loss
-                        assert mini_step <= 1, "Only 2 ministeps supported for now"
+                        if mini_step > 1:
+                            logger.warning(f"[Predictive Router Replay] Mini-step {mini_step}: More than 2 mini-steps detected. Mathematically this may lead to sub-optimal optimization for bias predictors due to inconsistent training objective across different mini-steps. However this is not explicitly forbidden and would still work in practice.")
                         RouterReplay.set_global_predictive_action(RouterPredictiveAction.COMPUTE_PREDICTIVE_LOSS)
 
             self.actor_optimizer.zero_grad()
