@@ -286,7 +286,7 @@ class AgentLoopBase(ABC):
                 text=[raw_prompt],
                 images=images,
                 videos=videos,
-                video_metadatas=video_metadatas,
+                video_metadata=video_metadatas,
                 return_tensors="pt",
                 do_sample_frames=False,
             )
@@ -647,7 +647,7 @@ class AgentLoopWorker:
             text=[current_text],
             images=images,
             videos=videos,
-            video_metadatas=video_metadatas,
+            video_metadata=video_metadatas,
             return_tensors="pt",
             do_sample_frames=False,
         )
