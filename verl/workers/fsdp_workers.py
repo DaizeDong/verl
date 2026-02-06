@@ -871,6 +871,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 lr_scheduler=self.actor_lr_scheduler,
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_config=self.config.actor.checkpoint,
+                trust_remote_code=self.config.model.get("trust_remote_code", False),
             )
 
         if not self._is_actor and self._is_rollout:
@@ -1253,7 +1254,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         )
         self.use_orig_params = self.config.model.fsdp_config.get("use_orig_params", False)
 
-    def _build_critic_model_optimizer(self, config):
+    def _build_critic_model_optimizer(self, config: FSDPCriticConfig):
         # the following line is necessary
         from torch.distributed.fsdp import MixedPrecision
 
@@ -1531,6 +1532,7 @@ class CriticWorker(Worker, DistProfilerExtension):
             lr_scheduler=self.critic_lr_scheduler,
             processing_class=self.processor if self.processor is not None else self.tokenizer,
             checkpoint_config=self.config.checkpoint,
+            trust_remote_code=self.config.model.get("trust_remote_code", False),
         )
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
