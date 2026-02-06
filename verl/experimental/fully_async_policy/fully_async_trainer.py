@@ -83,7 +83,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.config)
 
-        self.use_rm = need_reward_model(self.role_worker_mapping)
+        self.use_rm = need_reward_model(self.config)
         self.use_reward_loop = self.config.reward_model.use_reward_loop
 
         self.use_critic = need_critic(self.config)
