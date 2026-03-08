@@ -354,7 +354,7 @@ def collate_fn(x: list["DataProtoItem"]):
     # Use np.empty + assignment for large predictive data keys to avoid memory explosion
     # np.array(val, dtype=object) recursively processes nested lists → 300GB spike
     # np.empty + [:] assignment only creates references → stable memory
-    LARGE_DATA_KEYS = {'old_inputs', 'old_logits'}
+    LARGE_DATA_KEYS = {"old_inputs", "old_logits", "old_bias", "old_token_positions"}
     
     for key, val in non_tensor_batch.items():
         mem_before_key = psutil.virtual_memory()

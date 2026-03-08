@@ -640,7 +640,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # - vllm: vLLMAsyncRollout
         # - sglang: ServerAdapter
         if "rollout" in self.role:
-            rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
+            rollout_omega = OmegaConf.create(OmegaConf.to_container(self.config.rollout, resolve=False))
+            if "actor" in self.role:
+                actor_router_replay = OmegaConf.to_container(self.config.actor.router_replay, resolve=False)
+                rollout_router_replay = rollout_omega.get("router_replay")
+                if rollout_router_replay is None or rollout_router_replay.get("mode", "disabled") == "disabled":
+                    rollout_omega["router_replay"] = actor_router_replay
+                    if actor_router_replay.get("mode", "disabled") != "disabled":
+                        logger.info(
+                            "[RouterStates] Inherited actor.router_replay into rollout config: mode=%s enable_bias_predictor=%s",
+                            actor_router_replay.get("mode"),
+                            actor_router_replay.get("enable_bias_predictor"),
+                        )
+            rollout_config: RolloutConfig = omega_conf_to_dataclass(rollout_omega)
 
             # 3.1 build rollout device mesh (sglang need only)
             infer_tp = rollout_config.tensor_model_parallel_size * rollout_config.data_parallel_size

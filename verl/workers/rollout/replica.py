@@ -37,6 +37,14 @@ class TokenOutput(BaseModel):
     """logprobs of response token ids"""
     routed_experts: Optional[Any] = None
     """routed experts of response token ids"""
+    router_inputs: Optional[Any] = None
+    """router inputs for predictive routing replay (numpy array)"""
+    router_logits: Optional[Any] = None
+    """router logits for predictive routing replay (numpy array)"""
+    router_bias: Optional[Any] = None
+    """router bias (delta_logits from bias_predictor) for R3 statistics (numpy array)"""
+    router_token_positions: Optional[Any] = None
+    """request-local token positions for predictive routing replay (numpy array)"""
     stop_reason: Optional[str] = None
     """stop reason: 'completed', 'aborted', or None for unknown"""
 

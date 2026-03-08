@@ -50,6 +50,44 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _router_state_present(value: Any) -> bool:
+    return value is not None
+
+
+def _summarize_router_state_list(values: list[Any]) -> tuple[int, Any]:
+    valid_count = 0
+    first_shape = None
+    for value in values:
+        if not _router_state_present(value):
+            continue
+        valid_count += 1
+        if first_shape is None:
+            first_shape = getattr(value, "shape", None)
+    return valid_count, first_shape
+
+
+def _to_object_array(values: list[Any]) -> np.ndarray:
+    arr = np.empty(len(values), dtype=object)
+    arr[:] = values
+    return arr
+
+
+def _build_rollout_replica_config(full_config: DictConfig) -> DictConfig:
+    rollout_omega = OmegaConf.create(OmegaConf.to_container(full_config.actor_rollout_ref.rollout, resolve=False))
+    actor_router_replay = OmegaConf.to_container(full_config.actor_rollout_ref.actor.router_replay, resolve=False)
+    rollout_router_replay = rollout_omega.get("router_replay")
+    if rollout_router_replay is None or rollout_router_replay.get("mode", "disabled") == "disabled":
+        rollout_omega["router_replay"] = actor_router_replay
+        if actor_router_replay.get("mode", "disabled") != "disabled":
+            logger.info(
+                "[RouterStates] AgentLoopManager inherited actor.router_replay into rollout replica config: "
+                "mode=%s enable_bias_predictor=%s",
+                actor_router_replay.get("mode"),
+                actor_router_replay.get("enable_bias_predictor"),
+            )
+    return rollout_omega
+
+
 class AsyncLLMServerManager:
     """
     A class to manage multiple OpenAI compatible LLM servers. This class provides
@@ -136,6 +174,14 @@ class AgentLoopOutput(BaseModel):
     """Log probabilities for the response tokens."""
     routed_experts: Optional[Any] = None
     """Routed experts for the total tokens."""
+    router_inputs: Optional[Any] = None
+    """Router inputs for predictive routing replay (numpy array)."""
+    router_logits: Optional[Any] = None
+    """Router logits for predictive routing replay (numpy array)."""
+    router_bias: Optional[Any] = None
+    """Router bias (delta_logits from bias_predictor) for R3 statistics (numpy array)."""
+    router_token_positions: Optional[Any] = None
+    """Router token positions for predictive routing replay (numpy array)."""
     multi_modal_data: Optional[dict[str, Any]] = None
     """Multi-modal data for multi-modal tools."""
     reward_score: Optional[float] = None
@@ -169,6 +215,14 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded log probabilities for the response tokens."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
+    router_inputs: Optional[Any] = None
+    """Unpadded router inputs for predictive routing replay (numpy array)."""
+    router_logits: Optional[Any] = None
+    """Unpadded router logits for predictive routing replay (numpy array)."""
+    router_bias: Optional[Any] = None
+    """Unpadded router bias (delta_logits from bias_predictor) for R3 statistics (numpy array)."""
+    router_token_positions: Optional[Any] = None
+    """Unpadded router token positions for predictive routing replay (numpy array)."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
     """Multi-modal inputs for processors (e.g., pixel_values, image_grid_thw)."""
     extra_fields: dict[str, Any] = {}
@@ -416,6 +470,16 @@ class AgentLoopWorkerBase:
             assert agent_name in _agent_loop_registry, (
                 f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
             )
+            router_replay_config = self.config.actor_rollout_ref.actor.router_replay
+            if (
+                router_replay_config.mode == "R3"
+                and router_replay_config.enable_bias_predictor
+                and agent_name != "single_turn_agent"
+            ):
+                raise NotImplementedError(
+                    "R3 predictive replay currently only supports agent.default_agent_loop=single_turn_agent. "
+                    f"Got agent loop: {agent_name}."
+                )
 
             agent_loop_config = _agent_loop_registry[agent_name]
             agent_loop = hydra.utils.instantiate(
@@ -499,7 +563,10 @@ class AgentLoopWorkerBase:
         if output.routed_experts is not None:
             total_length = input_ids.shape[1]
             length, layer_num, topk_num = output.routed_experts.shape
-            experts_tensor = torch.from_numpy(output.routed_experts)
+            if isinstance(output.routed_experts, np.ndarray):
+                experts_tensor = torch.from_numpy(output.routed_experts)
+            elif isinstance(output.routed_experts, torch.Tensor):
+                experts_tensor = output.routed_experts
             routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
 
             # Calculate start position: left padding means original prompt starts at the end
@@ -513,6 +580,13 @@ class AgentLoopWorkerBase:
                 )
 
             routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
+        
+        # Router inputs/logits/bias: keep unpadded format (same as R2 mode)
+        # Do NOT pad them - they should remain as numpy arrays with shape [num_tokens, layers, feature_dim]
+        router_inputs = output.router_inputs
+        router_logits = output.router_logits
+        router_bias = output.router_bias
+        router_token_positions = output.router_token_positions
 
         # Handle multi-modal inputs and position_ids calculation
         # Only support Qwen2VLImageProcessor for multi-modal processing currently
@@ -588,6 +662,10 @@ class AgentLoopWorkerBase:
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
             routed_experts=routed_experts,
+            router_inputs=router_inputs,
+            router_logits=router_logits,
+            router_bias=router_bias,
+            router_token_positions=router_token_positions,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
             reward_score=output.reward_score,
@@ -610,6 +688,42 @@ class AgentLoopWorkerBase:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
+        
+        # Add router states to non_tensor_batch using 1D object arrays.
+        # Each element is an unpadded numpy array: [num_tokens_i, layers, feature_dim].
+        # Use same field names as R2: old_inputs and old_logits.
+        non_tensor_outputs = {}
+        
+        # R3+Predictive mode: create old_inputs/old_logits/old_bias as 1D object arrays.
+        # DataProto requires every non_tensor_batch entry to be an np.ndarray.
+        # Use np.empty + assignment to avoid recursive conversion on large nested arrays.
+        router_replay_config = self.config.actor_rollout_ref.actor.router_replay
+        if router_replay_config.mode == "R3" and router_replay_config.enable_bias_predictor:
+            router_inputs_list = [input.router_inputs for input in inputs]
+            router_logits_list = [input.router_logits for input in inputs]
+            router_bias_list = [input.router_bias for input in inputs]
+            router_token_positions_list = [input.router_token_positions for input in inputs]
+            inputs_count, inputs_shape = _summarize_router_state_list(router_inputs_list)
+            logits_count, logits_shape = _summarize_router_state_list(router_logits_list)
+            bias_count, bias_shape = _summarize_router_state_list(router_bias_list)
+            positions_count, positions_shape = _summarize_router_state_list(router_token_positions_list)
+
+            if inputs_count > 0:
+                non_tensor_outputs["old_inputs"] = _to_object_array(router_inputs_list)
+            if logits_count > 0:
+                non_tensor_outputs["old_logits"] = _to_object_array(router_logits_list)
+            if bias_count > 0:
+                non_tensor_outputs["old_bias"] = _to_object_array(router_bias_list)
+            if positions_count > 0:
+                non_tensor_outputs["old_token_positions"] = _to_object_array(router_token_positions_list)
+
+            logger.info(
+                "[R3+Predictive] Agent loop router states: "
+                f"old_inputs={inputs_count}/{len(inputs)} first_shape={inputs_shape}, "
+                f"old_logits={logits_count}/{len(inputs)} first_shape={logits_shape}, "
+                f"old_bias={bias_count}/{len(inputs)} first_shape={bias_shape}, "
+                f"old_token_positions={positions_count}/{len(inputs)} first_shape={positions_shape}"
+            )
 
         batch = TensorDict(
             {
@@ -635,6 +749,7 @@ class AgentLoopWorkerBase:
 
         non_tensor_batch = {
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
+            **non_tensor_outputs,  # Add router states here
         }
 
         # add reward_extra_info to non_tensor_batch
@@ -768,7 +883,7 @@ class AgentLoopManager:
         )
         num_replicas = world_size // rollout_world_size
 
-        rollout_config = self.config.actor_rollout_ref.rollout
+        rollout_config = _build_rollout_replica_config(self.config)
         model_config = self.config.actor_rollout_ref.model
         self.rollout_replicas = [
             self.rollout_replica_class(

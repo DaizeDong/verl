@@ -78,6 +78,10 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 if output.routed_experts is not None
                 else None
             ),
+            router_inputs=output.router_inputs,
+            router_logits=output.router_logits,
+            router_bias=output.router_bias,
+            router_token_positions=output.router_token_positions,
             multi_modal_data={"image": image_data} if image_data is not None else {},
             num_turns=2,
             metrics=metrics,

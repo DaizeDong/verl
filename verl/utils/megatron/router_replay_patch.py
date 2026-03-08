@@ -61,9 +61,10 @@ class RouterReplayCacheAction(Enum):
 class RouterPredictiveAction(Enum):
     """Enum for router predictive actions."""
     DISABLED = "disabled"
-    RECORD = "record"  # log_prob阶段：记录inputs和logits
+    RECORD = "record"  # R2 log_prob阶段：记录inputs和logits
     SKIP_PREDICTIVE = "skip_predictive"  # training ministep==0：跳过loss计算
     COMPUTE_PREDICTIVE_LOSS = "compute_predictive_loss"  # training ministep>=1：计算loss
+    R3_COLLECT_STATS = "r3_collect_stats"  # R3 compute_log_prob阶段：用SGLang返回的bias计算统计
 
 
 class RouterReplay:
@@ -110,12 +111,13 @@ class RouterReplay:
         self.predictive_action = None
         self.recorded_old_inputs = None  # Stored router inputs from log_prob phase
         self.recorded_old_logits = None  # Stored router logits from log_prob phase
+        self.recorded_old_bias = None   # Stored delta_logits from SGLang (R3 mode only)
 
         RouterReplay.router_instances.append(self)
 
     """routing replay management"""
 
-    def set_target_indices(self, topk_indices: torch.Tensor, selected_union_mask: torch.Tensor=None):
+    def set_target_indices(self, topk_indices: torch.Tensor):
         """Sets the target topk indices for replay."""
         self.target_topk_idx = topk_indices
         self.replay_backward_list.append(topk_indices)
@@ -129,10 +131,6 @@ class RouterReplay:
         self.recorded_topk_idx = None
         self.target_topk_idx = None
         self.replay_backward_list = []
-        self.recorded_original_topk_idx = None
-        self.recorded_selected_union_mask = None
-        self.target_selected_union_mask = None
-        self.replay_backward_list_selected_union_mask = []
 
     @staticmethod
     def clear_global_indices():
@@ -319,6 +317,20 @@ class RouterReplay:
         for router in RouterReplay.router_instances:
             router.clear_predictive_data()
 
+    def set_predictive_bias(self, bias: torch.Tensor):
+        """Set old_bias (SGLang delta_logits) for this layer."""
+        self.recorded_old_bias = bias.detach() if bias is not None else None
+
+    def clear_predictive_bias(self):
+        """Clear old_bias for this layer."""
+        self.recorded_old_bias = None
+
+    @staticmethod
+    def clear_global_predictive_bias():
+        """Clear old_bias for all router instances."""
+        for router in RouterReplay.router_instances:
+            router.clear_predictive_bias()
+
     def set_predictive_action(self, action: RouterPredictiveAction):
         """Set the predictive action for this layer."""
         self.predictive_action = action
@@ -342,11 +354,6 @@ class RouterReplay:
     """(predictive) routing replay metrics logging"""
 
     @staticmethod
-    def record_replay_topk_accuracy(layer_idx: int, accuracy_value: float):
-        """Record routing replay top-k accuracy for wandb logging."""
-        RouterReplay.replay_topk_accuracy_tracker.append((layer_idx, accuracy_value))
-
-    @staticmethod
     def record_predictive_loss(layer_idx: int, loss_value: float):
         """Record predictive loss for wandb logging."""
         RouterReplay.predictive_loss_tracker.append((layer_idx, loss_value))
@@ -365,11 +372,6 @@ class RouterReplay:
     def get_and_clear_predictive_metrics():
         """Get aggregated predictive metrics and clear trackers."""
         metrics = {}
-
-        if RouterReplay.replay_topk_accuracy_tracker:
-            avg_accuracy = sum(acc for _, acc in RouterReplay.replay_topk_accuracy_tracker) / len(RouterReplay.replay_topk_accuracy_tracker)
-            metrics['replay_topk_accuracy'] = avg_accuracy
-            RouterReplay.replay_topk_accuracy_tracker.clear()
 
         if RouterReplay.predictive_loss_tracker:
             avg_loss = sum(loss for _, loss in RouterReplay.predictive_loss_tracker) / len(RouterReplay.predictive_loss_tracker)
@@ -703,7 +705,12 @@ def patched_forward(self, input: torch.Tensor):
         if router_replay_action == RouterReplayAction.REPLAY_BACKWARD:
             probs, routing_map = self.routing(logits)
         else:
-            if predictive_routing_action == RouterPredictiveAction.RECORD:
+            if predictive_routing_action is None:
+                if self.layer_number == 1 and self.router_replay and self.router_replay.layer_idx == 0:
+                    logger.info("[Predictive Routing Replay] No predictive action set. Using vanilla routing.")
+                probs, routing_map = self.routing(logits)
+
+            elif predictive_routing_action == RouterPredictiveAction.RECORD: # PR2 inference phase
                 with torch.no_grad():
                     # Log_prob phase: record inputs and logits, apply bias correction
                     self.router_replay.record_predictive_data(input, logits)
@@ -720,26 +727,38 @@ def patched_forward(self, input: torch.Tensor):
                     if RouterReplay.enable_logits_recording:
                         RouterReplay.record_predictive_bias(delta_logits, layer_idx)
 
-                # Union mode handling
-                use_union_mode = self.router_replay.use_union_mode if self.router_replay is not None else False
-                if use_union_mode:
-                    # Union mode: record original top-k for correction during routing
-                    _, topk_indices = torch.topk(logits, k=self.topk, dim=-1)
-                    self.router_replay.recorded_original_topk_idx = topk_indices
-
                 # Apply bias correction and route
                 corrected_logits = logits + delta_logits
                 probs, routing_map = self.routing(corrected_logits)
 
             elif predictive_routing_action == RouterPredictiveAction.SKIP_PREDICTIVE:
-                # Training phase ministep=0
+                # PR2/PR3 Training phase ministep=0
                 # Skip predictive loss, use normal routing
                 if self.layer_number == 1 and self.router_replay and self.router_replay.layer_idx == 0:
                      logger.info(f"[Predictive Routing Replay] Action is SKIP_PREDICTIVE. Skipping loss computation.")
                 probs, routing_map = self.routing(logits)
 
+            elif predictive_routing_action == RouterPredictiveAction.R3_COLLECT_STATS:
+                # R3 compute_log_prob phase: use SGLang-provided delta_logits (old_bias) for statistics
+                # No gradient needed; purely for logging bias_ratio and recording predictive_bias
+                with torch.no_grad():
+                    layer_idx = self.router_replay.layer_idx if self.router_replay else 0
+                    delta_logits = self.router_replay.recorded_old_bias if self.router_replay else None
+                    if delta_logits is not None:
+                        delta_logits = delta_logits.to(logits.device)
+                        # Track bias ratio: |delta_logits|_mean / |logits|_mean
+                        bias_ratio = (torch.abs(delta_logits).mean() / (torch.abs(logits).mean() + 1e-10)).item()
+                        RouterReplay.record_predictive_bias_ratio(layer_idx, bias_ratio)
+
+                        # Record predictive bias to logits cache if saving is enabled
+                        if RouterReplay.enable_logits_recording:
+                            RouterReplay.record_predictive_bias(delta_logits, layer_idx)
+                    elif self.layer_number == 1 and layer_idx == 0:
+                        logger.debug("[Predictive Routing Replay] R3_COLLECT_STATS: no old_bias available for this sample, skipping stats.")
+                probs, routing_map = self.routing(logits)
+
             elif predictive_routing_action == RouterPredictiveAction.COMPUTE_PREDICTIVE_LOSS:
-                # Training phase ministep>=1: compute predictive loss
+                # PR2/PR3 Training phase ministep>=1: compute predictive loss
                 if self.layer_number == 1 and self.router_replay and self.router_replay.layer_idx == 0:
                      logger.info(f"[Predictive Routing Replay] Action is COMPUTE_PREDICTIVE_LOSS. Computing loss...")
 
@@ -805,10 +824,10 @@ def patched_forward(self, input: torch.Tensor):
                         # }, SAVE_DIR + f"predictive_routing_logits_{self.layer_number}_{TIME}.pt")
                         # logger.info(f"[Predictive Routing Replay] [Debug] Saved delta_logits and logits_diff for debugging at layer {self.layer_number} to {SAVE_DIR}predictive_routing_logits_{self.layer_number}_{TIME}.pt")
                         ##############
-                        pred_probs = torch.softmax(delta_logits, dim=-1)
+                        pred_log_probs = torch.log_softmax(delta_logits, dim=-1)
                         target_probs = torch.softmax(logits_diff, dim=-1)
                         predictive_loss = torch.nn.functional.kl_div(
-                            torch.log(pred_probs + 1e-10),
+                            pred_log_probs,
                             target_probs.detach(),
                             reduction='batchmean'
                         )
@@ -816,9 +835,16 @@ def patched_forward(self, input: torch.Tensor):
                     elif self.config.bias_predictor_loss_type == "kl-post":
                         # KL divergence on corrected vs uncorrected routing distributions
                         # This measures the KL between final routing decisions
-                        pred_log = torch.log_softmax(old_logits + delta_logits, dim=-1)
-                        target_log = torch.log_softmax(current_logits, dim=-1)
-                        predictive_loss = torch.sum(torch.exp(pred_log) * (pred_log - target_log.detach()), dim=-1).mean()
+                        pred_log_probs = torch.log_softmax(old_logits + delta_logits, dim=-1)
+                        target_probs = torch.softmax(current_logits, dim=-1)
+                        predictive_loss = torch.nn.functional.kl_div(
+                            pred_log_probs,
+                            target_probs.detach(),
+                            reduction='batchmean'
+                        )
+                        # pred_log = torch.log_softmax(old_logits + delta_logits, dim=-1)
+                        # target_log = torch.log_softmax(current_logits, dim=-1)
+                        # predictive_loss = torch.sum(torch.exp(pred_log) * (pred_log - target_log.detach()), dim=-1).mean()
 
                     else:
                         raise ValueError(f"Invalid loss type: {self.config.bias_predictor_loss_type}")
@@ -846,8 +872,7 @@ def patched_forward(self, input: torch.Tensor):
                 probs, routing_map = self.routing(logits)
 
             else:
-                # DISABLED : normal routing
-                probs, routing_map = self.routing(logits)
+                raise ValueError(f"Invalid predictive routing action: {predictive_routing_action}")
 
         if predictive_loss is not None:
             # probs = self.apply_predictive_loss(probs, predictive_loss)
@@ -858,7 +883,7 @@ def patched_forward(self, input: torch.Tensor):
             del old_inputs, old_logits, valid_mask
 
     else:
-        # Standard routing without bias predictor
+        # Vanilla, R2, R3 inference & training phases: Standard routing without bias predictor
         probs, routing_map = self.routing(logits)
 
     return probs, routing_map

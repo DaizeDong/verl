@@ -20,6 +20,8 @@ from omegaconf import MISSING
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
 
+from .actor import RouterReplayConfig
+
 __all__ = [
     "SamplingConfig",
     "MultiTurnConfig",
@@ -205,6 +207,7 @@ class RolloutConfig(BaseConfig):
 
     quantization: Optional[str] = None
     enable_rollout_routing_replay: bool = False
+    router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
 
     def __post_init__(self):
         """Validate the rollout config"""

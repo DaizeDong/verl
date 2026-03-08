@@ -52,6 +52,7 @@ from verl.utils.megatron.router_replay_utils import (
     set_router_replay_data,
     merge_router_predictive_data,
     set_router_predictive_data,
+    set_router_predictive_bias_data,
 )
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
 from verl.utils.megatron_utils import get_model_config, unwrap_model
@@ -202,6 +203,78 @@ class MegatronPPOActor(BasePPOActor):
             config.megatron.sequence_parallel = False
         self.config = config
 
+    @staticmethod
+    def _normalize_non_tensor_sequence(value):
+        if value is None:
+            return None
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, tuple):
+            return list(value)
+        return value
+
+    @staticmethod
+    def _validate_non_tensor_sequence_length(values, expected_len, key):
+        if values is not None and len(values) != expected_len:
+            raise ValueError(
+                f"Predictive routing replay field '{key}' length mismatch: "
+                f"expected {expected_len}, got {len(values)}."
+            )
+
+    @classmethod
+    def _describe_router_state_field(cls, non_tensor_batch, key):
+        if key not in non_tensor_batch:
+            return "missing", 0, None
+        values = cls._normalize_non_tensor_sequence(non_tensor_batch.get(key))
+        if values is None:
+            return "missing", 0, None
+        valid_count = sum(value is not None for value in values)
+        return ("valid" if valid_count > 0 else "all_none"), valid_count, values
+
+    @classmethod
+    def _describe_predictive_pair(cls, non_tensor_batch, require_positions=False):
+        has_inputs = "old_inputs" in non_tensor_batch
+        has_logits = "old_logits" in non_tensor_batch
+        has_positions = "old_token_positions" in non_tensor_batch
+        if not has_inputs and not has_logits and not has_positions:
+            return "missing", 0, None, None, None
+        if has_inputs != has_logits:
+            inputs = cls._normalize_non_tensor_sequence(non_tensor_batch.get("old_inputs"))
+            logits = cls._normalize_non_tensor_sequence(non_tensor_batch.get("old_logits"))
+            positions = cls._normalize_non_tensor_sequence(non_tensor_batch.get("old_token_positions"))
+            return "partial", 0, inputs, logits, positions
+        if require_positions and not has_positions:
+            inputs = cls._normalize_non_tensor_sequence(non_tensor_batch.get("old_inputs"))
+            logits = cls._normalize_non_tensor_sequence(non_tensor_batch.get("old_logits"))
+            return "missing_positions", 0, inputs, logits, None
+
+        old_inputs = cls._normalize_non_tensor_sequence(non_tensor_batch.get("old_inputs"))
+        old_logits = cls._normalize_non_tensor_sequence(non_tensor_batch.get("old_logits"))
+        old_token_positions = cls._normalize_non_tensor_sequence(non_tensor_batch.get("old_token_positions"))
+        if old_inputs is None or old_logits is None:
+            return "partial", 0, old_inputs, old_logits, old_token_positions
+        if len(old_inputs) != len(old_logits):
+            raise ValueError(
+                "Predictive routing replay field length mismatch between 'old_inputs' and 'old_logits': "
+                f"{len(old_inputs)} vs {len(old_logits)}."
+            )
+        if require_positions:
+            if old_token_positions is None:
+                return "missing_positions", 0, old_inputs, old_logits, None
+            if len(old_inputs) != len(old_token_positions):
+                raise ValueError(
+                    "Predictive routing replay field length mismatch between 'old_inputs' and "
+                    f"'old_token_positions': {len(old_inputs)} vs {len(old_token_positions)}."
+                )
+        valid_count = 0
+        for idx, (old_input, old_logit) in enumerate(zip(old_inputs, old_logits)):
+            if old_input is None or old_logit is None:
+                continue
+            if require_positions and old_token_positions[idx] is None:
+                continue
+            valid_count += 1
+        return ("valid" if valid_count > 0 else "all_none"), valid_count, old_inputs, old_logits, old_token_positions
+
     @GPUMemoryLogger(role="megatron actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
@@ -261,11 +334,55 @@ class MegatronPPOActor(BasePPOActor):
             if "global_token_ids" in data.batch.keys():
                 select_keys.append("global_token_ids")
 
-            batch = data.select(batch_keys=select_keys).batch
+            # R3+predictive mode: select router states from non_tensor_batch
+            # Router states come from rollout (already decoded as numpy arrays)
+            # Use same field names as R2: old_inputs and old_logits
+            non_tensor_batch_keys = []
+            if (self.enable_routing_replay and 
+                self.config.router_replay.mode == "R3" and 
+                self.enable_bias_predictor):
+                if "old_inputs" in data.non_tensor_batch:
+                    non_tensor_batch_keys.append("old_inputs")
+                if "old_logits" in data.non_tensor_batch:
+                    non_tensor_batch_keys.append("old_logits")
+                if "old_bias" in data.non_tensor_batch:
+                    non_tensor_batch_keys.append("old_bias")
+
+            batch = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_batch_keys).batch
             input_ids = batch["input_ids"]
             batch_size = input_ids.size(0)
             response = batch["responses"]
             response_length = response.size(1)
+            old_bias_status, old_bias_count, _ = self._describe_router_state_field(data.non_tensor_batch, "old_bias")
+            # R3+predictive: set R3_COLLECT_STATS action so patched router forward collects bias stats
+            r3_collect_stats = (
+                self.enable_routing_replay and
+                self.config.router_replay.mode == "R3" and
+                self.enable_bias_predictor and
+                old_bias_status == "valid"
+            )
+            compute_log_prob_predictive_action_set = False
+            if r3_collect_stats:
+                RouterReplay.set_global_predictive_action(RouterPredictiveAction.R3_COLLECT_STATS)
+                compute_log_prob_predictive_action_set = True
+                logger.info(
+                    "[R3+Predictive] compute_log_prob: set R3_COLLECT_STATS action "
+                    f"with old_bias samples={old_bias_count}/{batch_size}"
+                )
+            elif self.enable_routing_replay and self.config.router_replay.mode == "R3" and self.enable_bias_predictor:
+                RouterReplay.set_global_predictive_action(RouterPredictiveAction.SKIP_PREDICTIVE)
+                compute_log_prob_predictive_action_set = True
+                if old_bias_status == "missing":
+                    logger.info(
+                        "[R3+Predictive] compute_log_prob: old_bias not provided by rollout; "
+                        "set action=SKIP_PREDICTIVE."
+                    )
+                elif old_bias_status == "all_none":
+                    logger.warning(
+                        "[R3+Predictive] compute_log_prob: old_bias field is present but all samples are empty; "
+                        "set action=SKIP_PREDICTIVE."
+                    )
+
             with torch.no_grad():
                 logger.info(f"[Data] [compute_log_prob] Total batch length: {batch_size}")
                 output = self.forward_backward_batch(
@@ -277,125 +394,130 @@ class MegatronPPOActor(BasePPOActor):
                     micro_batch_size=micro_batch_size,
                     max_token_len=max_token_len,
                 )
+
+            # Clear R3_COLLECT_STATS action after forward pass
+            if compute_log_prob_predictive_action_set:
+                RouterReplay.clear_global_predictive_action()
+                RouterReplay.clear_global_predictive_bias()
+            if mpu.is_pipeline_last_stage(ignore_virtual=True):
+                # only on last rank. It should be on every tp rank
+                if calculate_entropy:
+                    log_probs = [o[0]["log_probs"] for o in output["output"]]  # (bs, seq_size)
+                else:
+                    log_probs = [o["log_probs"] for o in output["output"]]  # (bs, seq_size)
+                log_probs = torch.cat(log_probs, dim=0).to(torch.float32)
+                if use_dynamic_bsz:
+                    indices = output["indices"]
+                    indices = list(itertools.chain.from_iterable(indices))
+                    assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
+                    revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+                    log_probs = log_probs[revert_indices]
+            else:
+                log_probs = torch.empty(
+                    size=(batch_size, response_length), dtype=torch.float32, device=input_ids.device
+                )
+            log_probs = log_probs.to(get_device_id())
+            # broadcast across pp ranks
+            torch.distributed.broadcast(
+                tensor=log_probs,
+                src=mpu.get_pipeline_model_parallel_last_rank(),
+                group=mpu.get_pipeline_model_parallel_group(),
+                async_op=False,
+            )
+            log_probs = log_probs.to("cpu")
+            if calculate_entropy:
+                # Note that o[0] is metrics, o[1] is entropy
                 if mpu.is_pipeline_last_stage(ignore_virtual=True):
-                    # only on last rank. It should be on every tp rank
-                    if calculate_entropy:
-                        log_probs = [o[0]["log_probs"] for o in output["output"]]  # (bs, seq_size)
-                    else:
-                        log_probs = [o["log_probs"] for o in output["output"]]  # (bs, seq_size)
-                    log_probs = torch.cat(log_probs, dim=0).to(torch.float32)
+                    entropys = torch.cat([o[1] for o in output["output"]], dim=0)
+                    entropys = entropys.to(torch.float32)
                     if use_dynamic_bsz:
                         indices = output["indices"]
                         indices = list(itertools.chain.from_iterable(indices))
-                        assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
+                        assert len(indices) == entropys.size(0), f"{len(indices)} vs. {entropys.size()}"
                         revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
-                        log_probs = log_probs[revert_indices]
+                        entropys = entropys[revert_indices]
                 else:
-                    log_probs = torch.empty(
+                    entropys = torch.empty(
                         size=(batch_size, response_length), dtype=torch.float32, device=input_ids.device
                     )
-                log_probs = log_probs.to(get_device_id())
                 # broadcast across pp ranks
+                entropys = entropys.to(get_device_id())
                 torch.distributed.broadcast(
-                    tensor=log_probs,
+                    tensor=entropys,
                     src=mpu.get_pipeline_model_parallel_last_rank(),
                     group=mpu.get_pipeline_model_parallel_group(),
                     async_op=False,
                 )
-                log_probs = log_probs.to("cpu")
-                if calculate_entropy:
-                    # Note that o[0] is metrics, o[1] is entropy
-                    if mpu.is_pipeline_last_stage(ignore_virtual=True):
-                        entropys = torch.cat([o[1] for o in output["output"]], dim=0)
-                        entropys = entropys.to(torch.float32)
-                        if use_dynamic_bsz:
-                            indices = output["indices"]
-                            indices = list(itertools.chain.from_iterable(indices))
-                            assert len(indices) == entropys.size(0), f"{len(indices)} vs. {entropys.size()}"
-                            revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
-                            entropys = entropys[revert_indices]
-                    else:
-                        entropys = torch.empty(
-                            size=(batch_size, response_length), dtype=torch.float32, device=input_ids.device
-                        )
-                    # broadcast across pp ranks
-                    entropys = entropys.to(get_device_id())
-                    torch.distributed.broadcast(
-                        tensor=entropys,
-                        src=mpu.get_pipeline_model_parallel_last_rank(),
-                        group=mpu.get_pipeline_model_parallel_group(),
-                        async_op=False,
-                    )
-                    entropys = entropys.to("cpu")
+                entropys = entropys.to("cpu")
 
-                layers_topk_idx = None
-                layers_predictive_states = None
+            layers_topk_idx = None
+            layers_predictive_states = None
 
-                if RouterReplayHelper.is_r2_record_action(self.tf_config):
-                    # (bs, max_seq_len/response_len,local_layer_num,topk)
-                    layers_topk_idx = output["mini_layer_topk_idx_tensor"].to(torch.uint8)
+            if RouterReplayHelper.is_r2_record_action(self.tf_config):
+                # (bs, max_seq_len/response_len,local_layer_num,topk)
+                layers_topk_idx = output["mini_layer_topk_idx_tensor"].to(torch.uint8)
+                if use_dynamic_bsz:
+                    indices = output["indices"]
+                    indices = list(itertools.chain.from_iterable(indices))
+                    assert len(indices) == layers_topk_idx.size(0), f"{len(indices)} vs. {layers_topk_idx.size()}"
+                    revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+                    layers_topk_idx = layers_topk_idx[revert_indices]
+                layers_topk_idx = pp_gather(layers_topk_idx, self.tf_config)
+
+                if RouterReplayHelper.is_predictive_record_action(self.tf_config):
+                    # NEW: Expect list of variable-shape tensors instead of single padded tensor
+                    layers_old_inputs_list = output["mini_layer_old_inputs_list"]  # list of [num_tokens_i, layers, hidden]
+                    layers_old_logits_list = output["mini_layer_old_logits_list"]  # list of [num_tokens_i, layers, num_experts]
+                    sampled_masks = output["mini_layer_sampled_masks_tensor"]  # [num_batches * bs], bool tensor
+                    logger.info(f"[Predictive Routing Replay] Shape of layers_old_inputs_list after compute_log_prob forward: {[t.shape if t is not None else None for t in layers_old_inputs_list]}")
+                    logger.info(f"[Predictive Routing Replay] Shape of layers_old_logits_list after compute_log_prob forward: {[t.shape if t is not None else None for t in layers_old_logits_list]}")
+                    logger.info(f"[Predictive Routing Replay] Shape of sampled_masks after compute_log_prob forward: {sampled_masks.shape}, values: {sampled_masks}")
+
+                    # Memory debug
+                    # inputs_mb = sum(t.numel() * t.element_size() for t in layers_old_inputs_list) / 1024 / 1024
+                    # logits_mb = sum(t.numel() * t.element_size() for t in layers_old_logits_list) / 1024 / 1024
+                    # logger.info(f"[Predictive Routing Replay] [Memory] compute_log_prob: old_inputs={inputs_mb:.2f}MB (list of {len(layers_old_inputs_list)} samples), old_logits={logits_mb:.2f}MB, {get_system_memory_info()}")
+
+                    # Convert to numpy for Ray efficiency
+                    # Each tensor is already on CPU and has shape [num_tokens_i, layers, hidden]
+                    layers_old_inputs_list_np = [t.contiguous().numpy() for t in layers_old_inputs_list]
+                    layers_old_logits_list_np = [t.contiguous().numpy() for t in layers_old_logits_list]
+
+                    # Delete the torch tensors
+                    del layers_old_inputs_list, layers_old_logits_list
+                    import gc
+                    gc.collect()
+
+                    # Note: dynamic_bsz reordering - if needed, reorder the list
                     if use_dynamic_bsz:
-                        indices = output["indices"]
-                        indices = list(itertools.chain.from_iterable(indices))
-                        assert len(indices) == layers_topk_idx.size(0), f"{len(indices)} vs. {layers_topk_idx.size()}"
-                        revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
-                        layers_topk_idx = layers_topk_idx[revert_indices]
-                    layers_topk_idx = pp_gather(layers_topk_idx, self.tf_config)
+                        # TODO: check correctness
+                        indices = output["indices"]  # [num_batches * bs], range from 0 to (num_batches * bs - 1)
+                        indices_tensor = torch.tensor(list(itertools.chain.from_iterable(indices)) , dtype=torch.long, device=sampled_masks.device)  # Convert to tensor
+                        sampled_indices = indices_tensor[sampled_masks]  # [num_batches * sampled_batch_size], range from 0 to (num_batches * bs - 1)
+                        # Now we need to reassign the indices from 0 to (num_batches * sampled_batch_size - 1), while keeping the order
+                        # Out target: [99, 20, 49, 2, 40, 75, 0, 8] => [7, 3, 5, 1, 4, 6, 0, 2]
+                        indices_for_sorting = torch.argsort(sampled_indices)  # [99, 20, 49, 2, 40, 75, 0, 8] => [6, 3, 7, 1, 4, 2, 5, 0]
+                        revert_indices = torch.tensor(get_reverse_idx(indices_for_sorting), dtype=torch.long)  # [6, 3, 7, 1, 4, 2, 5, 0] => [7, 3, 5, 1, 4, 6, 0, 2]
+                        # Reorder the numpy lists
+                        layers_old_inputs_list_np = [layers_old_inputs_list_np[i] for i in revert_indices]
+                        layers_old_logits_list_np = [layers_old_logits_list_np[i] for i in revert_indices]
 
-                    if RouterReplayHelper.is_predictive_record_action(self.tf_config):
-                        # NEW: Expect list of variable-shape tensors instead of single padded tensor
-                        layers_old_inputs_list = output["mini_layer_old_inputs_list"]  # list of [num_tokens_i, layers, hidden]
-                        layers_old_logits_list = output["mini_layer_old_logits_list"]  # list of [num_tokens_i, layers, num_experts]
-                        sampled_masks = output["mini_layer_sampled_masks_tensor"]  # [num_batches * bs], bool tensor
-                        logger.info(f"[Predictive Routing Replay] Shape of layers_old_inputs_list after compute_log_prob forward: {[t.shape if t is not None else None for t in layers_old_inputs_list]}")
-                        logger.info(f"[Predictive Routing Replay] Shape of layers_old_logits_list after compute_log_prob forward: {[t.shape if t is not None else None for t in layers_old_logits_list]}")
-                        logger.info(f"[Predictive Routing Replay] Shape of sampled_masks after compute_log_prob forward: {sampled_masks.shape}, values: {sampled_masks}")
+                    # Insert None for unsampled entries
+                    full_inputs_list = []
+                    full_logits_list = []
+                    sampled_idx = 0
+                    for i in range(len(sampled_masks)):
+                        if sampled_masks[i]:
+                            full_inputs_list.append(layers_old_inputs_list_np[sampled_idx])
+                            full_logits_list.append(layers_old_logits_list_np[sampled_idx])
+                            sampled_idx += 1
+                        else:
+                            full_inputs_list.append(None)
+                            full_logits_list.append(None)
 
-                        # Memory debug
-                        # inputs_mb = sum(t.numel() * t.element_size() for t in layers_old_inputs_list) / 1024 / 1024
-                        # logits_mb = sum(t.numel() * t.element_size() for t in layers_old_logits_list) / 1024 / 1024
-                        # logger.info(f"[Predictive Routing Replay] [Memory] compute_log_prob: old_inputs={inputs_mb:.2f}MB (list of {len(layers_old_inputs_list)} samples), old_logits={logits_mb:.2f}MB, {get_system_memory_info()}")
+                    # logger.info(f"[Predictive Routing Replay] [Downsample] Restored predictive data to full batch size: {len(sampled_masks)} (downsampled from {len(layers_old_inputs_list_np)})")
 
-                        # Convert to numpy for Ray efficiency
-                        # Each tensor is already on CPU and has shape [num_tokens_i, layers, hidden]
-                        layers_old_inputs_list_np = [t.contiguous().numpy() for t in layers_old_inputs_list]
-                        layers_old_logits_list_np = [t.contiguous().numpy() for t in layers_old_logits_list]
-
-                        # Delete the torch tensors
-                        del layers_old_inputs_list, layers_old_logits_list
-                        import gc
-                        gc.collect()
-                        
-                        # Note: dynamic_bsz reordering - if needed, reorder the list
-                        if use_dynamic_bsz:
-                            # TODO: check correctness
-                            indices = output["indices"]  # [num_batches * bs], range from 0 to (num_batches * bs - 1)
-                            indices_tensor = torch.tensor(list(itertools.chain.from_iterable(indices)) , dtype=torch.long, device=sampled_masks.device)  # Convert to tensor
-                            sampled_indices = indices_tensor[sampled_masks]  # [num_batches * sampled_batch_size], range from 0 to (num_batches * bs - 1)
-                            # Now we need to reassign the indices from 0 to (num_batches * sampled_batch_size - 1), while keeping the order
-                            # Out target: [99, 20, 49, 2, 40, 75, 0, 8] => [7, 3, 5, 1, 4, 6, 0, 2]
-                            indices_for_sorting = torch.argsort(sampled_indices)  # [99, 20, 49, 2, 40, 75, 0, 8] => [6, 3, 7, 1, 4, 2, 5, 0]
-                            revert_indices = torch.tensor(get_reverse_idx(indices_for_sorting), dtype=torch.long)  # [6, 3, 7, 1, 4, 2, 5, 0] => [7, 3, 5, 1, 4, 6, 0, 2]
-                            # Reorder the numpy lists
-                            layers_old_inputs_list_np = [layers_old_inputs_list_np[i] for i in revert_indices]
-                            layers_old_logits_list_np = [layers_old_logits_list_np[i] for i in revert_indices]
-
-                        # Insert None for unsampled entries
-                        full_inputs_list = []
-                        full_logits_list = []
-                        sampled_idx = 0
-                        for i in range(len(sampled_masks)):
-                            if sampled_masks[i]:
-                                full_inputs_list.append(layers_old_inputs_list_np[sampled_idx])
-                                full_logits_list.append(layers_old_logits_list_np[sampled_idx])
-                                sampled_idx += 1
-                            else:
-                                full_inputs_list.append(None)
-                                full_logits_list.append(None)
-                        
-                        # logger.info(f"[Predictive Routing Replay] [Downsample] Restored predictive data to full batch size: {len(sampled_masks)} (downsampled from {len(layers_old_inputs_list_np)})")
-
-                        layers_predictive_states = (full_inputs_list, full_logits_list)
+                    layers_predictive_states = (full_inputs_list, full_logits_list)
 
         # add empty cache after each compute
         get_torch_device().empty_cache()
@@ -457,16 +579,20 @@ class MegatronPPOActor(BasePPOActor):
                 logger.warning("[make_minibatch_iterator] R3 mode but routed_experts not in batch. Training will record this step.")
         if self.enable_logits_saving:
             select_keys.append("global_token_ids")
-        # Router bias predictor: include old_inputs and old_logits for training
+        # Router bias predictor: include old_inputs, old_logits, and old_bias for training
         # These are stored in non_tensor_batch, not in batch
+        # Both R2 and R3 modes use the same field names: old_inputs and old_logits
+        # old_bias is R3-only (from SGLang bias predictor delta_logits)
         non_tensor_batch_keys = []
         if self.enable_bias_predictor:
             if "old_inputs" in data.non_tensor_batch.keys():
                 non_tensor_batch_keys.append("old_inputs")
-                # logger.info(f"[Memory] [make_minibatch_iterator] Including old_inputs in non_tensor_batch")
             if "old_logits" in data.non_tensor_batch.keys():
                 non_tensor_batch_keys.append("old_logits")
-                # logger.info(f"[Memory] [make_minibatch_iterator] Including old_logits in non_tensor_batch")
+            if "old_bias" in data.non_tensor_batch.keys():
+                non_tensor_batch_keys.append("old_bias")
+            if "old_token_positions" in data.non_tensor_batch.keys():
+                non_tensor_batch_keys.append("old_token_positions")
         
         # logger.info(f"[Memory] [make_minibatch_iterator] Before data.select(): {get_system_memory_info()}")
         if self.has_multi_modal_inputs:
@@ -530,32 +656,63 @@ class MegatronPPOActor(BasePPOActor):
 
         def _add_non_tensor_batch_to_micro_batches(micro_batches, mini_batch, indices=None):
             """
-            Add old_inputs and old_logits from non_tensor_batch to each micro_batch's batch.
+            Add old_inputs, old_logits, old_bias, and old_token_positions from non_tensor_batch to each micro_batch.
             
             Args:
                 micro_batches: List of DataProto micro batches
                 mini_batch: DataProto containing non_tensor_batch
                 indices: Optional list of index lists for dynamic batching
             """
-            if "old_inputs" not in mini_batch.non_tensor_batch and "old_logits" not in mini_batch.non_tensor_batch:
-                logger.info(f"[Predictive Routing Replay] Skip adding non_tensor_batch due to no old_inputs or old_logits found.")
+            old_inputs_list = self._normalize_non_tensor_sequence(mini_batch.non_tensor_batch.get("old_inputs"))
+            old_logits_list = self._normalize_non_tensor_sequence(mini_batch.non_tensor_batch.get("old_logits"))
+            old_bias_list = self._normalize_non_tensor_sequence(mini_batch.non_tensor_batch.get("old_bias"))
+            old_token_positions_list = self._normalize_non_tensor_sequence(
+                mini_batch.non_tensor_batch.get("old_token_positions")
+            )
+            batch_size = mini_batch.batch["input_ids"].size(0)
+
+            self._validate_non_tensor_sequence_length(old_inputs_list, batch_size, "old_inputs")
+            self._validate_non_tensor_sequence_length(old_logits_list, batch_size, "old_logits")
+            self._validate_non_tensor_sequence_length(old_bias_list, batch_size, "old_bias")
+            self._validate_non_tensor_sequence_length(old_token_positions_list, batch_size, "old_token_positions")
+
+            if (
+                old_inputs_list is None
+                and old_logits_list is None
+                and old_bias_list is None
+                and old_token_positions_list is None
+            ):
+                logger.info("[Predictive Routing Replay] No predictive router-state fields attached to mini_batch.")
                 return
 
-            old_inputs_list = mini_batch.non_tensor_batch["old_inputs"]
-            old_logits_list = mini_batch.non_tensor_batch["old_logits"]
-
-            # Ensure they are lists (protocol.py might have converted them to object arrays)
-            if isinstance(old_inputs_list, np.ndarray):
-                old_inputs_list = old_inputs_list.tolist()
-            if isinstance(old_logits_list, np.ndarray):
-                old_logits_list = old_logits_list.tolist()
+            if (old_inputs_list is None) != (old_logits_list is None):
+                logger.warning(
+                    "[Predictive Routing Replay] old_inputs/old_logits presence mismatch while splitting micro-batches. "
+                    f"old_inputs_present={old_inputs_list is not None}, old_logits_present={old_logits_list is not None}. "
+                    "Dropping paired predictive data for this mini_batch."
+                )
+                old_inputs_list = None
+                old_logits_list = None
+            if self.config.router_replay.mode == "R3" and old_token_positions_list is None and old_inputs_list is not None:
+                logger.warning(
+                    "[Predictive Routing Replay] old_token_positions missing while splitting R3 micro-batches. "
+                    "Dropping position metadata for this mini_batch."
+                )
 
             # Split the lists according to indices or sequential split
             if indices is not None:
                 # Dynamic batching: use indices to split
                 for i, batch_idx in enumerate(indices):
-                    micro_batches[i].non_tensor_batch["old_inputs"] = [old_inputs_list[idx] for idx in batch_idx]
-                    micro_batches[i].non_tensor_batch["old_logits"] = [old_logits_list[idx] for idx in batch_idx]
+                    if old_inputs_list is not None:
+                        micro_batches[i].non_tensor_batch["old_inputs"] = [old_inputs_list[idx] for idx in batch_idx]
+                    if old_logits_list is not None:
+                        micro_batches[i].non_tensor_batch["old_logits"] = [old_logits_list[idx] for idx in batch_idx]
+                    if old_bias_list is not None:
+                        micro_batches[i].non_tensor_batch["old_bias"] = [old_bias_list[idx] for idx in batch_idx]
+                    if old_token_positions_list is not None:
+                        micro_batches[i].non_tensor_batch["old_token_positions"] = [
+                            old_token_positions_list[idx] for idx in batch_idx
+                        ]
             else:
                 raise ValueError("Indices must be provided for dynamic batching")
         
@@ -602,7 +759,7 @@ class MegatronPPOActor(BasePPOActor):
             micro_batches = mini_batch.split(micro_batch_size)
             
             # Ensure non_tensor_batch elements are lists if they are object arrays
-            # Note: old_inputs/old_logits can be either numpy arrays or torch tensors
+            # Note: old_inputs/old_logits/old_bias can be either numpy arrays or torch tensors
             for mb in micro_batches:
                 if "old_inputs" in mb.non_tensor_batch:
                     val = mb.non_tensor_batch["old_inputs"]
@@ -614,6 +771,10 @@ class MegatronPPOActor(BasePPOActor):
                     if isinstance(val, np.ndarray):
                         # Convert object array to list (elements can be torch tensors or numpy arrays)
                         mb.non_tensor_batch["old_logits"] = val.tolist()
+                if "old_bias" in mb.non_tensor_batch:
+                    val = mb.non_tensor_batch["old_bias"]
+                    if isinstance(val, np.ndarray):
+                        mb.non_tensor_batch["old_bias"] = val.tolist()
 
             seq_len = micro_batches[0].batch["input_ids"].shape[1]
             total_seqlen = micro_batch_size * seq_len
@@ -787,16 +948,81 @@ class MegatronPPOActor(BasePPOActor):
                 set_router_replay_data(layers_topk_idx, attention_mask, self.tf_config, vp_rank)
 
                 if RouterReplayHelper.is_predictive_compute_loss_action(self.tf_config, vp_rank):
-                    # logger.info(f"[Memory] [forward_step] Loading predictive data: {get_system_memory_info()}")
+                    predictive_pair_status, predictive_pair_count, old_inputs_list, old_logits_list, old_token_positions_list = (
+                        self._describe_predictive_pair(
+                            batch.non_tensor_batch,
+                            require_positions=self.config.router_replay.mode == "R3",
+                        )
+                    )
 
-                    # Read old_inputs and old_logits from batch (per-sample, may contain None)
-                    if "old_inputs" in batch.non_tensor_batch and "old_logits" in batch.non_tensor_batch:
+                    # Both R2 and R3 modes: router states are Python list of unpadded numpy arrays.
+                    # R3 mode: router states come from rollout.
+                    # R2 mode: router states come from log_prob phase.
+                    if predictive_pair_status == "valid":
                         set_router_predictive_data(
-                            batch.non_tensor_batch["old_inputs"],  # list of ndarray or None
-                            batch.non_tensor_batch["old_logits"],  # list of ndarray or None
+                            old_inputs_list,
+                            old_logits_list,
                             attention_mask,
                             self.tf_config,
                             vp_rank,
+                            old_token_positions_list=(
+                                old_token_positions_list if self.config.router_replay.mode == "R3" else None
+                            ),
+                        )
+                        if self.config.router_replay.mode == "R3":
+                            logger.info(
+                                "[R3+Predictive] Set router states from rollout "
+                                f"for {predictive_pair_count}/{attention_mask.size(0)} samples"
+                            )
+                        else:
+                            logger.info(
+                                "[R2+Predictive] Set router states from log_prob phase "
+                                f"for {predictive_pair_count}/{attention_mask.size(0)} samples"
+                            )
+                    else:
+                        RouterReplay.clear_global_predictive_data()
+                        if predictive_pair_status == "missing":
+                            logger.info(
+                                "[Predictive Routing Replay] old_inputs/old_logits not provided for this micro-batch; "
+                                "cleared predictive replay state."
+                            )
+                        elif predictive_pair_status == "missing_positions":
+                            logger.warning(
+                                "[Predictive Routing Replay] old_token_positions not provided for this R3 micro-batch; "
+                                "cleared predictive replay state."
+                            )
+                        elif predictive_pair_status == "partial":
+                            logger.warning(
+                                "[Predictive Routing Replay] old_inputs/old_logits presence mismatch for this micro-batch; "
+                                "cleared predictive replay state."
+                            )
+                        else:
+                            logger.warning(
+                                "[Predictive Routing Replay] old_inputs/old_logits are present but all samples are empty; "
+                                "cleared predictive replay state."
+                            )
+
+            # R3_COLLECT_STATS: load old_bias per layer for bias ratio statistics
+            if RouterReplayHelper.is_r3_collect_stats_action(self.tf_config, vp_rank):
+                old_bias_status, old_bias_count, old_bias_list = self._describe_router_state_field(batch.non_tensor_batch, "old_bias")
+                if old_bias_status == "valid":
+                    set_router_predictive_bias_data(
+                        old_bias_list,
+                        attention_mask,
+                        self.tf_config,
+                        vp_rank,
+                    )
+                    logger.info(
+                        "[R3+Predictive] Loaded old_bias for R3_COLLECT_STATS "
+                        f"with {old_bias_count}/{attention_mask.size(0)} samples"
+                    )
+                else:
+                    RouterReplay.clear_global_predictive_bias()
+                    if old_bias_status == "missing":
+                        logger.info("[R3+Predictive] No old_bias attached to this micro-batch; cleared bias stats state.")
+                    else:
+                        logger.warning(
+                            "[R3+Predictive] old_bias is present but all samples are empty; cleared bias stats state."
                         )
 
             # logger.info(f"[Memory] [forward_step] After data generation (non_tensor_batch): {get_system_memory_info()}")
@@ -960,6 +1186,7 @@ class MegatronPPOActor(BasePPOActor):
                 microbatch_group_size_per_vp_stage = self.tf_config.microbatch_group_size_per_vp_stage
                 bs = n_micro_batch
                 losses_reduced["mini_layer_topk_idx_tensor"] = reorder_and_merge_vpp_layers(self.mini_layer_topk_idx_list, bs, vp_size, microbatch_group_size_per_vp_stage)
+                # Predictive routing tensors
                 if RouterReplayHelper.is_predictive_record_action(self.tf_config):
                     # logger.info(f"[Predictive Routing Replay] Merging predictive tensors with VPP size {vp_size}")
                     # logger.info(f"[Predictive Routing Replay] [Debug] mini_layer_old_inputs_list BEFORE reorder: len: {len(self.mini_layer_old_inputs_list)}, first element shape: {self.mini_layer_old_inputs_list[0].shape if len(self.mini_layer_old_inputs_list) > 0 else 'N/A'}")
@@ -987,6 +1214,7 @@ class MegatronPPOActor(BasePPOActor):
                     # logger.info(f"[Predictive Routing Replay] [Memory] Merged predictive tensors: old_inputs={inputs_mb:.2f}MB, old_logits={logits_mb:.2f}MB, {get_system_memory_info()}")
             else:
                 losses_reduced["mini_layer_topk_idx_tensor"] = torch.cat(self.mini_layer_topk_idx_list, dim=0)
+                # Predictive routing tensors
                 if RouterReplayHelper.is_predictive_record_action(self.tf_config):
                     logger.info(f"[Predictive Routing Replay] Concatenating predictive tensors from mini-batches...")
                     # logger.info(f"[Predictive Routing Replay] [Debug] mini_layer_old_inputs_list BEFORE reorder & merge: len: {len(self.mini_layer_old_inputs_list)}, first element shape: {self.mini_layer_old_inputs_list[0].shape if len(self.mini_layer_old_inputs_list) > 0 else 'N/A'}")
@@ -1044,13 +1272,14 @@ class MegatronPPOActor(BasePPOActor):
             # Remove them to save memory during forward/backward
             if mini_step == 0 and self.config.router_replay.enable_bias_predictor:
                 if "old_inputs" in data.non_tensor_batch or "old_logits" in data.non_tensor_batch:
-                    # logger.info(f"[Memory] [update_policy] Mini-step 0: Removing old_inputs/old_logits to save memory (SKIP_PREDICTIVE doesn't need them)")
-                    # logger.info(f"[Memory] Before removal: {get_system_memory_info()}")
+                    logger.info(
+                        "[Predictive Routing Replay] Mini-step 0: dropping old_inputs/old_logits by design "
+                        "because action=SKIP_PREDICTIVE."
+                    )
                     data.non_tensor_batch.pop("old_inputs", None)
                     data.non_tensor_batch.pop("old_logits", None)
                     import gc
                     gc.collect()
-                    # logger.info(f"[Memory] After removal and GC: {get_system_memory_info()}")
             
             should_save = self.enable_logits_saving and (step_for_save % self.save_frequency == 0)
             if should_save:
@@ -1064,10 +1293,44 @@ class MegatronPPOActor(BasePPOActor):
                 if self.config.router_replay.enable_bias_predictor:
                     if mini_step == 0:  # First ministep: skip predictive loss
                         RouterReplay.set_global_predictive_action(RouterPredictiveAction.SKIP_PREDICTIVE)
+                        logger.info("[Predictive Routing Replay] Mini-step 0: set action=SKIP_PREDICTIVE.")
                     else:  # Later ministeps: compute predictive loss
+                        predictive_pair_status, predictive_pair_count, _, _, _ = self._describe_predictive_pair(
+                            data.non_tensor_batch,
+                            require_positions=self.config.router_replay.mode == "R3",
+                        )
                         if mini_step > 1:
                             logger.warning(f"[Predictive Router Replay] Mini-step {mini_step}: More than 2 mini-steps detected. Mathematically this may lead to sub-optimal optimization for bias predictors due to inconsistent training objective across different mini-steps. However this is not explicitly forbidden and would still work in practice.")
-                        RouterReplay.set_global_predictive_action(RouterPredictiveAction.COMPUTE_PREDICTIVE_LOSS)
+                        if predictive_pair_status == "valid":
+                            RouterReplay.set_global_predictive_action(RouterPredictiveAction.COMPUTE_PREDICTIVE_LOSS)
+                            logger.info(
+                                "[Predictive Routing Replay] Mini-step "
+                                f"{mini_step}: set action=COMPUTE_PREDICTIVE_LOSS with "
+                                f"{predictive_pair_count}/{data.batch['input_ids'].size(0)} valid samples."
+                            )
+                        else:
+                            RouterReplay.set_global_predictive_action(RouterPredictiveAction.SKIP_PREDICTIVE)
+                            if predictive_pair_status == "missing":
+                                logger.info(
+                                    f"[Predictive Routing Replay] Mini-step {mini_step}: "
+                                    "old_inputs/old_logits not provided; fallback to SKIP_PREDICTIVE."
+                                )
+                            elif predictive_pair_status == "missing_positions":
+                                logger.warning(
+                                    f"[Predictive Routing Replay] Mini-step {mini_step}: "
+                                    "old_token_positions not provided for R3; fallback to SKIP_PREDICTIVE."
+                                )
+                            elif predictive_pair_status == "partial":
+                                logger.warning(
+                                    f"[Predictive Routing Replay] Mini-step {mini_step}: "
+                                    "old_inputs/old_logits presence mismatch; fallback to SKIP_PREDICTIVE."
+                                )
+                            else:
+                                logger.warning(
+                                    f"[Predictive Routing Replay] Mini-step {mini_step}: "
+                                    "old_inputs/old_logits are present but all samples are empty; "
+                                    "fallback to SKIP_PREDICTIVE."
+                                )
 
             self.actor_optimizer.zero_grad()
             # use use_contiguous_buffers_in_local_ddp and no overlap_dp_param_comm

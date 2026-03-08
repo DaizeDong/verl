@@ -528,7 +528,19 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         from torch.distributed.device_mesh import init_device_mesh
 
         # 1. parse rollout and huggingface model config
-        rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
+        rollout_omega = OmegaConf.create(OmegaConf.to_container(self.config.rollout, resolve=False))
+        if self._is_actor:
+            actor_router_replay = OmegaConf.to_container(self.config.actor.router_replay, resolve=False)
+            rollout_router_replay = rollout_omega.get("router_replay")
+            if rollout_router_replay is None or rollout_router_replay.get("mode", "disabled") == "disabled":
+                rollout_omega["router_replay"] = actor_router_replay
+                if actor_router_replay.get("mode", "disabled") != "disabled":
+                    logger.info(
+                        "[RouterStates] Inherited actor.router_replay into rollout config: mode=%s enable_bias_predictor=%s",
+                        actor_router_replay.get("mode"),
+                        actor_router_replay.get("enable_bias_predictor"),
+                    )
+        rollout_config: RolloutConfig = omega_conf_to_dataclass(rollout_omega)
 
         # Convert megatron lora config to HFModelConfig
         model_config_dict = OmegaConf.to_container(self.config.model)
@@ -936,9 +948,15 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             # R3 mode: Replay if routed_experts available, otherwise Record (for first step)
             if "routed_experts" in data.batch.keys():
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+                # R3 mode: Do NOT set predictive action in log_prob phase
+                # Router states come from rollout, no need to record here
             else:
+                # First step: use RECORD mode (fallback)
                 logger.info(f"[Rank {self.rank}] R3 mode: routed_experts not in batch (first step). Using RECORD mode this time.")
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+                if self.config.actor.router_replay.enable_bias_predictor:
+                    # First step needs RECORD since no rollout data yet
+                    RouterReplay.set_global_predictive_action(RouterPredictiveAction.RECORD)
 
         output, entropys, layers_topk_idx, layers_predictive_states = self.actor.compute_log_prob(data=data, calculate_entropy=True)
         output = DataProto.from_dict(
@@ -951,12 +969,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             if self.config.actor.router_replay.enable_bias_predictor:
                 if layers_predictive_states is not None:
                     # Store to non_tensor_batch (as numpy arrays for Ray serialization efficiency)
-                    # Check for non-zero data
-                    # inputs_sum = sum(t.sum() if t is not None else 0 for t in layers_predictive_states[0])
-                    # logits_sum = sum(t.sum() if t is not None else 0 for t in layers_predictive_states[1])
-                    # logger.info(f"[Rank {self.rank}] [Bias Predictor] Storing predictive states (numpy format). Inputs sum: {inputs_sum}, Logits sum: {logits_sum}")
-                    # if inputs_sum == 0 and logits_sum == 0:
-                    #      logger.warning(f"[Rank {self.rank}] [Bias Predictor] Warning: Storing all-zero predictive states!")
                     output.non_tensor_batch["old_inputs"] = layers_predictive_states[0]  # list of numpy array [num_tokens_i, layers, hidden] (variable shape), length = bs
                     output.non_tensor_batch["old_logits"] = layers_predictive_states[1]  # list of numpy array [num_tokens_i, layers, num_experts] (variable shape), length = bs
                 else:
@@ -966,8 +978,15 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             # R3: only save if we recorded this step (i.e., routed_experts was not in input batch)
             if "routed_experts" not in data.batch.keys() and layers_topk_idx is not None:
                 output.batch["routed_experts"] = layers_topk_idx
-                # TODO: implement selected_union_mask for R3
-                logger.info(f"[Rank {self.rank}] R3 first step: recorded routed_experts for next step's replay")
+                
+                # First step: also save router states if bias predictor is enabled
+                if self.config.actor.router_replay.enable_bias_predictor and layers_predictive_states is not None:
+                    output.non_tensor_batch["old_inputs"] = layers_predictive_states[0]
+                    output.non_tensor_batch["old_logits"] = layers_predictive_states[1]
+                    logger.info(f"[Rank {self.rank}] R3 first step: recorded routed_experts + router states")
+                else:
+                    logger.info(f"[Rank {self.rank}] R3 first step: recorded routed_experts for next step's replay")
+            # Normal R3 runs: routed_experts and router states both come from rollout, no need to save new data
 
         if self.config.actor.router_replay.mode in ["R2", "R3"]:
             RouterReplay.clear_global_indices()

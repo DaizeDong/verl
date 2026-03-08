@@ -46,7 +46,161 @@ from verl.workers.rollout.sglang_rollout.sglang_rollout import ServerAdapter, _s
 from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address, run_unvicorn
 
 logger = logging.getLogger(__file__)
+
+
+def _rollout_router_replay_config(config):
+    return getattr(config, "router_replay", None)
+
+
+def _router_replay_get(router_replay_config, key: str, default=None):
+    if router_replay_config is None:
+        return default
+    if isinstance(router_replay_config, dict):
+        return router_replay_config.get(key, default)
+    return getattr(router_replay_config, key, default)
+
+
+def _should_return_router_states(config) -> bool:
+    return bool(getattr(config, "enable_rollout_routing_replay", False))
+
+
+def _should_enable_router_bias_predictor(config) -> bool:
+    router_replay_config = _rollout_router_replay_config(config)
+    return bool(_router_replay_get(router_replay_config, "enable_bias_predictor", False))
 logger.setLevel(logging.INFO)
+
+
+def _router_state_payload_present(value) -> bool:
+    return value is not None and not (isinstance(value, str) and value == "")
+
+
+def _normalize_router_state_quartet(
+    router_inputs,
+    router_logits,
+    router_bias,
+    router_token_positions,
+    *,
+    request_id: str,
+):
+    present = [
+        _router_state_payload_present(router_inputs),
+        _router_state_payload_present(router_logits),
+        _router_state_payload_present(router_bias),
+        _router_state_payload_present(router_token_positions),
+    ]
+    if not any(present):
+        return None, None, None, None
+    if not all(present):
+        logger.warning(
+            "[SGLang] Inconsistent router-state quartet for request_id=%s: "
+            "inputs_present=%s logits_present=%s bias_present=%s token_positions_present=%s. "
+            "Dropping router states.",
+            request_id,
+            present[0],
+            present[1],
+            present[2],
+            present[3],
+        )
+        return None, None, None, None
+    return router_inputs, router_logits, router_bias, router_token_positions
+
+
+def _get_expected_router_token_count(meta_info: dict[str, Any], output_token_ids: list[int]) -> int:
+    prompt_tokens = meta_info.get("prompt_tokens")
+    completion_tokens = meta_info.get("completion_tokens")
+    if prompt_tokens is None or completion_tokens is None:
+        logger.warning(
+            "[SGLang] Missing prompt_tokens/completion_tokens while decoding router states. "
+            "Falling back to len(output_ids)=%s.",
+            len(output_token_ids),
+        )
+        return len(output_token_ids)
+    return max(prompt_tokens + completion_tokens - 1, 0)
+
+
+def _coerce_router_state_array(value, *, expected_tokens: int, field_name: str, request_id: str):
+    import numpy as np
+
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().contiguous().numpy()
+    elif isinstance(value, list):
+        value = np.asarray(value)
+    if not hasattr(value, "shape") or len(value.shape) == 0:
+        logger.warning(
+            "[SGLang] Invalid %s payload for request_id=%s: type=%s. Dropping router states.",
+            field_name,
+            request_id,
+            type(value),
+        )
+        return None
+    if value.shape[0] != expected_tokens:
+        logger.warning(
+            "[SGLang] %s token-count mismatch for request_id=%s: expected=%s actual=%s. "
+            "Dropping router states.",
+            field_name,
+            request_id,
+            expected_tokens,
+            value.shape[0],
+        )
+        return None
+    return value
+
+
+def _decode_router_states_from_meta_info(meta_info: dict[str, Any], *, hf_config, output_token_ids: list[int], request_id: str):
+    import numpy as np
+    import pybase64
+
+    router_inputs_base64, router_logits_base64, router_bias_base64, router_token_positions_base64 = (
+        _normalize_router_state_quartet(
+        meta_info.get("router_inputs"),
+        meta_info.get("router_logits"),
+        meta_info.get("router_bias"),
+        meta_info.get("router_token_positions"),
+        request_id=request_id,
+    ))
+    if router_inputs_base64 is None:
+        return None, None, None, None
+
+    num_tokens = _get_expected_router_token_count(meta_info, output_token_ids)
+    hidden_size = hf_config.hidden_size
+    num_layers = hf_config.num_hidden_layers
+    num_experts = hf_config.num_local_experts
+
+    def _decode_payload(base64_value: str, feature_size: int, field_name: str):
+        raw = np.frombuffer(pybase64.b64decode(base64_value.encode("utf-8")), dtype=np.float16)
+        expected_size = num_tokens * num_layers * feature_size
+        if raw.size != expected_size:
+            logger.warning(
+                "[SGLang] %s size mismatch for request_id=%s: expected=%s actual=%s. Dropping router states.",
+                field_name,
+                request_id,
+                expected_size,
+                raw.size,
+            )
+            return None
+        return raw.reshape(num_tokens, num_layers, feature_size)
+
+    router_inputs = _decode_payload(router_inputs_base64, hidden_size, "router_inputs")
+    router_logits = _decode_payload(router_logits_base64, num_experts, "router_logits")
+    router_bias = _decode_payload(router_bias_base64, num_experts, "router_bias")
+    router_token_positions = np.frombuffer(
+        pybase64.b64decode(router_token_positions_base64.encode("utf-8")),
+        dtype=np.int32,
+    )
+    if router_token_positions.size != num_tokens:
+        logger.warning(
+            "[SGLang] router_token_positions size mismatch for request_id=%s: expected=%s actual=%s. "
+            "Dropping router states.",
+            request_id,
+            num_tokens,
+            router_token_positions.size,
+        )
+        return None, None, None, None
+    if router_inputs is None or router_logits is None or router_bias is None:
+        return None, None, None, None
+    return router_inputs, router_logits, router_bias, router_token_positions
 
 
 @ray.remote(num_cpus=1)
@@ -192,6 +346,33 @@ class SGLangHttpServer:
             enable_weights_cpu_backup = True if self.rollout_mode == RolloutMode.COLOCATED else False
             args["enable_weights_cpu_backup"] = enable_weights_cpu_backup
 
+        if self.config.enable_rollout_routing_replay:
+            args.update({"enable_return_routed_experts": True})
+
+            if _should_return_router_states(self.config):
+                args["enable_return_router_states"] = True
+                args["enable_router_bias_predictor"] = _should_enable_router_bias_predictor(self.config)
+
+                router_replay_config = _rollout_router_replay_config(self.config)
+                if router_replay_config is not None:
+                    args["router_states_sample_rate"] = _router_replay_get(
+                        router_replay_config,
+                        "predictive_r3_downsample_keep_rate",
+                        args.get("router_states_sample_rate"),
+                    )
+                    args["router_states_max_seq_len"] = _router_replay_get(
+                        router_replay_config,
+                        "predictive_downsample_max_len_limit",
+                        args.get("router_states_max_seq_len"),
+                    )
+
+                logger.warning(
+                    "[SGLang] Enabled router states capture: bias_predictor=%s keep_rate=%s max_seq_len=%s",
+                    args["enable_router_bias_predictor"],
+                    args.get("router_states_sample_rate"),
+                    args.get("router_states_max_seq_len"),
+                )
+
         # NOTE: We can't directly call SGLang's launch_server since it's not an async function.
         # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
@@ -269,14 +450,30 @@ class SGLangHttpServer:
         sampling_params["max_new_tokens"] = max_new_tokens
         return_logprob = sampling_params.pop("logprobs", False)
 
-        request = GenerateReqInput(
-            rid=request_id,
-            input_ids=prompt_ids,
-            sampling_params=sampling_params,
-            return_logprob=return_logprob,
-            image_data=image_data,
-        )
-        output = await self.tokenizer_manager.generate_request(request, None).__anext__()
+        request = {
+            "rid": request_id,
+            "input_ids": prompt_ids,
+            "sampling_params": sampling_params,
+            "return_logprob": return_logprob,
+            "image_data": image_data,
+            # TODO: support video input for sglang
+            # video_data=video_data,
+        }
+
+        if self.config.enable_rollout_routing_replay:
+            request.update({"return_routed_experts": True})
+
+            if _should_return_router_states(self.config):
+                request.update({"return_router_states": True})
+                logger.warning(
+                    "[RouterStates] Sending generate request rid=%s return_router_states=%s",
+                    request_id,
+                    request["return_router_states"],
+                )
+
+        generate_request = GenerateReqInput(**request)
+
+        output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
         if return_logprob:
             output_token_logprobs = output["meta_info"]["output_token_logprobs"]
             log_probs, token_ids = zip(
@@ -285,7 +482,108 @@ class SGLangHttpServer:
         else:
             token_ids = output["output_ids"]
             log_probs = None
-        return TokenOutput(token_ids=token_ids, log_probs=log_probs)
+
+        routed_experts = None
+        router_inputs = None
+        router_logits = None
+        router_bias = None
+        router_token_positions = None
+        meta_info = output.get("meta_info", {})
+        if (
+            meta_info.get("router_inputs") is not None
+            or meta_info.get("router_logits") is not None
+            or meta_info.get("router_bias") is not None
+            or meta_info.get("router_token_positions") is not None
+        ):
+            logger.warning(
+                "[RouterStates] Received router-state payloads for rid=%s inputs_present=%s logits_present=%s "
+                "bias_present=%s positions_present=%s",
+                request_id,
+                meta_info.get("router_inputs") is not None,
+                meta_info.get("router_logits") is not None,
+                meta_info.get("router_bias") is not None,
+                meta_info.get("router_token_positions") is not None,
+            )
+        
+        if self.config.enable_rollout_routing_replay:
+            if self.config.skip_tokenizer_init:
+                routed_experts = meta_info.get("routed_experts", None)
+
+                if _should_return_router_states(self.config):
+                    router_inputs, router_logits, router_bias, router_token_positions = _normalize_router_state_quartet(
+                        meta_info.get("router_inputs", None),
+                        meta_info.get("router_logits", None),
+                        meta_info.get("router_bias", None),
+                        meta_info.get("router_token_positions", None),
+                        request_id=request_id,
+                    )
+                    if router_inputs is not None:
+                        expected_tokens = _get_expected_router_token_count(meta_info, list(token_ids))
+                        router_inputs = _coerce_router_state_array(
+                            router_inputs,
+                            expected_tokens=expected_tokens,
+                            field_name="router_inputs",
+                            request_id=request_id,
+                        )
+                        router_logits = _coerce_router_state_array(
+                            router_logits,
+                            expected_tokens=expected_tokens,
+                            field_name="router_logits",
+                            request_id=request_id,
+                        )
+                        router_bias = _coerce_router_state_array(
+                            router_bias,
+                            expected_tokens=expected_tokens,
+                            field_name="router_bias",
+                            request_id=request_id,
+                        )
+                        router_token_positions = _coerce_router_state_array(
+                            router_token_positions,
+                            expected_tokens=expected_tokens,
+                            field_name="router_token_positions",
+                            request_id=request_id,
+                        )
+                        if (
+                            router_inputs is None
+                            or router_logits is None
+                            or router_bias is None
+                            or router_token_positions is None
+                        ):
+                            router_inputs = None
+                            router_logits = None
+                            router_bias = None
+                            router_token_positions = None
+            else:
+                from sglang.srt.layers.moe.routed_experts_capturer import extract_routed_experts_from_meta_info
+
+                hf_config = self.model_config.hf_config
+                if not hasattr(hf_config, "num_hidden_layers") or not hasattr(hf_config, "num_experts_per_tok"):
+                    raise AttributeError(
+                        "enable_rollout_routing_replay is set, but hf_config is missing "
+                        "'num_hidden_layers' or 'num_experts_per_tok'. This feature requires an MoE model "
+                        "configuration that defines these attributes."
+                    )
+                routed_experts = extract_routed_experts_from_meta_info(output).reshape(
+                    -1, hf_config.num_hidden_layers, hf_config.num_experts_per_tok
+                )
+
+                if _should_return_router_states(self.config):
+                    router_inputs, router_logits, router_bias, router_token_positions = _decode_router_states_from_meta_info(
+                        meta_info,
+                        hf_config=hf_config,
+                        output_token_ids=list(token_ids),
+                        request_id=request_id,
+                    )
+
+        return TokenOutput(
+            token_ids=token_ids, 
+            log_probs=log_probs, 
+            routed_experts=routed_experts,
+            router_inputs=router_inputs,
+            router_logits=router_logits,
+            router_bias=router_bias,
+            router_token_positions=router_token_positions,
+        )
 
 
 _rollout_worker_actor_cls = ray.remote(ServerAdapter)

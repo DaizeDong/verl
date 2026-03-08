@@ -77,6 +77,7 @@ class RouterReplayConfig(BaseConfig):
     bias_predictor_lr_mult: float = 1000.0
     predictive_downsample_batch_size: int = None
     predictive_downsample_max_len_limit: int = None
+    predictive_r3_downsample_keep_rate: float = 1.0
     predictive_storage_dtype: str = "bf16"
 
     def __post_init__(self):
