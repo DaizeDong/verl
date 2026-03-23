@@ -33,7 +33,7 @@ from verl.trainer.distillation import distillation_ppo_loss, is_distillation_ena
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_name, set_expandable_segments
-from verl.utils.distributed import initialize_global_process_group_ray
+from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.metric.utils import Metric
@@ -84,6 +84,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
         from verl.workers.engine import BaseEngine, EngineRegistry
 
         initialize_global_process_group_ray(timeout_second=None)
+
+        set_numa_affinity()
 
         self.config = config
         self.model_config = self.config.model_config
