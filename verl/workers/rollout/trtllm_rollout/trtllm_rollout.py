@@ -22,7 +22,7 @@ import os
 import pickle
 import threading
 from contextlib import asynccontextmanager
-from typing import Any, Generator, Optional
+from typing import Any, AsyncGenerator, Generator, Optional
 
 import aiohttp
 import pynvml
@@ -412,7 +412,10 @@ class ServerAdapter(BaseRollout):
         await asyncio.to_thread(dist.barrier, group=self.hybrid_device_mesh["exclude_dp"].get_group())
 
     async def update_weights(
-        self, weights: Generator[tuple[str, torch.Tensor], None, None], global_steps: int = None, **kwargs
+        self,
+        weights: Generator[tuple[str, torch.Tensor], None, None] | AsyncGenerator[tuple[str, torch.Tensor], None],
+        global_steps: int = None,
+        **kwargs,
     ):
         assert self.hybrid_device_mesh is not None, "hybrid_device_mesh is not set"
 
@@ -454,11 +457,11 @@ class ServerAdapter(BaseRollout):
             cur_available_bytes = total_available_bytes
             cur_handles = []
 
-        # Non-VLM never supports partial loading. For VLM, leader queries and broadcasts to all
+        # For non-VLM, always use partial loading. For VLM, leader queries and broadcasts to all
         # ranks in the DP replica; use get_global_rank(group, 0) since each replica has a different leader.
         is_vlm = self.model_config.hf_config is not None and hasattr(self.model_config.hf_config, "vision_config")
         if not is_vlm:
-            supports_partial_loading = False
+            supports_partial_loading = True
         else:
             exclude_dp_group = self.hybrid_device_mesh["exclude_dp"].get_group()
             spl_tensor = torch.zeros(1, dtype=torch.int32)
