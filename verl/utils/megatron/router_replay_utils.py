@@ -253,7 +253,7 @@ def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_lis
 
         if input_ids.is_nested:
             batch_size = input_ids.shape[0]
-            _, packed_seq_params = preprocess_thd_engine(input_ids, pre_process=True)
+            _, packed_seq_params, _ = preprocess_thd_engine(input_ids, pre_process=True)
             layers_topk_idx = postprocess_thd_engine(
                 layers_topk_idx, packed_seq_params, input_ids, batch_size, post_process=True
             )
