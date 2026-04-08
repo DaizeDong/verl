@@ -45,6 +45,7 @@ def main(config):
     responses = dataset[config.data.response_key]
     data_sources = dataset[config.data.data_source_key]
     reward_model_data = dataset[config.data.reward_model_key]
+    print(config)
 
     total = len(dataset)
 

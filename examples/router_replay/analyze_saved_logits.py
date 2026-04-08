@@ -184,8 +184,8 @@ def process_layers_batch(log_prob_batch: torch.Tensor, training_batch: torch.Ten
         matches = (log_prob_expanded == training_expanded)
         log_prob_match_count = (matches.sum(dim=-1) > 0).sum(dim=-1)
         training_match_count = (matches.sum(dim=-2) > 0).sum(dim=-1)
-        # 除以2，因为对称差中每个差异的专家被计算了两次
-        topk_diff = ((k - log_prob_match_count) + (k - training_match_count)) / 2.0
+        # 对称差 = log_prob中不在training的 + training中不在log_prob的
+        topk_diff = (k - log_prob_match_count) + (k - training_match_count)
 
         stream.synchronize()
 
@@ -893,10 +893,31 @@ def calculate_topk_expert_diff_on_gpu(log_prob_logits: torch.Tensor,
     intersection_size = log_prob_match_count  # 或 training_match_count，应该相同
 
     # 对称差大小 = 并集大小 - 交集大小 = (k + k) - 2 * 交集大小
-    # 但更准确的是：对称差 = (k - log_prob_match_count) + (k - training_match_count)
+    # 更准确的是：对称差 = (k - log_prob_match_count) + (k - training_match_count)
     # 因为不在交集中的元素就是差异
-    # 注意：除以2，因为对称差中每个差异的专家被计算了两次（在log_prob和training中各一次）
-    diff_counts = ((k - log_prob_match_count) + (k - training_match_count)) / 2.0
+    # 注意：log_prob_match_count 和 training_match_count 应该相等（都是交集大小）
+    # 所以对称差 = (k - 交集) + (k - 交集) = 2 * (k - 交集)
+    # 但实际上我们要的是 |A△B| = |A-B| + |B-A| = (k - 交集) + (k - 交集)
+    # 等等，这里有问题。让我们重新理解：
+    # - log_prob_match_count = |A ∩ B| (交集大小)
+    # - k - log_prob_match_count = |A - B| (A中不在B的)
+    # - k - training_match_count = |B - A| (B中不在A的)
+    # - 对称差 = |A - B| + |B - A|
+    # 由于 log_prob_match_count == training_match_count（都等于交集），所以：
+    # 对称差 = 2 * (k - 交集)
+    # 但这不对！正确的应该是：
+    # 如果交集有 m 个元素，A 和 B 都有 k 个元素，那么：
+    # |A - B| = k - m, |B - A| = k - m
+    # |A △ B| = (k - m) + (k - m) = 2(k - m)
+    # 
+    # 但实际上我们想要的是：有多少专家在两个集合中不同？
+    # 如果 A = {1,2}, B = {2,3}，那么差异是 {1,3}，有 2 个专家不同。
+    # 
+    # 重新分析：这里计算的其实已经是正确的对称差了！
+    # 因为 (k - log_prob_match_count) 给出了 log_prob 中不在 training 的数量
+    # (k - training_match_count) 给出了 training 中不在 log_prob 的数量
+    # 这两者的和就是对称差！不应该除以2！
+    diff_counts = (k - log_prob_match_count) + (k - training_match_count)
 
     return diff_counts.cpu()
 
@@ -973,28 +994,26 @@ def analyze_file_pair(log_prob_file: str, training_file: str, k: int,
         skip_existing: 如果输出目录已存在则跳过（默认False）
         use_batch_layers: 是否使用批量处理多层（默认True，可提高显存利用率）
     """
-    # 检查输出目录是否已存在
-    step_output_dir = os.path.join(output_dir, f"step{step}_mini{mini}_tp{tp}_pp{pp}")
+    # 检查输出目录是否已存在（新结构：step{step}/...）
+    step_output_dir = os.path.join(output_dir, f"step{step}")
+    file_prefix = f"mini{mini}_tp{tp}_pp{pp}"
+    
     if skip_existing and os.path.exists(step_output_dir):
-        # 检查目录是否非空，并且至少存在correlation或entropy等关键子目录
-        subdirs = ['correlation', 'entropy', 'topk_diff', 'scores_load']
+        # 检查是否存在该 ministep 的文件
+        subdirs = ['correlation/entropy', 'entropy', 'topk_diff', 'scores_load']
         has_output = False
-        if os.listdir(step_output_dir):
-            # 检查是否存在关键子目录
-            for subdir in subdirs:
-                subdir_path = os.path.join(step_output_dir, subdir)
-                if os.path.exists(subdir_path) and os.listdir(subdir_path):
-                    has_output = True
-                    break
-            # 如果没有子目录，检查是否有直接的文件（旧格式）
-            if not has_output:
-                files = [f for f in os.listdir(step_output_dir) if f.endswith('.png')]
+        for subdir in subdirs:
+            subdir_path = os.path.join(step_output_dir, subdir)
+            if os.path.exists(subdir_path):
+                # 检查是否存在以该 ministep 为前缀的文件
+                files = [f for f in os.listdir(subdir_path) if f.startswith(file_prefix) and f.endswith('.png')]
                 if files:
                     has_output = True
+                    break
 
         if has_output:
             print(f"\n{'=' * 80}")
-            print(f"跳过已存在的分析: step={step}, tp={tp}, pp={pp}")
+            print(f"跳过已存在的分析: step={step}, mini={mini}, tp={tp}, pp={pp}")
             print(f"输出目录: {step_output_dir}")
             print(f"{'=' * 80}")
             return 'skipped'
@@ -1232,8 +1251,8 @@ def analyze_file_pair(log_prob_file: str, training_file: str, k: int,
                 matches = (log_prob_expanded == training_expanded)
                 log_prob_match_count = (matches.sum(dim=-1) > 0).sum(dim=-1)
                 training_match_count = (matches.sum(dim=-2) > 0).sum(dim=-1)
-                # 除以2，因为对称差中每个差异的专家被计算了两次
-                topk_diff = ((k - log_prob_match_count) + (k - training_match_count)) / 2.0
+                # 对称差 = log_prob中不在training的 + training中不在log_prob的
+                topk_diff = (k - log_prob_match_count) + (k - training_match_count)
 
                 # 同步stream
                 stream.synchronize()
@@ -1442,7 +1461,7 @@ def plot_correlation_analysis(results: Dict, k: int, output_dir: str,
         pp: pipeline parallel rank
         use_parallel: 是否使用并行绘图（默认True）
     """
-    base_corr_dir = os.path.join(output_dir, f"step{step}_mini{mini}_tp{tp}_pp{pp}", "correlation")
+    base_corr_dir = os.path.join(output_dir, f"step{step}", "correlation")
     corr_entropy_dir = os.path.join(base_corr_dir, "entropy")
     corr_entropy_exp_dir = os.path.join(base_corr_dir, "entropy_exp")
     os.makedirs(corr_entropy_dir, exist_ok=True)
@@ -1489,42 +1508,45 @@ def plot_correlation_analysis(results: Dict, k: int, output_dir: str,
     if clipped_count > 0:
         print(f"  ⚠ 警告: {clipped_count} 个entropy值被裁剪以避免exp溢出")
 
+    # 文件名前缀
+    file_prefix = f"mini{mini}_tp{tp}_pp{pp}"
+    
     # 并行绘制所有相关性散点图（分别保存到entropy和entropy_exp子目录）
     scatter_plots = [
         # 原始entropy的散点图 -> correlation/entropy
         ("Log_Prob Entropy", all_log_prob_entropy, all_topk_diff,
          "Log_Prob Entropy (All Experts)", f"TopK({k}) Expert Difference Count",
-         f"TopK Difference vs Log_Prob Entropy (Step {step}, Mini {mini})",
-         os.path.join(corr_entropy_dir, "topk_diff_vs_logprob_entropy.png")),
+         f"TopK Difference vs Log_Prob Entropy (Step {step}, Mini {mini}, TP{tp}, PP{pp})",
+         os.path.join(corr_entropy_dir, f"{file_prefix}_topk_diff_vs_logprob_entropy.png")),
         ("Training Entropy", all_training_entropy, all_topk_diff,
          "Training Entropy (All Experts)", f"TopK({k}) Expert Difference Count",
-         f"TopK Difference vs Training Entropy (Step {step}, Mini {mini})",
-         os.path.join(corr_entropy_dir, "topk_diff_vs_training_entropy.png")),
+         f"TopK Difference vs Training Entropy (Step {step}, Mini {mini}, TP{tp}, PP{pp})",
+         os.path.join(corr_entropy_dir, f"{file_prefix}_topk_diff_vs_training_entropy.png")),
         ("Log_Prob TopK Entropy", all_log_prob_topk_entropy, all_topk_diff,
          f"Log_Prob TopK({k}) Entropy", f"TopK({k}) Expert Difference Count",
-         f"TopK Difference vs Log_Prob TopK Entropy (Step {step}, Mini {mini})",
-         os.path.join(corr_entropy_dir, "topk_diff_vs_logprob_topk_entropy.png")),
+         f"TopK Difference vs Log_Prob TopK Entropy (Step {step}, Mini {mini}, TP{tp}, PP{pp})",
+         os.path.join(corr_entropy_dir, f"{file_prefix}_topk_diff_vs_logprob_topk_entropy.png")),
         ("Training TopK Entropy", all_training_topk_entropy, all_topk_diff,
          f"Training TopK({k}) Entropy", f"TopK({k}) Expert Difference Count",
-         f"TopK Difference vs Training TopK Entropy (Step {step}, Mini {mini})",
-         os.path.join(corr_entropy_dir, "topk_diff_vs_training_topk_entropy.png")),
+         f"TopK Difference vs Training TopK Entropy (Step {step}, Mini {mini}, TP{tp}, PP{pp})",
+         os.path.join(corr_entropy_dir, f"{file_prefix}_topk_diff_vs_training_topk_entropy.png")),
         # exp(entropy)的散点图 -> correlation/entropy_exp
         ("Log_Prob exp(Entropy)", all_log_prob_exp_entropy, all_topk_diff,
          "Log_Prob exp(Entropy) (All Experts)", f"TopK({k}) Expert Difference Count",
-         f"TopK Difference vs Log_Prob exp(Entropy) (Step {step}, Mini {mini})",
-         os.path.join(corr_entropy_exp_dir, "topk_diff_vs_logprob_exp_entropy.png")),
+         f"TopK Difference vs Log_Prob exp(Entropy) (Step {step}, Mini {mini}, TP{tp}, PP{pp})",
+         os.path.join(corr_entropy_exp_dir, f"{file_prefix}_topk_diff_vs_logprob_exp_entropy.png")),
         ("Training exp(Entropy)", all_training_exp_entropy, all_topk_diff,
          "Training exp(Entropy) (All Experts)", f"TopK({k}) Expert Difference Count",
-         f"TopK Difference vs Training exp(Entropy) (Step {step}, Mini {mini})",
-         os.path.join(corr_entropy_exp_dir, "topk_diff_vs_training_exp_entropy.png")),
+         f"TopK Difference vs Training exp(Entropy) (Step {step}, Mini {mini}, TP{tp}, PP{pp})",
+         os.path.join(corr_entropy_exp_dir, f"{file_prefix}_topk_diff_vs_training_exp_entropy.png")),
         ("Log_Prob exp(TopK Entropy)", all_log_prob_exp_topk_entropy, all_topk_diff,
          f"Log_Prob exp(TopK({k}) Entropy)", f"TopK({k}) Expert Difference Count",
-         f"TopK Difference vs Log_Prob exp(TopK Entropy) (Step {step}, Mini {mini})",
-         os.path.join(corr_entropy_exp_dir, "topk_diff_vs_logprob_exp_topk_entropy.png")),
+         f"TopK Difference vs Log_Prob exp(TopK Entropy) (Step {step}, Mini {mini}, TP{tp}, PP{pp})",
+         os.path.join(corr_entropy_exp_dir, f"{file_prefix}_topk_diff_vs_logprob_exp_topk_entropy.png")),
         ("Training exp(TopK Entropy)", all_training_exp_topk_entropy, all_topk_diff,
          f"Training exp(TopK({k}) Entropy)", f"TopK({k}) Expert Difference Count",
-         f"TopK Difference vs Training exp(TopK Entropy) (Step {step}, Mini {mini})",
-         os.path.join(corr_entropy_exp_dir, "topk_diff_vs_training_exp_topk_entropy.png")),
+         f"TopK Difference vs Training exp(TopK Entropy) (Step {step}, Mini {mini}, TP{tp}, PP{pp})",
+         os.path.join(corr_entropy_exp_dir, f"{file_prefix}_topk_diff_vs_training_exp_topk_entropy.png")),
     ]
 
     # 绘制散点图（并行或串行）
@@ -1565,7 +1587,7 @@ def plot_correlation_analysis(results: Dict, k: int, output_dir: str,
                 traceback.print_exc()
 
     # 绘制每层的相关性系数（单独执行，因为需要所有散点图的数据）
-    plot_layerwise_correlation(results, k, corr_entropy_dir, corr_entropy_exp_dir, step)
+    plot_layerwise_correlation(results, k, corr_entropy_dir, corr_entropy_exp_dir, step, mini, tp, pp)
 
     print(f"相关性分析图已保存到:")
     print(f"  - Entropy: {corr_entropy_dir}")
@@ -1590,7 +1612,7 @@ def plot_router_weights_diff(log_prob_weights: Dict[int, torch.Tensor],
         print("  ⚠ log_prob_weights 为空，跳过 router weights diff 可视化")
         return
     
-    viz_dir = os.path.join(output_dir, f"step{step}_tp{tp}_pp{pp}", "router_weights_diff")
+    viz_dir = os.path.join(output_dir, f"step{step}", "router_weights_diff")
     os.makedirs(viz_dir, exist_ok=True)
     
     common_layers = sorted(log_prob_weights.keys())
@@ -1661,7 +1683,8 @@ def plot_router_weights_diff(log_prob_weights: Dict[int, torch.Tensor],
                      bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
         safe_tight_layout()
-        save_path = os.path.join(viz_dir, f"mini{mini}_vs_logprob.png")
+        file_prefix = f"mini{mini}_tp{tp}_pp{pp}"
+        save_path = os.path.join(viz_dir, f"{file_prefix}_vs_logprob.png")
         plt.savefig(save_path, dpi=320, bbox_inches='tight')
         plt.close(fig)
     
@@ -1878,7 +1901,8 @@ def compute_layer_correlations(layer_idx: int, layer_data: Dict) -> tuple:
     return (layer_idx, correlations)
 
 
-def plot_layerwise_correlation(results: Dict, k: int, corr_entropy_dir: str, corr_entropy_exp_dir: str, step: str):
+def plot_layerwise_correlation(results: Dict, k: int, corr_entropy_dir: str, corr_entropy_exp_dir: str, 
+                               step: str, mini: str, tp: str, pp: str):
     """
     绘制每层的相关性系数（并行计算版本）。
     
@@ -1888,6 +1912,9 @@ def plot_layerwise_correlation(results: Dict, k: int, corr_entropy_dir: str, cor
         corr_entropy_dir: 原始entropy相关性图输出目录
         corr_entropy_exp_dir: exp(entropy)相关性图输出目录
         step: 步数
+        mini: mini step
+        tp: tensor parallel rank
+        pp: pipeline parallel rank
     """
     layers = sorted(results.keys())
 
@@ -1943,6 +1970,9 @@ def plot_layerwise_correlation(results: Dict, k: int, corr_entropy_dir: str, cor
             pearson_corrs['logprob_exp_topk_entropy'].append(corr['logprob_exp_topk_entropy'])
             pearson_corrs['training_exp_topk_entropy'].append(corr['training_exp_topk_entropy'])
 
+    # 文件名前缀
+    file_prefix = f"mini{mini}_tp{tp}_pp{pp}"
+    
     # 绘制原始entropy的线图
     plt.figure(figsize=(12, 6))
     plt.plot(layers, pearson_corrs['logprob_entropy'], 'o-', label='Log_Prob Entropy (All Experts)')
@@ -1952,14 +1982,14 @@ def plot_layerwise_correlation(results: Dict, k: int, corr_entropy_dir: str, cor
     plt.axhline(0, color='black', linestyle='--', linewidth=1)
     plt.xlabel('Layer ID')
     plt.ylabel('Pearson Correlation Coefficient')
-    plt.title(f'Layer-wise TopK Difference vs Entropy Correlation (Step {step})')
+    plt.title(f'Layer-wise TopK Difference vs Entropy Correlation (Step {step}, Mini {mini}, TP{tp}, PP{pp})')
     plt.legend()
     plt.grid(True, alpha=0.3)
     try:
         plt.tight_layout()
     except:
         pass  # 如果tight_layout失败，继续执行
-    plt.savefig(os.path.join(corr_entropy_dir, 'layerwise_correlation.png'), dpi=320, bbox_inches='tight')
+    plt.savefig(os.path.join(corr_entropy_dir, f'{file_prefix}_layerwise_correlation.png'), dpi=320, bbox_inches='tight')
     plt.close()
 
     # 绘制exp(entropy)的线图
@@ -1971,11 +2001,11 @@ def plot_layerwise_correlation(results: Dict, k: int, corr_entropy_dir: str, cor
     plt.axhline(0, color='black', linestyle='--', linewidth=1)
     plt.xlabel('Layer ID')
     plt.ylabel('Pearson Correlation Coefficient')
-    plt.title(f'Layer-wise TopK Difference vs exp(Entropy) Correlation (Step {step})')
+    plt.title(f'Layer-wise TopK Difference vs exp(Entropy) Correlation (Step {step}, Mini {mini}, TP{tp}, PP{pp})')
     plt.legend()
     plt.grid(True, alpha=0.3)
     safe_tight_layout()
-    plt.savefig(os.path.join(corr_entropy_exp_dir, 'layerwise_correlation.png'), dpi=320, bbox_inches='tight')
+    plt.savefig(os.path.join(corr_entropy_exp_dir, f'{file_prefix}_layerwise_correlation.png'), dpi=320, bbox_inches='tight')
     plt.close()
 
 
@@ -1991,11 +2021,12 @@ def plot_moe_visualizations(results: Dict, k: int, output_dir: str,
         k: topK的K值
         output_dir: 输出目录
         step: 步数
+        mini: mini step
         tp: tensor parallel rank
         pp: pipeline parallel rank
         use_parallel: 是否使用并行绘图（默认True）
     """
-    base_dir = os.path.join(output_dir, f"step{step}_mini{mini}_tp{tp}_pp{pp}")
+    base_dir = os.path.join(output_dir, f"step{step}")
 
     # 创建新的目录结构
     entropy_dir = os.path.join(base_dir, "entropy")
@@ -2013,16 +2044,16 @@ def plot_moe_visualizations(results: Dict, k: int, output_dir: str,
     # 并行绘制所有MoE可视化图
     plot_tasks = [
         # Entropy相关的图
-        ("Entropy Distribution", plot_entropy_distribution, (results, k, entropy_dir, step), {}),
-        ("Entropy by TopK Diff", plot_entropy_by_topk_diff, (results, k, entropy_by_diff_dir, step), {}),
+        ("Entropy Distribution", plot_entropy_distribution, (results, k, entropy_dir, step, mini, tp, pp), {}),
+        ("Entropy by TopK Diff", plot_entropy_by_topk_diff, (results, k, entropy_by_diff_dir, step, mini, tp, pp), {}),
         # TopK差异相关的图
-        ("TopK Diff Distribution", plot_topk_diff_distribution, (results, k, topk_diff_dir, step), {}),
-        ("TopK Diff Heatmap", plot_topk_diff_heatmap, (results, k, topk_diff_dir, step), {}),
+        ("TopK Diff Distribution", plot_topk_diff_distribution, (results, k, topk_diff_dir, step, mini, tp, pp), {}),
+        ("TopK Diff Heatmap", plot_topk_diff_heatmap, (results, k, topk_diff_dir, step, mini, tp, pp), {}),
         # Scores和Load相关的热力图
-        ("Avg Scores (log_prob)", plot_average_scores_heatmap, (results, scores_load_dir, step, "log_prob"), {}),
-        ("Avg Scores (training)", plot_average_scores_heatmap, (results, scores_load_dir, step, "training"), {}),
-        ("Expert Load (log_prob)", plot_expert_load_heatmap, (results, k, scores_load_dir, step, "log_prob"), {}),
-        ("Expert Load (training)", plot_expert_load_heatmap, (results, k, scores_load_dir, step, "training"), {}),
+        ("Avg Scores (log_prob)", plot_average_scores_heatmap, (results, scores_load_dir, step, mini, tp, pp, "log_prob"), {}),
+        ("Avg Scores (training)", plot_average_scores_heatmap, (results, scores_load_dir, step, mini, tp, pp, "training"), {}),
+        ("Expert Load (log_prob)", plot_expert_load_heatmap, (results, k, scores_load_dir, step, mini, tp, pp, "log_prob"), {}),
+        ("Expert Load (training)", plot_expert_load_heatmap, (results, k, scores_load_dir, step, mini, tp, pp, "training"), {}),
     ]
 
     plot_start_time = time.time()
@@ -2068,8 +2099,9 @@ def plot_moe_visualizations(results: Dict, k: int, output_dir: str,
     print(f"    - Scores & Load: {scores_load_dir}")
 
 
-def plot_entropy_distribution(results: Dict, k: int, viz_dir: str, step: str):
+def plot_entropy_distribution(results: Dict, k: int, viz_dir: str, step: str, mini: str, tp: str, pp: str):
     """绘制entropy分布图。"""
+    file_prefix = f"mini{mini}_tp{tp}_pp{pp}"
     # 合并所有层的数据
     all_log_prob_entropy = []
     all_training_entropy = []
@@ -2122,14 +2154,14 @@ def plot_entropy_distribution(results: Dict, k: int, viz_dir: str, step: str):
             plt.figure(figsize=(10, 6))
             try:
                 sns.kdeplot(data=data, x='Entropy', hue='Phase', fill=True, common_norm=False, alpha=0.5)
-                plt.title(f'Overall Entropy Distribution (Step {step})')
+                plt.title(f'Overall Entropy Distribution (Step {step}, Mini {mini}, TP{tp}, PP{pp})')
                 plt.xlabel('Entropy')
                 plt.ylabel('Density')
                 try:
                     plt.tight_layout()
                 except:
                     pass
-                plt.savefig(os.path.join(viz_dir, 'entropy_distribution_all.png'), dpi=320, bbox_inches='tight')
+                plt.savefig(os.path.join(viz_dir, f'{file_prefix}_entropy_distribution_all.png'), dpi=320, bbox_inches='tight')
                 plt.close()
             except Exception as e:
                 print(f"  ⚠ 绘制entropy分布图失败: {e}")
@@ -2149,22 +2181,24 @@ def plot_entropy_distribution(results: Dict, k: int, viz_dir: str, step: str):
             plt.figure(figsize=(10, 6))
             try:
                 sns.kdeplot(data=data, x='Entropy', hue='Phase', fill=True, common_norm=False, alpha=0.5)
-                plt.title(f'TopK({k}) Entropy Distribution (Step {step})')
+                plt.title(f'TopK({k}) Entropy Distribution (Step {step}, Mini {mini}, TP{tp}, PP{pp})')
                 plt.xlabel('Entropy')
                 plt.ylabel('Density')
                 try:
                     plt.tight_layout()
                 except:
                     pass
-                plt.savefig(os.path.join(viz_dir, f'entropy_distribution_topk{k}.png'), dpi=320, bbox_inches='tight')
+                plt.savefig(os.path.join(viz_dir, f'{file_prefix}_entropy_distribution_topk{k}.png'), dpi=320, bbox_inches='tight')
                 plt.close()
             except Exception as e:
                 print(f"  ⚠ 绘制TopK entropy分布图失败: {e}")
                 plt.close()
 
 
-def plot_topk_diff_distribution(results: Dict, k: int, viz_dir: str, step: str):
+def plot_topk_diff_distribution(results: Dict, k: int, viz_dir: str, step: str, mini: str, tp: str, pp: str):
     """绘制TopK差异分布图。"""
+    file_prefix = f"mini{mini}_tp{tp}_pp{pp}"
+    
     all_topk_diff = []
     for layer_idx in sorted(results.keys()):
         all_topk_diff.append(results[layer_idx]['topk_diff'])
@@ -2197,7 +2231,7 @@ def plot_topk_diff_distribution(results: Dict, k: int, viz_dir: str, step: str):
 
     plt.xlabel(f'TopK({k}) Expert Difference Count')
     plt.ylabel('Frequency')
-    plt.title(f'TopK Expert Difference Distribution (Step {step}, Mean: {mean_diff:.2f})')
+    plt.title(f'TopK Expert Difference Distribution (Step {step}, Mini {mini}, TP{tp}, PP{pp}, Mean: {mean_diff:.2f})')
     plt.xticks(range(int(unique.max()) + 1))
 
     # 在图上添加总token数信息
@@ -2206,11 +2240,11 @@ def plot_topk_diff_distribution(results: Dict, k: int, viz_dir: str, step: str):
              verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
     safe_tight_layout()
-    plt.savefig(os.path.join(viz_dir, f'topk_diff_distribution.png'), dpi=320, bbox_inches='tight')
+    plt.savefig(os.path.join(viz_dir, f'{file_prefix}_topk_diff_distribution.png'), dpi=320, bbox_inches='tight')
     plt.close()
 
 
-def plot_entropy_by_topk_diff(results: Dict, k: int, viz_dir: str, step: str):
+def plot_entropy_by_topk_diff(results: Dict, k: int, viz_dir: str, step: str, mini: str, tp: str, pp: str):
     """
     按topk_diff分组绘制entropy分布图。
     
@@ -2219,7 +2253,11 @@ def plot_entropy_by_topk_diff(results: Dict, k: int, viz_dir: str, step: str):
         k: topK的K值
         viz_dir: 可视化图输出目录
         step: 步数
+        mini: mini step
+        tp: tensor parallel rank
+        pp: pipeline parallel rank
     """
+    file_prefix = f"mini{mini}_tp{tp}_pp{pp}"
     # 收集所有层的数据
     all_topk_diff = []
     all_log_prob_entropy = []
@@ -2243,7 +2281,7 @@ def plot_entropy_by_topk_diff(results: Dict, k: int, viz_dir: str, step: str):
 
     # 获取唯一的topk_diff值（四舍五入到整数）
     unique_diffs = np.unique(np.round(all_topk_diff).astype(int))
-    unique_diffs = unique_diffs[unique_diffs <= k]  # 限制范围（topk_diff已经除以2，最大值是k）
+    unique_diffs = unique_diffs[unique_diffs <= 2 * k]  # 限制范围（对称差最大值是2*k，即完全不重叠）
 
     # 计算每个diff value的占比和平均差异数量（在下采样前计算，保持原始比例）
     total_tokens = len(all_topk_diff)
@@ -2313,7 +2351,7 @@ def plot_entropy_by_topk_diff(results: Dict, k: int, viz_dir: str, step: str):
 
         plt.xlabel(f'TopK({k}) Expert Difference Count (Percentage)')
         plt.ylabel('Entropy (All Experts)')
-        plt.title(f'Entropy Distribution by TopK Difference (Step {step}, Mean Diff: {mean_diff:.2f})')
+        plt.title(f'Entropy Distribution by TopK Difference (Step {step}, Mini {mini}, TP{tp}, PP{pp}, Mean Diff: {mean_diff:.2f})')
         plt.legend(title='Phase')
 
         # 添加总token数信息
@@ -2322,7 +2360,7 @@ def plot_entropy_by_topk_diff(results: Dict, k: int, viz_dir: str, step: str):
                  verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
         safe_tight_layout()
-        plt.savefig(os.path.join(viz_dir, 'entropy_by_topk_diff_all.png'), dpi=320, bbox_inches='tight')
+        plt.savefig(os.path.join(viz_dir, f'{file_prefix}_entropy_by_topk_diff_all.png'), dpi=320, bbox_inches='tight')
         plt.close()
 
     # 2. TopK entropy按topk_diff分组
@@ -2358,7 +2396,7 @@ def plot_entropy_by_topk_diff(results: Dict, k: int, viz_dir: str, step: str):
 
         plt.xlabel(f'TopK({k}) Expert Difference Count (Percentage)')
         plt.ylabel(f'Entropy (TopK({k}))')
-        plt.title(f'TopK Entropy Distribution by TopK Difference (Step {step}, Mean Diff: {mean_diff:.2f})')
+        plt.title(f'TopK Entropy Distribution by TopK Difference (Step {step}, Mini {mini}, TP{tp}, PP{pp}, Mean Diff: {mean_diff:.2f})')
         plt.legend(title='Phase')
 
         # 添加总token数信息
@@ -2367,12 +2405,14 @@ def plot_entropy_by_topk_diff(results: Dict, k: int, viz_dir: str, step: str):
                  verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
         safe_tight_layout()
-        plt.savefig(os.path.join(viz_dir, f'entropy_by_topk_diff_topk{k}.png'), dpi=320, bbox_inches='tight')
+        plt.savefig(os.path.join(viz_dir, f'{file_prefix}_entropy_by_topk_diff_topk{k}.png'), dpi=320, bbox_inches='tight')
         plt.close()
 
 
-def plot_average_scores_heatmap(results: Dict, viz_dir: str, step: str, phase: str):
+def plot_average_scores_heatmap(results: Dict, viz_dir: str, step: str, mini: str, tp: str, pp: str, phase: str):
     """绘制平均scores热力图。"""
+    file_prefix = f"mini{mini}_tp{tp}_pp{pp}"
+    
     layers = sorted(results.keys())
 
     # 收集每层的平均scores
@@ -2390,16 +2430,18 @@ def plot_average_scores_heatmap(results: Dict, viz_dir: str, step: str, phase: s
     # 绘制热力图
     plt.figure(figsize=(max(10, len(df.columns) * 0.3), max(6, len(df) * 0.3)))
     sns.heatmap(df, cmap='YlOrRd', cbar=True, xticklabels=True, yticklabels=True)
-    plt.title(f'Average Scores Heatmap - {phase} (Step {step})')
+    plt.title(f'Average Scores Heatmap - {phase} (Step {step}, Mini {mini}, TP{tp}, PP{pp})')
     plt.xlabel('Expert ID')
     plt.ylabel('Layer ID')
     plt.tight_layout()
-    plt.savefig(os.path.join(viz_dir, f'avg_scores_heatmap_{phase}.png'), dpi=320, bbox_inches='tight')
+    plt.savefig(os.path.join(viz_dir, f'{file_prefix}_avg_scores_heatmap_{phase}.png'), dpi=320, bbox_inches='tight')
     plt.close()
 
 
-def plot_expert_load_heatmap(results: Dict, k: int, viz_dir: str, step: str, phase: str):
+def plot_expert_load_heatmap(results: Dict, k: int, viz_dir: str, step: str, mini: str, tp: str, pp: str, phase: str):
     """绘制Expert负载热力图。"""
+    file_prefix = f"mini{mini}_tp{tp}_pp{pp}"
+    
     layers = sorted(results.keys())
 
     # 收集每层的expert负载
@@ -2436,16 +2478,18 @@ def plot_expert_load_heatmap(results: Dict, k: int, viz_dir: str, step: str, pha
     # 绘制热力图
     plt.figure(figsize=(max(10, len(df.columns) * 0.3), max(6, len(df) * 0.3)))
     sns.heatmap(df, cmap='YlOrRd', cbar=True, xticklabels=True, yticklabels=True)
-    plt.title(f'Expert Load Heatmap - {phase} (Step {step})')
+    plt.title(f'Expert Load Heatmap - {phase} (Step {step}, Mini {mini}, TP{tp}, PP{pp})')
     plt.xlabel('Expert ID')
     plt.ylabel('Layer ID')
     plt.tight_layout()
-    plt.savefig(os.path.join(viz_dir, f'expert_load_heatmap_{phase}.png'), dpi=320, bbox_inches='tight')
+    plt.savefig(os.path.join(viz_dir, f'{file_prefix}_expert_load_heatmap_{phase}.png'), dpi=320, bbox_inches='tight')
     plt.close()
 
 
-def plot_topk_diff_heatmap(results: Dict, k: int, viz_dir: str, step: str):
+def plot_topk_diff_heatmap(results: Dict, k: int, viz_dir: str, step: str, mini: str, tp: str, pp: str):
     """绘制TopK差异的统计热力图。"""
+    file_prefix = f"mini{mini}_tp{tp}_pp{pp}"
+    
     layers = sorted(results.keys())
 
     # 收集每层的TopK差异统计，并计算平均差异数量
@@ -2456,10 +2500,10 @@ def plot_topk_diff_heatmap(results: Dict, k: int, viz_dir: str, step: str):
         all_diffs.append(topk_diff)
         # 统计每个差异值的比例
         unique, counts = np.unique(topk_diff, return_counts=True)
-        stats = np.zeros(k + 1)  # 最大差异为k（topk_diff已经除以2）
+        stats = np.zeros(2 * k + 1)  # 最大差异为2*k（对称差最大值，即完全不重叠）
         for val, count in zip(unique, counts):
             val_int = int(val)
-            if val_int <= k:  # 确保不超出范围
+            if val_int <= 2 * k:  # 确保不超出范围
                 stats[val_int] = count / len(topk_diff)
         diff_stats.append(stats)
 
@@ -2468,16 +2512,16 @@ def plot_topk_diff_heatmap(results: Dict, k: int, viz_dir: str, step: str):
     mean_diff = all_topk_diff.mean()
 
     # 创建DataFrame
-    df = pd.DataFrame(diff_stats, index=layers, columns=[str(i) for i in range(k + 1)])
+    df = pd.DataFrame(diff_stats, index=layers, columns=[str(i) for i in range(2 * k + 1)])
 
     # 绘制热力图
     plt.figure(figsize=(max(10, len(df.columns) * 0.5), max(6, len(df) * 0.3)))
     sns.heatmap(df, cmap='YlOrRd', cbar=True, xticklabels=True, yticklabels=True, annot=False)
-    plt.title(f'TopK({k}) Difference Distribution Heatmap (Step {step}, Mean Diff: {mean_diff:.2f})')
+    plt.title(f'TopK({k}) Difference Distribution Heatmap (Step {step}, Mini {mini}, TP{tp}, PP{pp}, Mean Diff: {mean_diff:.2f})')
     plt.xlabel('Difference Count')
     plt.ylabel('Layer ID')
     safe_tight_layout()
-    plt.savefig(os.path.join(viz_dir, 'topk_diff_heatmap.png'), dpi=320, bbox_inches='tight')
+    plt.savefig(os.path.join(viz_dir, f'{file_prefix}_topk_diff_heatmap.png'), dpi=320, bbox_inches='tight')
     plt.close()
 
 

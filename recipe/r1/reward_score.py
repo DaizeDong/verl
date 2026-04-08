@@ -14,7 +14,11 @@
 
 
 def reward_func(data_source, solution_str, ground_truth, extra_info=None):
-    if data_source in ["Maxwell-Jia/AIME_2024", "opencompass/cnmo2024_en", "opencompass/cnmo2024_zh"]:
+    if data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
+        from verl.utils.reward_score import math_dapo
+
+        return math_dapo.compute_score(solution_str, ground_truth)["acc"]
+    elif data_source in ["Maxwell-Jia/AIME_2024", "opencompass/cnmo2024_en", "opencompass/cnmo2024_zh"]:
         from recipe.r1.tasks import math_reward
 
         return math_reward.compute_score(solution_str, ground_truth)

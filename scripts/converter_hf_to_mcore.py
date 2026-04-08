@@ -168,8 +168,28 @@ def convert_checkpoint_from_transformers_to_megatron(
             numel += safe_copy(qkv_bias, layer.self_attention.linear_qkv.bias)
 
         if hasattr(hf_layer.self_attn, "q_norm"):
-            numel += safe_copy(hf_layer.self_attn.q_norm.weight.data, layer.self_attention.q_layernorm.weight)
-            numel += safe_copy(hf_layer.self_attn.k_norm.weight.data, layer.self_attention.k_layernorm.weight)
+            q_weight = hf_layer.self_attn.q_norm.weight.data
+            k_weight = hf_layer.self_attn.k_norm.weight.data
+            q_target = layer.self_attention.q_layernorm.weight
+            k_target = layer.self_attention.k_layernorm.weight
+
+            if q_weight.shape != q_target.shape:
+                if q_weight.numel() == q_target.numel():
+                    q_weight = q_weight.view(q_target.shape).contiguous()
+                elif q_target.dim() == 1 and q_weight.numel() == hidden_dim:
+                    q_weight = q_weight.view(num_attention_heads, head_dim).mean(dim=0).contiguous()
+                else:
+                    raise ValueError(f"q_norm shape mismatch: hf={q_weight.shape} megatron={q_target.shape}")
+            if k_weight.shape != k_target.shape:
+                if k_weight.numel() == k_target.numel():
+                    k_weight = k_weight.view(k_target.shape).contiguous()
+                elif k_target.dim() == 1 and k_weight.numel() == hidden_dim:
+                    k_weight = k_weight.view(num_key_value_heads, head_dim).mean(dim=0).contiguous()
+                else:
+                    raise ValueError(f"k_norm shape mismatch: hf={k_weight.shape} megatron={k_target.shape}")
+
+            numel += safe_copy(q_weight, q_target)
+            numel += safe_copy(k_weight, k_target)
 
         numel += safe_copy(hf_layer.self_attn.o_proj.weight, layer.self_attention.linear_proj.weight)
         numel += safe_copy(hf_layer.post_attention_layernorm.weight, layer.pre_mlp_layernorm.weight)
@@ -574,6 +594,8 @@ def convert_hf_to_mcore(
     elif "DeepseekV3ForCausalLM" in hf_config.architectures:
         convert_checkpoint_from_transformers_to_megatron_dpskv3(hf_model, model[0].module, hf_config, tfconfig=tfconfig)
     elif "Qwen3MoeForCausalLM" in hf_config.architectures:
+        convert_checkpoint_from_transformers_to_megatron(hf_model, model[0].module, hf_config)
+    elif "OlmoeForCausalLM" in hf_config.architectures:
         convert_checkpoint_from_transformers_to_megatron(hf_model, model[0].module, hf_config)
     else:
         assert not use_cpu_initialization, "use_cpu_initialization is only supported for MoE model"

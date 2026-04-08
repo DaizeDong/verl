@@ -21,6 +21,12 @@ from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from verl.utils.logger import print_rank_0
 
 
+def _coerce_optional_int(value):
+    if value is None:
+        return None
+    return int(value)
+
+
 def init_megatron_optim_config(
     optim_config: dict, use_distributed_optimizer: bool = True, fp16: bool = False
 ) -> OptimizerConfig:
@@ -82,15 +88,15 @@ def get_megatron_optimizer_param_scheduler(
     """
     Get the optimizer parameter scheduler for Megatron.
     """
-    lr_decay_steps = config.lr_decay_steps
-    lr_warmup_steps = config.lr_warmup_steps
+    lr_decay_steps = _coerce_optional_int(config.lr_decay_steps)
+    lr_warmup_steps = _coerce_optional_int(config.lr_warmup_steps)
     if config.get("lr_decay_steps", None) is None:
-        lr_decay_steps = config.total_training_steps
+        lr_decay_steps = _coerce_optional_int(config.total_training_steps)
     wsd_decay_steps = None
     if config.get("lr_wsd_decay_steps", None) is not None:
-        wsd_decay_steps = config.lr_wsd_decay_steps
+        wsd_decay_steps = _coerce_optional_int(config.lr_wsd_decay_steps)
     if config.get("lr_warmup_steps_ratio", None) is not None and (
-        config.get("lr_warmup_steps", None) is None or config.lr_warmup_steps <= 0
+        config.get("lr_warmup_steps", None) is None or lr_warmup_steps <= 0
     ):
         lr_warmup_steps = int(config.lr_warmup_steps_ratio * lr_decay_steps)
 

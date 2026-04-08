@@ -481,6 +481,9 @@ class McoreToHFWeightConverterQwen3Moe(McoreToHFWeightConverterDense):
         if "pre_mlp_layernorm" in name:
             convert_names.append(f"model.layers.{layer_number}.post_attention_layernorm.weight")
             assert len(params) == 1
+        elif "mlp.router.bias_predictor.weight" in name:
+            convert_names.append(f"model.layers.{layer_number}.mlp.bias_predictor.weight")
+            assert len(params) == 1
         elif "mlp.router.weight" in name:
             convert_names.append(f"model.layers.{layer_number}.mlp.gate.weight")
             assert len(params) == 1
