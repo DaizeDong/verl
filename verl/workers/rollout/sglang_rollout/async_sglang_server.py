@@ -17,6 +17,8 @@ import dataclasses
 import json
 import logging
 import os
+import socket
+import zlib
 from typing import Any, Optional
 
 import ray
@@ -70,6 +72,66 @@ def _should_enable_router_bias_predictor(config) -> bool:
 logger.setLevel(logging.INFO)
 
 
+def _debug_r3_trace_enabled() -> bool:
+    return os.getenv("VERL_DEBUG_R3_TRACE", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_r3_trace_save_dir() -> Optional[str]:
+    value = os.getenv("VERL_DEBUG_R3_TRACE_SAVE_DIR", "").strip()
+    return value or None
+
+
+def _checksum_array(value) -> Optional[str]:
+    import numpy as np
+
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu().contiguous()
+        if tensor.dtype == torch.bfloat16:
+            tensor = tensor.to(torch.float32)
+        array = tensor.numpy()
+    else:
+        array = np.ascontiguousarray(np.asarray(value))
+        if str(array.dtype) == "bfloat16":
+            array = array.astype(np.float32, copy=False)
+    return f"{zlib.crc32(array.tobytes()) & 0xFFFFFFFF:08x}"
+
+
+def _array_summary(value) -> Optional[dict]:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        array = value.detach().cpu().contiguous()
+        dtype = str(array.dtype)
+        shape = list(array.shape)
+    else:
+        import numpy as np
+
+        array = np.asarray(value)
+        dtype = str(array.dtype)
+        shape = list(array.shape)
+    return {
+        "shape": shape,
+        "dtype": dtype,
+        "checksum": _checksum_array(array),
+    }
+
+
+def _append_r3_trace(source: str, payload: dict) -> None:
+    if not _debug_r3_trace_enabled():
+        return
+    record = {"source": source, **payload}
+    message = json.dumps(record, sort_keys=True)
+    logger.warning("[R3Trace] %s", message)
+    save_dir = _debug_r3_trace_save_dir()
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        trace_path = os.path.join(save_dir, f"trace-{socket.gethostname()}-{os.getpid()}.jsonl")
+        with open(trace_path, "a", encoding="utf-8") as f:
+            f.write(message + "\n")
+
+
 def _router_state_payload_present(value) -> bool:
     return value is not None and not (isinstance(value, str) and value == "")
 
@@ -101,6 +163,17 @@ def _normalize_router_state_quartet(
             present[2],
             present[3],
         )
+        _append_r3_trace(
+            "verl.async_sglang.normalize_router_state_quartet",
+            {
+                "request_id": request_id,
+                "drop_reason": "inconsistent_quartet",
+                "inputs_present": present[0],
+                "logits_present": present[1],
+                "bias_present": present[2],
+                "token_positions_present": present[3],
+            },
+        )
         return None, None, None, None
     return router_inputs, router_logits, router_bias, router_token_positions
 
@@ -115,7 +188,7 @@ def _get_expected_router_token_count(meta_info: dict[str, Any], output_token_ids
             len(output_token_ids),
         )
         return len(output_token_ids)
-    return max(prompt_tokens + completion_tokens - 1, 0)
+    return max(prompt_tokens + completion_tokens, 0)
 
 
 def _coerce_router_state_array(value, *, expected_tokens: int, field_name: str, request_id: str):
@@ -148,6 +221,51 @@ def _coerce_router_state_array(value, *, expected_tokens: int, field_name: str, 
     return value
 
 
+def _validate_router_token_positions(router_token_positions, *, expected_tokens: int, request_id: str):
+    import numpy as np
+
+    if router_token_positions is None:
+        return None
+    if not hasattr(router_token_positions, "shape"):
+        logger.warning(
+            "[SGLang] Invalid router_token_positions payload for request_id=%s: type=%s. "
+            "Dropping router states.",
+            request_id,
+            type(router_token_positions),
+        )
+        return None
+    if router_token_positions.ndim != 1:
+        logger.warning(
+            "[SGLang] router_token_positions ndim mismatch for request_id=%s: expected=1 actual=%s. "
+            "Dropping router states.",
+            request_id,
+            router_token_positions.ndim,
+        )
+        return None
+    if router_token_positions.size == 0:
+        logger.warning(
+            "[SGLang] router_token_positions is empty for request_id=%s. Dropping router states.",
+            request_id,
+        )
+        return None
+    if np.any(router_token_positions < 0) or np.any(router_token_positions >= expected_tokens):
+        logger.warning(
+            "[SGLang] router_token_positions out of range for request_id=%s: expected_tokens=%s head=%s. "
+            "Dropping router states.",
+            request_id,
+            expected_tokens,
+            router_token_positions[:8].tolist(),
+        )
+        return None
+    if np.unique(router_token_positions).shape[0] != router_token_positions.shape[0]:
+        logger.warning(
+            "[SGLang] router_token_positions contains duplicates for request_id=%s. Dropping router states.",
+            request_id,
+        )
+        return None
+    return router_token_positions.astype(np.int32, copy=False)
+
+
 def _decode_router_states_from_meta_info(meta_info: dict[str, Any], *, hf_config, output_token_ids: list[int], request_id: str):
     import numpy as np
     import pybase64
@@ -163,7 +281,20 @@ def _decode_router_states_from_meta_info(meta_info: dict[str, Any], *, hf_config
     if router_inputs_base64 is None:
         return None, None, None, None
 
-    num_tokens = _get_expected_router_token_count(meta_info, output_token_ids)
+    expected_tokens = _get_expected_router_token_count(meta_info, output_token_ids)
+    router_token_positions = np.frombuffer(
+        pybase64.b64decode(router_token_positions_base64.encode("utf-8")),
+        dtype=np.int32,
+    )
+    router_token_positions = _validate_router_token_positions(
+        router_token_positions,
+        expected_tokens=expected_tokens,
+        request_id=request_id,
+    )
+    if router_token_positions is None:
+        return None, None, None, None
+
+    num_tokens = int(router_token_positions.size)
     hidden_size = hf_config.hidden_size
     num_layers = hf_config.num_hidden_layers
     num_experts = hf_config.num_local_experts
@@ -185,19 +316,6 @@ def _decode_router_states_from_meta_info(meta_info: dict[str, Any], *, hf_config
     router_inputs = _decode_payload(router_inputs_base64, hidden_size, "router_inputs")
     router_logits = _decode_payload(router_logits_base64, num_experts, "router_logits")
     router_bias = _decode_payload(router_bias_base64, num_experts, "router_bias")
-    router_token_positions = np.frombuffer(
-        pybase64.b64decode(router_token_positions_base64.encode("utf-8")),
-        dtype=np.int32,
-    )
-    if router_token_positions.size != num_tokens:
-        logger.warning(
-            "[SGLang] router_token_positions size mismatch for request_id=%s: expected=%s actual=%s. "
-            "Dropping router states.",
-            request_id,
-            num_tokens,
-            router_token_positions.size,
-        )
-        return None, None, None, None
     if router_inputs is None or router_logits is None or router_bias is None:
         return None, None, None, None
     return router_inputs, router_logits, router_bias, router_token_positions
@@ -504,7 +622,7 @@ class SGLangHttpServer:
                 meta_info.get("router_bias") is not None,
                 meta_info.get("router_token_positions") is not None,
             )
-        
+
         if self.config.enable_rollout_routing_replay:
             if self.config.skip_tokenizer_init:
                 routed_experts = meta_info.get("routed_experts", None)
@@ -519,30 +637,39 @@ class SGLangHttpServer:
                     )
                     if router_inputs is not None:
                         expected_tokens = _get_expected_router_token_count(meta_info, list(token_ids))
-                        router_inputs = _coerce_router_state_array(
-                            router_inputs,
-                            expected_tokens=expected_tokens,
-                            field_name="router_inputs",
-                            request_id=request_id,
-                        )
-                        router_logits = _coerce_router_state_array(
-                            router_logits,
-                            expected_tokens=expected_tokens,
-                            field_name="router_logits",
-                            request_id=request_id,
-                        )
-                        router_bias = _coerce_router_state_array(
-                            router_bias,
-                            expected_tokens=expected_tokens,
-                            field_name="router_bias",
-                            request_id=request_id,
-                        )
                         router_token_positions = _coerce_router_state_array(
                             router_token_positions,
-                            expected_tokens=expected_tokens,
+                            expected_tokens=router_token_positions.shape[0]
+                            if hasattr(router_token_positions, "shape")
+                            else expected_tokens,
                             field_name="router_token_positions",
                             request_id=request_id,
                         )
+                        router_token_positions = _validate_router_token_positions(
+                            router_token_positions,
+                            expected_tokens=expected_tokens,
+                            request_id=request_id,
+                        )
+                        actual_tokens = None if router_token_positions is None else int(router_token_positions.shape[0])
+                        if actual_tokens is not None:
+                            router_inputs = _coerce_router_state_array(
+                                router_inputs,
+                                expected_tokens=actual_tokens,
+                                field_name="router_inputs",
+                                request_id=request_id,
+                            )
+                            router_logits = _coerce_router_state_array(
+                                router_logits,
+                                expected_tokens=actual_tokens,
+                                field_name="router_logits",
+                                request_id=request_id,
+                            )
+                            router_bias = _coerce_router_state_array(
+                                router_bias,
+                                expected_tokens=actual_tokens,
+                                field_name="router_bias",
+                                request_id=request_id,
+                            )
                         if (
                             router_inputs is None
                             or router_logits is None
@@ -575,9 +702,24 @@ class SGLangHttpServer:
                         request_id=request_id,
                     )
 
+        _append_r3_trace(
+            "verl.async_sglang.generate",
+            {
+                "request_id": request_id,
+                "prompt_tokens": meta_info.get("prompt_tokens"),
+                "completion_tokens": meta_info.get("completion_tokens"),
+                "returned_router_states": router_inputs is not None,
+                "router_inputs": _array_summary(router_inputs),
+                "router_logits": _array_summary(router_logits),
+                "router_bias": _array_summary(router_bias),
+                "router_token_positions": _array_summary(router_token_positions),
+            },
+        )
+
         return TokenOutput(
             token_ids=token_ids, 
             log_probs=log_probs, 
+            router_request_id=request_id,
             routed_experts=routed_experts,
             router_inputs=router_inputs,
             router_logits=router_logits,

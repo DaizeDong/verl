@@ -67,6 +67,19 @@ class RouterPredictiveAction(Enum):
     R3_COLLECT_STATS = "r3_collect_stats"  # R3 compute_log_prob阶段：用SGLang返回的bias计算统计
 
 
+def _r3_predictive_diag_enabled() -> bool:
+    return os.getenv("VERL_DEBUG_R3_PREDICTIVE_DIAG", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _relative_l2(lhs: torch.Tensor, rhs: torch.Tensor) -> float:
+    lhs_f = lhs.detach().float()
+    rhs_f = rhs.detach().float()
+    denom = rhs_f.norm().item()
+    if denom <= 1e-12:
+        return float("inf") if lhs_f.norm().item() > 1e-12 else 0.0
+    return (lhs_f - rhs_f).norm().item() / denom
+
+
 class RouterReplay:
     """
     A class to manage the recording and replaying of MoE routing decisions.
@@ -255,6 +268,12 @@ class RouterReplay:
         if not RouterReplay.enable_logits_recording or RouterReplay.current_cache_action is None:
             return
 
+        # R2 saved bias predictor output with a singleton sequence dimension: [tokens, 1, experts].
+        # R3 stats collection receives per-layer bias from SGLang as [tokens, experts].
+        # Normalize the saved artifact to the R2 shape so downstream comparisons stay consistent.
+        if delta_logits.ndim == 2:
+            delta_logits = delta_logits.unsqueeze(1)
+
         # Move to CPU to avoid GPU memory pressure
         delta_logits_cpu = delta_logits.detach().cpu().contiguous()
 
@@ -279,22 +298,29 @@ class RouterReplay:
 
     """predictive routing replay management"""
 
-    def set_predictive_data(self, inputs: torch.Tensor, logits: torch.Tensor, valid_mask=None):
+    def set_predictive_data(self, inputs: torch.Tensor, logits: torch.Tensor, valid_mask=None, loss_scale: float = 1.0):
         """Set old inputs and logits for this layer.
         
         Args:
             inputs: Old router inputs
             logits: Old router logits
             valid_mask: Optional boolean mask of shape [total_tokens] indicating which tokens belong to valid samples
+            loss_scale: Scalar multiplier applied to predictive loss for this batch/layer.
         """
         self.recorded_old_inputs = inputs.detach() if inputs is not None else None
         self.recorded_old_logits = logits.detach() if logits is not None else None
         self.predictive_valid_mask = valid_mask.detach() if valid_mask is not None else None
+        self.predictive_loss_scale = float(loss_scale)
         # For now this is the same as record_predictive_data, as we don't have backward yet.
 
     def get_predictive_data(self):
         """Get old inputs and logits for this layer."""
-        return self.recorded_old_inputs, self.recorded_old_logits, self.predictive_valid_mask
+        return (
+            self.recorded_old_inputs,
+            self.recorded_old_logits,
+            self.predictive_valid_mask,
+            getattr(self, "predictive_loss_scale", 1.0),
+        )
 
     def record_predictive_data(self, inputs: torch.Tensor, logits: torch.Tensor):
         """Record inputs and logits for this layer (like record_indices)."""
@@ -310,6 +336,7 @@ class RouterReplay:
         self.recorded_old_inputs = None
         self.recorded_old_logits = None
         self.predictive_valid_mask = None
+        self.predictive_loss_scale = 1.0
 
     @staticmethod
     def clear_global_predictive_data():
@@ -729,7 +756,7 @@ def patched_forward(self, input: torch.Tensor):
 
                 # Apply bias correction and route
                 corrected_logits = logits + delta_logits
-                probs, routing_map = self.routing(corrected_logits)
+                probs, routing_map = self.routing(corrected_logits)  # TODO: this is inconsistent with other phases, as they use uncorrected logits
 
             elif predictive_routing_action == RouterPredictiveAction.SKIP_PREDICTIVE:
                 # PR2/PR3 Training phase ministep=0
@@ -764,7 +791,7 @@ def patched_forward(self, input: torch.Tensor):
 
                 # gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3)
                 # logger.info(f"[Predictive Routing Replay] [Memory] (layer {self.layer_number}) Total GPU memory allocated before predictive loss computation: {gpu_mem:.2f} GB, {get_system_memory_info()}")
-                old_inputs, old_logits, valid_mask = self.router_replay.get_predictive_data()
+                old_inputs, old_logits, valid_mask, predictive_loss_scale = self.router_replay.get_predictive_data()
 
                 # CRITICAL FIX: Check if we have valid data by checking tensor size (not None)
                 # Empty tensors (shape [0, ...]) are created for processes without valid samples
@@ -849,6 +876,8 @@ def patched_forward(self, input: torch.Tensor):
                     else:
                         raise ValueError(f"Invalid loss type: {self.config.bias_predictor_loss_type}")
 
+                    predictive_loss = predictive_loss * predictive_loss_scale
+
                     # Record predictive loss
                     layer_idx = self.router_replay.layer_idx if self.router_replay else 0
                     RouterReplay.record_predictive_loss(layer_idx, predictive_loss.item())
@@ -857,17 +886,74 @@ def patched_forward(self, input: torch.Tensor):
                     accuracy = calculate_topk_accuracy(topk=self.topk, logits1=old_logits + delta_logits, logits2=current_logits)
                     RouterReplay.record_predictive_topk_accuracy(layer_idx, accuracy)
 
+                    if (
+                        _r3_predictive_diag_enabled()
+                        and self.config.enable_routing_replay
+                        and self.layer_number in {1, self.config.num_layers}
+                    ):
+                        with torch.no_grad():
+                            current_logits_on_old_inputs = self.gating(old_inputs)
+                            old_topk_to_current = calculate_topk_accuracy(
+                                topk=self.topk,
+                                logits1=old_logits,
+                                logits2=current_logits,
+                            )
+                            old_topk_to_current_on_old = calculate_topk_accuracy(
+                                topk=self.topk,
+                                logits1=old_logits,
+                                logits2=current_logits_on_old_inputs,
+                            )
+                            pred_topk_to_current_on_old = calculate_topk_accuracy(
+                                topk=self.topk,
+                                logits1=old_logits + delta_logits,
+                                logits2=current_logits_on_old_inputs,
+                            )
+                            current_on_old_to_current = calculate_topk_accuracy(
+                                topk=self.topk,
+                                logits1=current_logits_on_old_inputs,
+                                logits2=current_logits,
+                            )
+                            logger.warning(
+                                "[R3PredictiveDiag] layer=%s layer_idx=%s old_tokens=%s "
+                                "acc_pred_vs_current=%.6f acc_old_vs_current=%.6f "
+                                "acc_old_vs_current_on_old_inputs=%.6f "
+                                "acc_pred_vs_current_on_old_inputs=%.6f "
+                                "acc_current_on_old_inputs_vs_current=%.6f "
+                                "input_rel_l2=%.6e logits_rel_l2_current=%.6e "
+                                "logits_rel_l2_current_on_old_inputs=%.6e "
+                                "delta_to_old_ratio=%.6e valid_mask_sum=%s predictive_loss_scale=%.6f",
+                                self.layer_number,
+                                layer_idx,
+                                int(old_logits.shape[0]),
+                                accuracy,
+                                old_topk_to_current,
+                                old_topk_to_current_on_old,
+                                pred_topk_to_current_on_old,
+                                current_on_old_to_current,
+                                _relative_l2(current_input, old_inputs),
+                                _relative_l2(current_logits, old_logits),
+                                _relative_l2(current_logits_on_old_inputs, old_logits),
+                                (torch.abs(delta_logits).mean() / (torch.abs(old_logits).mean() + 1e-10)).item(),
+                                int(valid_mask.sum().item()) if valid_mask is not None else None,
+                                predictive_loss_scale,
+                            )
+
                     # gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3)
                     # logger.info(f"[Predictive Routing Replay] [Memory] (layer {self.layer_number}) Total GPU memory allocated after predictive loss computation: {gpu_mem:.2f} GB, {get_system_memory_info()}")
                 else:
-                    # Create dummy loss for processes without valid samples
-                    # This ensures all processes participate in backward synchronization
-                    # The dummy loss has zero gradient and won't affect training
-                    dummy_param = next(self.bias_predictor.parameters())
-                    predictive_loss = (dummy_param * 0.0).sum()  # Zero loss, but in computation graph
+                    # Processes without local predictive samples still need to traverse the
+                    # bias_predictor graph. A bare `param * 0` dummy loss skips that graph
+                    # entirely, which can desynchronize long-running router/update regions at
+                    # scale when other ranks execute a real predictor forward/backward.
+                    synthetic_inputs = input.detach()
+                    synthetic_delta_logits = self.bias_predictor(synthetic_inputs)
+                    predictive_loss = (synthetic_delta_logits * 0.0).sum()
 
                     if self.layer_number == 1:
-                        logger.warning("[Predictive Routing Replay] No valid predictive data, creating dummy loss for backward sync")
+                        logger.warning(
+                            "[Predictive Routing Replay] No valid predictive data, "
+                            "creating synthetic zero-loss through bias_predictor for backward sync"
+                        )
 
                 probs, routing_map = self.routing(logits)
 

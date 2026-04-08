@@ -24,6 +24,7 @@ import hydra
 import numpy as np
 import ray
 import torch
+import torch.nn.functional as F
 from cachetools import LRUCache
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict
@@ -70,6 +71,105 @@ def _to_object_array(values: list[Any]) -> np.ndarray:
     arr = np.empty(len(values), dtype=object)
     arr[:] = values
     return arr
+
+
+def _pad_and_cat_last_dim(
+    tensors: list[torch.Tensor],
+    *,
+    pad_value: int | float = 0,
+    left_pad: bool = False,
+) -> torch.Tensor:
+    """Pad tensors on the last dimension to a common length, then concat on batch dim."""
+    if not tensors:
+        raise ValueError("Expected at least one tensor to pad and concatenate.")
+
+    max_length = max(tensor.size(-1) for tensor in tensors)
+    padded_tensors: list[torch.Tensor] = []
+    for tensor in tensors:
+        pad_size = max_length - tensor.size(-1)
+        if pad_size == 0:
+            padded_tensors.append(tensor)
+            continue
+
+        pad_config = [0, 0] * tensor.dim()
+        if left_pad:
+            pad_config[0] = pad_size
+        else:
+            pad_config[1] = pad_size
+        padded_tensors.append(F.pad(tensor, tuple(pad_config), value=pad_value))
+
+    return torch.cat(padded_tensors, dim=0)
+
+
+def _pad_and_cat_dim1(tensors: list[torch.Tensor], *, pad_value: int | float = 0) -> torch.Tensor:
+    """Pad tensors on dimension 1 to a common length, then concat on batch dim."""
+    if not tensors:
+        raise ValueError("Expected at least one tensor to pad and concatenate.")
+
+    max_length = max(tensor.size(1) for tensor in tensors)
+    padded_tensors: list[torch.Tensor] = []
+    for tensor in tensors:
+        pad_size = max_length - tensor.size(1)
+        if pad_size == 0:
+            padded_tensors.append(tensor)
+            continue
+
+        if tensor.dim() != 4:
+            raise ValueError(f"Expected routed_experts tensor to be 4D, got shape {tuple(tensor.shape)}")
+
+        pad_config = (0, 0, 0, 0, 0, pad_size, 0, 0)
+        padded_tensors.append(F.pad(tensor, pad_config, value=pad_value))
+
+    return torch.cat(padded_tensors, dim=0)
+
+
+def _pad_tensor_last_dim_to(
+    tensor: torch.Tensor,
+    target_length: int,
+    *,
+    pad_value: int | float = 0,
+    left_pad: bool = False,
+) -> torch.Tensor:
+    pad_size = target_length - tensor.size(-1)
+    if pad_size <= 0:
+        return tensor
+
+    pad_config = [0, 0] * tensor.dim()
+    if left_pad:
+        pad_config[0] = pad_size
+    else:
+        pad_config[1] = pad_size
+    return F.pad(tensor, tuple(pad_config), value=pad_value)
+
+
+def _pad_tensor_dim1_to(tensor: torch.Tensor, target_length: int, *, pad_value: int | float = 0) -> torch.Tensor:
+    pad_size = target_length - tensor.size(1)
+    if pad_size <= 0:
+        return tensor
+    if tensor.dim() != 4:
+        raise ValueError(f"Expected routed_experts tensor to be 4D, got shape {tuple(tensor.shape)}")
+    return F.pad(tensor, (0, 0, 0, 0, 0, pad_size, 0, 0), value=pad_value)
+
+
+def _normalize_dataproto_batch_for_concat(data: DataProto, *, prompt_length: int, response_length: int, seq_length: int) -> DataProto:
+    batch_data = {}
+    for key, value in data.batch.items():
+        if key == "prompts":
+            batch_data[key] = _pad_tensor_last_dim_to(value, prompt_length, left_pad=True)
+        elif key in {"responses", "response_mask", "rm_scores", "rollout_log_probs"}:
+            batch_data[key] = _pad_tensor_last_dim_to(value, response_length)
+        elif key in {"input_ids", "attention_mask", "position_ids"}:
+            batch_data[key] = _pad_tensor_last_dim_to(value, seq_length)
+        elif key == "routed_experts":
+            batch_data[key] = _pad_tensor_dim1_to(value, seq_length)
+        else:
+            batch_data[key] = value
+
+    return DataProto(
+        batch=TensorDict(batch_data, batch_size=data.batch.batch_size),
+        non_tensor_batch=data.non_tensor_batch,
+        meta_info=data.meta_info,
+    )
 
 
 def _build_rollout_replica_config(full_config: DictConfig) -> DictConfig:
@@ -172,6 +272,8 @@ class AgentLoopOutput(BaseModel):
     """Response mask, 1 for LLM generated token, 0 for tool response token."""
     response_logprobs: Optional[list[float]] = None
     """Log probabilities for the response tokens."""
+    router_request_id: Optional[str] = None
+    """Request id used by rollout backend for router-state tracing."""
     routed_experts: Optional[Any] = None
     """Routed experts for the total tokens."""
     router_inputs: Optional[Any] = None
@@ -213,6 +315,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded attention mask."""
     response_logprobs: Optional[torch.Tensor] = None
     """Padded log probabilities for the response tokens."""
+    router_request_id: Optional[str] = None
+    """Request id used by rollout backend for router-state tracing."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
     router_inputs: Optional[Any] = None
@@ -661,6 +765,7 @@ class AgentLoopWorkerBase:
             response_mask=response_mask,
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
+            router_request_id=output.router_request_id,
             routed_experts=routed_experts,
             router_inputs=router_inputs,
             router_logits=router_logits,
@@ -677,17 +782,21 @@ class AgentLoopWorkerBase:
     def _postprocess(self, inputs: list[_InternalAgentLoopOutput]) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
         # Convert lists back to tensors and stack them to create a batch.
-        prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
-        response_ids = torch.cat([input.response_ids for input in inputs], dim=0)
-        response_mask = torch.cat([input.response_mask for input in inputs], dim=0)
-        attention_mask = torch.cat([input.attention_mask for input in inputs], dim=0)
-        input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
-        position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
+        prompt_ids = _pad_and_cat_last_dim([input.prompt_ids for input in inputs], left_pad=True)
+        response_ids = _pad_and_cat_last_dim([input.response_ids for input in inputs])
+        response_mask = _pad_and_cat_last_dim([input.response_mask for input in inputs])
+        attention_mask = _pad_and_cat_last_dim([input.attention_mask for input in inputs])
+        input_ids = _pad_and_cat_last_dim([input.input_ids for input in inputs])
+        position_ids = _pad_and_cat_last_dim([input.position_ids for input in inputs])
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
-            optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
+            optional_outputs["rollout_log_probs"] = _pad_and_cat_last_dim(
+                [input.response_logprobs for input in inputs if input.response_logprobs is not None]
+            )
         if inputs[0].routed_experts is not None:
-            optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
+            optional_outputs["routed_experts"] = _pad_and_cat_dim1(
+                [input.routed_experts for input in inputs if input.routed_experts is not None]
+            )
         
         # Add router states to non_tensor_batch using 1D object arrays.
         # Each element is an unpadded numpy array: [num_tokens_i, layers, feature_dim].
@@ -708,14 +817,18 @@ class AgentLoopWorkerBase:
             bias_count, bias_shape = _summarize_router_state_list(router_bias_list)
             positions_count, positions_shape = _summarize_router_state_list(router_token_positions_list)
 
-            if inputs_count > 0:
-                non_tensor_outputs["old_inputs"] = _to_object_array(router_inputs_list)
-            if logits_count > 0:
-                non_tensor_outputs["old_logits"] = _to_object_array(router_logits_list)
-            if bias_count > 0:
-                non_tensor_outputs["old_bias"] = _to_object_array(router_bias_list)
-            if positions_count > 0:
-                non_tensor_outputs["old_token_positions"] = _to_object_array(router_token_positions_list)
+            # Always emit these keys as 1D object arrays, even when every element is None.
+            # DataProto.concat merges non-tensor fields by key across workers; omitting the
+            # key on an all-None chunk causes missing entries to be filled with top-level
+            # None, which then breaks np.concatenate during cross-worker collation.
+            non_tensor_outputs["old_inputs"] = _to_object_array(router_inputs_list)
+            non_tensor_outputs["old_logits"] = _to_object_array(router_logits_list)
+            non_tensor_outputs["old_bias"] = _to_object_array(router_bias_list)
+            non_tensor_outputs["old_token_positions"] = _to_object_array(router_token_positions_list)
+            non_tensor_outputs["router_request_id"] = np.asarray(
+                [input.router_request_id for input in inputs],
+                dtype=object,
+            )
 
             logger.info(
                 "[R3+Predictive] Agent loop router states: "
@@ -949,6 +1062,18 @@ class AgentLoopManager:
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
+        max_prompt_length = max(output.batch["prompts"].size(-1) for output in outputs)
+        max_response_length = max(output.batch["responses"].size(-1) for output in outputs)
+        max_seq_length = max(output.batch["input_ids"].size(-1) for output in outputs)
+        outputs = [
+            _normalize_dataproto_batch_for_concat(
+                output,
+                prompt_length=max_prompt_length,
+                response_length=max_response_length,
+                seq_length=max_seq_length,
+            )
+            for output in outputs
+        ]
         output = DataProto.concat(outputs)
         # Fix for Issue #4147: Always call sleep() to ensure proper cleanup
         self.sleep()

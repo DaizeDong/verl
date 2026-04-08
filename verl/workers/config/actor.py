@@ -66,6 +66,9 @@ class RouterReplayConfig(BaseConfig):
         predictive_storage_dtype (str): Data type for storing predictive data (old_inputs/old_logits).
             Options: 'fp32', 'bf16', 'fp16'. Lower precision saves memory with minimal impact on accuracy.
             Default is 'bf16' (saves 50% memory compared to fp32).
+        predictive_max_total_tokens (int): Hard cap on total predictive tokens replayed in one mini-batch.
+            When set, old_inputs/old_logits (and token positions if available) are proportionally subsampled
+            before valid_mask construction to bound predictive replay memory. Set to None to disable.
     """
 
     mode: str = "disabled"
@@ -79,6 +82,7 @@ class RouterReplayConfig(BaseConfig):
     predictive_downsample_max_len_limit: int = None
     predictive_r3_downsample_keep_rate: float = 1.0
     predictive_storage_dtype: str = "bf16"
+    predictive_max_total_tokens: int = None
 
     def __post_init__(self):
         """Validate router replay configuration."""

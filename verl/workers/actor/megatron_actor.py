@@ -20,8 +20,11 @@ Note that our model doesn't have to be `MegatronModule` because we don't share e
 """
 
 import itertools
+import json
 import logging
 import os
+import socket
+import zlib
 from functools import partial
 from typing import Iterable
 
@@ -68,6 +71,94 @@ __all__ = ["MegatronPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _predictor_sync_debug_enabled() -> bool:
+    return os.getenv("VERL_DEBUG_PREDICTOR_SYNC", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _r3_trace_enabled() -> bool:
+    return os.getenv("VERL_DEBUG_R3_TRACE", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _r3_trace_should_log() -> bool:
+    if not _r3_trace_enabled():
+        return False
+    if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return False
+    return True
+
+
+def _r3_trace_save_dir() -> str | None:
+    value = os.getenv("VERL_DEBUG_R3_TRACE_SAVE_DIR", "").strip()
+    return value or None
+
+
+def _trace_checksum(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu().contiguous()
+        if tensor.dtype == torch.bfloat16:
+            tensor = tensor.to(torch.float32)
+        array = tensor.numpy()
+    else:
+        array = np.ascontiguousarray(np.asarray(value))
+        if str(array.dtype) == "bfloat16":
+            array = array.astype(np.float32, copy=False)
+    return f"{zlib.crc32(array.tobytes()) & 0xFFFFFFFF:08x}"
+
+
+def _trace_summary(value) -> dict | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        array = value.detach().cpu().contiguous()
+        shape = list(array.shape)
+        dtype = str(array.dtype)
+    else:
+        array = np.asarray(value)
+        shape = list(array.shape)
+        dtype = str(array.dtype)
+    return {
+        "shape": shape,
+        "dtype": dtype,
+        "checksum": _trace_checksum(array),
+    }
+
+
+def _append_r3_trace(source: str, payload: dict) -> None:
+    if not _r3_trace_should_log():
+        return
+    message = json.dumps({"source": source, **payload}, sort_keys=True)
+    logger.warning("[R3Trace] %s", message)
+    save_dir = _r3_trace_save_dir()
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        trace_path = os.path.join(save_dir, f"trace-{socket.gethostname()}-{os.getpid()}.jsonl")
+        with open(trace_path, "a", encoding="utf-8") as f:
+            f.write(message + "\n")
+
+
+def _format_predictor_sync_stats(tensor: torch.Tensor) -> str:
+    tensor = tensor.detach().float()
+    return (
+        f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+        f"l2={tensor.norm().item():.6e} "
+        f"maxabs={tensor.abs().max().item():.6e} "
+        f"checksum={tensor.sum().item():.6e}"
+    )
+
+
+def _format_predictor_grad_stats(grad: torch.Tensor | None) -> str:
+    if grad is None:
+        return "grad=None"
+    grad = grad.detach().float()
+    return (
+        f"grad_l2={grad.norm().item():.6e} "
+        f"grad_maxabs={grad.abs().max().item():.6e} "
+        f"grad_checksum={grad.sum().item():.6e}"
+    )
 
 
 class MegatronPPOActor(BasePPOActor):
@@ -192,6 +283,8 @@ class MegatronPPOActor(BasePPOActor):
         config = get_model_config(self.actor_module[0])
         print(config)
         config.finalize_model_grads_func = finalize_model_grads
+        self._current_r3_trace_global_step = None
+        self._current_r3_trace_mini_step = None
 
     def _validate_config(self, config) -> None:
         """Validate config options not implemented for Megatron backend"""
@@ -220,6 +313,540 @@ class MegatronPPOActor(BasePPOActor):
                 f"Predictive routing replay field '{key}' length mismatch: "
                 f"expected {expected_len}, got {len(values)}."
             )
+
+    @staticmethod
+    def _predictive_alignment_debug_enabled() -> bool:
+        return os.getenv("VERL_DEBUG_PREDICTIVE_ALIGNMENT", "").lower() in {"1", "true", "yes", "on"}
+
+    def _iter_target_predictor_params(self):
+        if not _predictor_sync_debug_enabled() or not self.enable_bias_predictor:
+            return
+
+        target_layers = {0, max(getattr(self.hf_config, "num_hidden_layers", 1) - 1, 0)}
+        target_patterns = []
+        for layer_idx in target_layers:
+            target_patterns.extend(
+                [
+                    f"layers.{layer_idx}.mlp.router.bias_predictor.weight",
+                    f"layers.{layer_idx}.mlp.router.weight",
+                ]
+            )
+        seen = set()
+        for module_idx, module in enumerate(self.actor_module):
+            for name, param in module.named_parameters():
+                if any(pattern in name for pattern in target_patterns):
+                    key = (module_idx, name)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    yield module_idx, name, param
+
+    def _log_actor_predictor_state(self, stage: str):
+        if not _predictor_sync_debug_enabled() or not self.enable_bias_predictor:
+            return
+
+        for module_idx, name, param in self._iter_target_predictor_params():
+            main_grad = getattr(param, "main_grad", None)
+            group_info = self._find_predictor_optimizer_group(param)
+            logger.info(
+                "[PredictorSync][%s] module_idx=%s %s requires_grad=%s in_optim_group=%s group_lr=%s group_wd=%s %s %s %s",
+                stage,
+                module_idx,
+                name,
+                param.requires_grad,
+                group_info["matched"],
+                group_info["lr"],
+                group_info["weight_decay"],
+                _format_predictor_sync_stats(param.data),
+                _format_predictor_grad_stats(param.grad),
+                _format_predictor_grad_stats(main_grad),
+            )
+
+    def _find_predictor_optimizer_group(self, target_param: torch.nn.Parameter) -> dict:
+        result = {"matched": False, "lr": None, "weight_decay": None}
+        optimizer = getattr(self, "actor_optimizer", None)
+        if optimizer is None:
+            return result
+
+        try:
+            param_groups = optimizer.param_groups
+        except Exception:
+            return result
+
+        candidate_params = {target_param}
+        main_param = getattr(target_param, "main_param", None)
+        if main_param is not None:
+            candidate_params.add(main_param)
+
+        for group in param_groups:
+            for param in group.get("params", []):
+                if param in candidate_params:
+                    result["matched"] = True
+                    result["lr"] = group.get("lr")
+                    result["weight_decay"] = group.get("weight_decay")
+                    return result
+        return result
+
+    def _iter_bias_predictor_params(self):
+        if not self.enable_bias_predictor:
+            return
+
+        seen = set()
+        for module in self.actor_module:
+            for name, param in module.named_parameters():
+                if not (getattr(param, "is_bias_predictor", False) or ".bias_predictor.weight" in name):
+                    continue
+                if id(param) in seen:
+                    continue
+                seen.add(id(param))
+                yield name, param
+
+    def _clear_bias_predictor_grad_state(self, reason: str):
+        if not self.enable_bias_predictor:
+            return
+
+        cleared_param_grad = 0
+        cleared_main_grad = 0
+        cleared_main_param_grad = 0
+
+        for _, param in self._iter_bias_predictor_params():
+            if param.grad is not None:
+                param.grad = None
+                cleared_param_grad += 1
+
+            main_grad = getattr(param, "main_grad", None)
+            if main_grad is not None:
+                main_grad.zero_()
+                cleared_main_grad += 1
+
+            main_param = getattr(param, "main_param", None)
+            if main_param is not None and main_param.grad is not None:
+                main_param.grad = None
+                cleared_main_param_grad += 1
+
+        if _predictor_sync_debug_enabled():
+            logger.info(
+                "[Predictive Routing Replay] Cleared predictor grad state (%s): "
+                "param_grad=%s main_grad=%s main_param_grad=%s",
+                reason,
+                cleared_param_grad,
+                cleared_main_grad,
+                cleared_main_param_grad,
+            )
+
+    def _iter_bias_predictor_optimizer_groups(self):
+        optimizer = getattr(self, "actor_optimizer", None)
+        if optimizer is None or not self.enable_bias_predictor:
+            return
+
+        try:
+            param_groups = optimizer.param_groups
+        except Exception:
+            return
+
+        predictor_param_ids = set()
+        for _, param in self._iter_bias_predictor_params():
+            predictor_param_ids.add(id(param))
+            main_param = getattr(param, "main_param", None)
+            if main_param is not None:
+                predictor_param_ids.add(id(main_param))
+
+        matched_groups = []
+        for group in param_groups:
+            params = group.get("params", [])
+            if any(id(param) in predictor_param_ids for param in params):
+                matched_groups.append(group)
+
+        if matched_groups:
+            for group in matched_groups:
+                yield group
+            return
+
+        # Distributed optimizer may replace params with sharded optimizer tensors whose Python
+        # object identity no longer matches the model/main params. Fall back to the distinct
+        # predictor max_lr created by config_overrides.
+        positive_group_lrs = [
+            float(group.get("max_lr", group.get("lr", 0.0)))
+            for group in param_groups
+            if float(group.get("max_lr", group.get("lr", 0.0))) > 0.0
+        ]
+        if not positive_group_lrs:
+            return
+
+        base_group_lr = min(positive_group_lrs)
+        lr_ratio_threshold = max(10.0, float(self.tf_config.bias_predictor_lr_mult) / 2.0)
+        fallback_threshold = base_group_lr * lr_ratio_threshold
+        for group in param_groups:
+            group_max_lr = float(group.get("max_lr", group.get("lr", 0.0)))
+            if group_max_lr >= fallback_threshold:
+                yield group
+
+    def _set_bias_predictor_optimizer_enabled(self, enabled: bool, reason: str):
+        if not self.enable_bias_predictor:
+            return
+
+        changed_groups = 0
+        for group in self._iter_bias_predictor_optimizer_groups():
+            if enabled:
+                if "_predictor_saved_lr" in group:
+                    group["lr"] = group.pop("_predictor_saved_lr")
+                    changed_groups += 1
+            else:
+                if "_predictor_saved_lr" not in group:
+                    group["_predictor_saved_lr"] = group.get("lr", 0.0)
+                group["lr"] = 0.0
+                changed_groups += 1
+
+        if _predictor_sync_debug_enabled() and changed_groups > 0:
+            logger.info(
+                "[Predictive Routing Replay] Predictor optimizer %s (%s): groups=%s",
+                "enabled" if enabled else "disabled",
+                reason,
+                changed_groups,
+            )
+
+    def _log_r3_predictive_trace(
+        self,
+        *,
+        non_tensor_batch,
+        predictive_pair_status: str,
+        predictive_pair_count: int,
+    ) -> None:
+        if not _r3_trace_should_log():
+            return
+
+        old_inputs_list = self._normalize_non_tensor_sequence(non_tensor_batch.get("old_inputs"))
+        old_logits_list = self._normalize_non_tensor_sequence(non_tensor_batch.get("old_logits"))
+        old_bias_list = self._normalize_non_tensor_sequence(non_tensor_batch.get("old_bias"))
+        old_token_positions_list = self._normalize_non_tensor_sequence(non_tensor_batch.get("old_token_positions"))
+        router_request_ids = self._normalize_non_tensor_sequence(non_tensor_batch.get("router_request_id"))
+
+        sample_idx = None
+        for idx, (old_input, old_logit) in enumerate(zip(old_inputs_list or [], old_logits_list or [])):
+            if old_input is None or old_logit is None:
+                continue
+            if self.config.router_replay.mode == "R3" and old_token_positions_list is not None and old_token_positions_list[idx] is None:
+                continue
+            sample_idx = idx
+            break
+
+        payload = {
+            "global_step": self._current_r3_trace_global_step,
+            "mini_step": self._current_r3_trace_mini_step,
+            "predictive_pair_status": predictive_pair_status,
+            "predictive_pair_count": predictive_pair_count,
+            "sample_idx": sample_idx,
+            "request_id": (
+                None
+                if sample_idx is None or router_request_ids is None or sample_idx >= len(router_request_ids)
+                else router_request_ids[sample_idx]
+            ),
+            "old_inputs": None if sample_idx is None else _trace_summary(old_inputs_list[sample_idx]),
+            "old_logits": None if sample_idx is None else _trace_summary(old_logits_list[sample_idx]),
+            "old_bias": (
+                None
+                if sample_idx is None or old_bias_list is None or sample_idx >= len(old_bias_list)
+                else _trace_summary(old_bias_list[sample_idx])
+            ),
+            "old_token_positions": (
+                None
+                if sample_idx is None or old_token_positions_list is None or sample_idx >= len(old_token_positions_list)
+                else _trace_summary(old_token_positions_list[sample_idx])
+            ),
+        }
+        _append_r3_trace("verl.actor.forward_step.predictive_data", payload)
+
+    @classmethod
+    def _log_predictive_alignment_debug(
+        cls,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        routed_experts: torch.Tensor,
+        old_logits_list,
+        old_bias_list,
+        old_token_positions_list,
+    ) -> None:
+        if not cls._predictive_alignment_debug_enabled():
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        if routed_experts is None:
+            logger.warning("[Predictive Alignment] routed_experts is missing; skip alignment debug.")
+            return
+
+        topk = int(routed_experts.shape[-1])
+        total_pairs = 0
+        matched_pairs = 0
+        exact_matched_pairs = 0
+        corrected_matched_pairs = 0
+        corrected_exact_matched_pairs = 0
+        checked_samples = 0
+        mismatch_examples = []
+
+        for sample_idx, old_logits in enumerate(old_logits_list):
+            if old_logits is None:
+                continue
+
+            old_logits_t = torch.as_tensor(old_logits, dtype=torch.float32)
+            if old_logits_t.ndim != 3:
+                logger.warning(
+                    "[Predictive Alignment] sample=%s old_logits ndim mismatch: expected 3, got %s",
+                    sample_idx,
+                    old_logits_t.ndim,
+                )
+                continue
+
+            old_bias_t = None
+            if old_bias_list is not None and sample_idx < len(old_bias_list) and old_bias_list[sample_idx] is not None:
+                old_bias_t = torch.as_tensor(old_bias_list[sample_idx], dtype=torch.float32)
+                if old_bias_t.shape != old_logits_t.shape:
+                    logger.warning(
+                        "[Predictive Alignment] sample=%s old_bias shape mismatch: old_logits=%s old_bias=%s",
+                        sample_idx,
+                        tuple(old_logits_t.shape),
+                        tuple(old_bias_t.shape),
+                    )
+                    old_bias_t = None
+
+            if old_token_positions_list is None or old_token_positions_list[sample_idx] is None:
+                token_positions = torch.arange(old_logits_t.shape[0], dtype=torch.long)
+            else:
+                token_positions = torch.as_tensor(old_token_positions_list[sample_idx], dtype=torch.long)
+
+            valid_token_indices = attention_mask[sample_idx].nonzero(as_tuple=False).squeeze(-1).cpu()
+            if token_positions.numel() == 0:
+                continue
+            if token_positions.ndim != 1:
+                logger.warning(
+                    "[Predictive Alignment] sample=%s token_positions ndim mismatch: expected 1, got %s",
+                    sample_idx,
+                    token_positions.ndim,
+                )
+                continue
+            if old_logits_t.shape[0] != token_positions.numel():
+                logger.warning(
+                    "[Predictive Alignment] sample=%s length mismatch: old_logits=%s token_positions=%s",
+                    sample_idx,
+                    old_logits_t.shape[0],
+                    token_positions.numel(),
+                )
+                continue
+            if token_positions.numel() > valid_token_indices.numel():
+                logger.warning(
+                    "[Predictive Alignment] sample=%s token_positions exceed valid tokens: positions=%s valid=%s",
+                    sample_idx,
+                    token_positions.numel(),
+                    valid_token_indices.numel(),
+                )
+                continue
+            if torch.any(token_positions < 0) or torch.any(token_positions >= valid_token_indices.numel()):
+                logger.warning(
+                    "[Predictive Alignment] sample=%s token_positions out of range: valid=%s head=%s",
+                    sample_idx,
+                    valid_token_indices.numel(),
+                    token_positions[:8].tolist(),
+                )
+                continue
+
+            abs_positions = valid_token_indices[token_positions]
+            routed_sample = routed_experts[sample_idx, abs_positions.to(routed_experts.device)].detach().cpu().to(torch.long)
+            if routed_sample.shape[:2] != old_logits_t.shape[:2]:
+                logger.warning(
+                    "[Predictive Alignment] sample=%s shape mismatch after gather: old_logits=%s routed=%s",
+                    sample_idx,
+                    tuple(old_logits_t.shape),
+                    tuple(routed_sample.shape),
+                )
+                continue
+
+            old_topk = torch.topk(old_logits_t, k=topk, dim=-1).indices.to(torch.long)
+            set_match = torch.sort(old_topk, dim=-1).values.eq(torch.sort(routed_sample, dim=-1).values).all(dim=-1)
+            exact_match = old_topk.eq(routed_sample).all(dim=-1)
+
+            sample_total = int(set_match.numel())
+            sample_match = int(set_match.sum().item())
+            sample_exact = int(exact_match.sum().item())
+
+            corrected_topk = None
+            corrected_match = None
+            corrected_exact_match = None
+            sample_corrected_match = sample_match
+            sample_corrected_exact = sample_exact
+            if old_bias_t is not None:
+                corrected_topk = torch.topk(old_logits_t + old_bias_t, k=topk, dim=-1).indices.to(torch.long)
+                corrected_match = torch.sort(corrected_topk, dim=-1).values.eq(
+                    torch.sort(routed_sample, dim=-1).values
+                ).all(dim=-1)
+                corrected_exact_match = corrected_topk.eq(routed_sample).all(dim=-1)
+                sample_corrected_match = int(corrected_match.sum().item())
+                sample_corrected_exact = int(corrected_exact_match.sum().item())
+
+            total_pairs += sample_total
+            matched_pairs += sample_match
+            exact_matched_pairs += sample_exact
+            corrected_matched_pairs += sample_corrected_match
+            corrected_exact_matched_pairs += sample_corrected_exact
+            checked_samples += 1
+
+            monotonic_positions = bool(
+                token_positions.numel() == 0
+                or torch.equal(token_positions, torch.arange(token_positions.numel(), dtype=torch.long))
+            )
+            logger.info(
+                "[Predictive Alignment] sample=%s prebias_set=%s/%s prebias_exact=%s/%s "
+                "postbias_set=%s/%s postbias_exact=%s/%s has_bias=%s "
+                "tokens=%s layers=%s monotonic_positions=%s pos_head=%s abs_pos_head=%s token_head=%s",
+                sample_idx,
+                sample_match,
+                sample_total,
+                sample_exact,
+                sample_total,
+                sample_corrected_match,
+                sample_total,
+                sample_corrected_exact,
+                sample_total,
+                old_bias_t is not None,
+                old_logits_t.shape[0],
+                old_logits_t.shape[1],
+                monotonic_positions,
+                token_positions[:8].tolist(),
+                abs_positions[:8].tolist(),
+                input_ids[sample_idx, abs_positions[:8].to(input_ids.device)].detach().cpu().tolist(),
+            )
+
+            mismatch_mask = corrected_match if corrected_match is not None else set_match
+            topk_for_mismatch = corrected_topk if corrected_topk is not None else old_topk
+            if int(mismatch_mask.sum().item()) != sample_total and len(mismatch_examples) < 4:
+                mismatch_idx = (~mismatch_mask).nonzero(as_tuple=False)
+                for token_idx, layer_idx in mismatch_idx[:2].tolist():
+                    mismatch_examples.append(
+                        {
+                            "sample": sample_idx,
+                            "token_pos": int(token_positions[token_idx].item()),
+                            "abs_pos": int(abs_positions[token_idx].item()),
+                            "layer": int(layer_idx),
+                            "token_id": int(input_ids[sample_idx, abs_positions[token_idx]].item()),
+                            "old_topk": old_topk[token_idx, layer_idx].tolist(),
+                            "corrected_topk": topk_for_mismatch[token_idx, layer_idx].tolist(),
+                            "routed": routed_sample[token_idx, layer_idx].tolist(),
+                        }
+                    )
+
+        if checked_samples == 0:
+            logger.warning("[Predictive Alignment] No valid samples available for alignment debug.")
+            return
+
+        logger.info(
+            "[Predictive Alignment] summary checked_samples=%s prebias_set=%s/%s prebias_exact=%s/%s "
+            "postbias_set=%s/%s postbias_exact=%s/%s",
+            checked_samples,
+            matched_pairs,
+            total_pairs,
+            exact_matched_pairs,
+            total_pairs,
+            corrected_matched_pairs,
+            total_pairs,
+            corrected_exact_matched_pairs,
+            total_pairs,
+        )
+        for example in mismatch_examples:
+            logger.warning(
+                "[Predictive Alignment] mismatch sample=%s token_pos=%s abs_pos=%s layer=%s token_id=%s "
+                "old_topk=%s corrected_topk=%s routed=%s",
+                example["sample"],
+                example["token_pos"],
+                example["abs_pos"],
+                example["layer"],
+                example["token_id"],
+                example["old_topk"],
+                example["corrected_topk"],
+                example["routed"],
+            )
+
+    @classmethod
+    def _correct_r3_routed_experts_from_rollout_states(
+        cls,
+        *,
+        attention_mask: torch.Tensor,
+        routed_experts: torch.Tensor,
+        old_logits_list,
+        old_bias_list,
+        old_token_positions_list,
+    ) -> torch.Tensor:
+        """Rebuild the replay target for captured R3 tokens from rollout states.
+
+        R3 rollout returns router states with explicit token positions, but the routed_experts
+        payload is reconstructed on the rollout side without those explicit positions. When those
+        two views diverge, replaying the raw routed_experts corrupts the predictive target.
+        """
+        if routed_experts is None or old_logits_list is None or old_bias_list is None or old_token_positions_list is None:
+            return routed_experts
+
+        corrected = routed_experts.clone()
+        topk = int(corrected.shape[-1])
+        corrected_samples = 0
+        corrected_tokens = 0
+        changed_pairs = 0
+        skipped_samples = 0
+
+        for sample_idx, old_logits in enumerate(old_logits_list):
+            if sample_idx >= corrected.shape[0]:
+                break
+            if old_logits is None:
+                continue
+            if sample_idx >= len(old_bias_list) or sample_idx >= len(old_token_positions_list):
+                skipped_samples += 1
+                continue
+
+            old_bias = old_bias_list[sample_idx]
+            old_token_positions = old_token_positions_list[sample_idx]
+            if old_bias is None or old_token_positions is None:
+                continue
+
+            old_logits_t = torch.as_tensor(old_logits, dtype=torch.float32)
+            old_bias_t = torch.as_tensor(old_bias, dtype=torch.float32)
+            token_positions = torch.as_tensor(old_token_positions, dtype=torch.long)
+
+            if old_logits_t.ndim != 3 or old_bias_t.shape != old_logits_t.shape or token_positions.ndim != 1:
+                skipped_samples += 1
+                continue
+            if old_logits_t.shape[0] != token_positions.numel():
+                skipped_samples += 1
+                continue
+
+            valid_token_indices = attention_mask[sample_idx].nonzero(as_tuple=False).squeeze(-1).cpu()
+            if token_positions.numel() == 0:
+                continue
+            if token_positions.numel() > valid_token_indices.numel():
+                skipped_samples += 1
+                continue
+            if torch.any(token_positions < 0) or torch.any(token_positions >= valid_token_indices.numel()):
+                skipped_samples += 1
+                continue
+
+            abs_positions = valid_token_indices[token_positions]
+            corrected_topk = torch.topk(old_logits_t + old_bias_t, k=topk, dim=-1).indices.to(
+                device=corrected.device,
+                dtype=corrected.dtype,
+            )
+            original_topk = corrected[sample_idx, abs_positions.to(corrected.device)]
+            changed_pairs += int((original_topk != corrected_topk).any(dim=-1).sum().item())
+            corrected[sample_idx, abs_positions.to(corrected.device)] = corrected_topk
+            corrected_samples += 1
+            corrected_tokens += int(token_positions.numel())
+
+        if corrected_samples > 0:
+            logger.info(
+                "[R3+Predictive] Corrected routed_experts from rollout router states for %s samples / %s tokens "
+                "(changed_pairs=%s skipped_samples=%s)",
+                corrected_samples,
+                corrected_tokens,
+                changed_pairs,
+                skipped_samples,
+            )
+
+        return corrected
 
     @classmethod
     def _describe_router_state_field(cls, non_tensor_batch, key):
@@ -593,6 +1220,8 @@ class MegatronPPOActor(BasePPOActor):
                 non_tensor_batch_keys.append("old_bias")
             if "old_token_positions" in data.non_tensor_batch.keys():
                 non_tensor_batch_keys.append("old_token_positions")
+            if "router_request_id" in data.non_tensor_batch.keys():
+                non_tensor_batch_keys.append("router_request_id")
         
         # logger.info(f"[Memory] [make_minibatch_iterator] Before data.select(): {get_system_memory_info()}")
         if self.has_multi_modal_inputs:
@@ -666,6 +1295,7 @@ class MegatronPPOActor(BasePPOActor):
             old_inputs_list = self._normalize_non_tensor_sequence(mini_batch.non_tensor_batch.get("old_inputs"))
             old_logits_list = self._normalize_non_tensor_sequence(mini_batch.non_tensor_batch.get("old_logits"))
             old_bias_list = self._normalize_non_tensor_sequence(mini_batch.non_tensor_batch.get("old_bias"))
+            router_request_id_list = self._normalize_non_tensor_sequence(mini_batch.non_tensor_batch.get("router_request_id"))
             old_token_positions_list = self._normalize_non_tensor_sequence(
                 mini_batch.non_tensor_batch.get("old_token_positions")
             )
@@ -674,6 +1304,7 @@ class MegatronPPOActor(BasePPOActor):
             self._validate_non_tensor_sequence_length(old_inputs_list, batch_size, "old_inputs")
             self._validate_non_tensor_sequence_length(old_logits_list, batch_size, "old_logits")
             self._validate_non_tensor_sequence_length(old_bias_list, batch_size, "old_bias")
+            self._validate_non_tensor_sequence_length(router_request_id_list, batch_size, "router_request_id")
             self._validate_non_tensor_sequence_length(old_token_positions_list, batch_size, "old_token_positions")
 
             if (
@@ -713,18 +1344,35 @@ class MegatronPPOActor(BasePPOActor):
                         micro_batches[i].non_tensor_batch["old_token_positions"] = [
                             old_token_positions_list[idx] for idx in batch_idx
                         ]
+                    if router_request_id_list is not None:
+                        micro_batches[i].non_tensor_batch["router_request_id"] = [
+                            router_request_id_list[idx] for idx in batch_idx
+                        ]
             else:
                 raise ValueError("Indices must be provided for dynamic batching")
-        
+
         if use_dynamic_bsz:
             assert max_token_len is not None, "max_token_len must be set when use_dynamic_bsz is True"
+            effective_max_token_len = max_token_len
+            input_ids = mini_batch.batch["input_ids"]
+            if input_ids.is_nested:
+                current_max_seq_len = int(input_ids.offsets().diff().max().item())
+            else:
+                current_max_seq_len = int(mini_batch.batch["attention_mask"].shape[-1])
+            if effective_max_token_len < current_max_seq_len:
+                logger.warning(
+                    "[Dynamic Batch] Raised max_token_len for current mini_batch because the observed sequence "
+                    f"length exceeded the configured cap: configured={effective_max_token_len}, "
+                    f"observed={current_max_seq_len}"
+                )
+                effective_max_token_len = current_max_seq_len
             vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
             if vpp_size is not None and vpp_size > 1:
                 microbatch_group_size_per_vp_stage = self.tf_config.microbatch_group_size_per_vp_stage
                 micro_batches_td, indices = rearrange_micro_batches(
                     batch=mini_batch.batch,
                     num_batches_divided_by=microbatch_group_size_per_vp_stage,
-                    max_token_len=max_token_len,
+                    max_token_len=effective_max_token_len,
                 )
                 
                 # Wrap TensorDicts in DataProto
@@ -740,7 +1388,9 @@ class MegatronPPOActor(BasePPOActor):
                     f"{microbatch_group_size_per_vp_stage} for megatron backend"
                 )
             else:
-                micro_batches_td, indices = rearrange_micro_batches(batch=mini_batch.batch, max_token_len=max_token_len)
+                micro_batches_td, indices = rearrange_micro_batches(
+                    batch=mini_batch.batch, max_token_len=effective_max_token_len
+                )
                 
                 # Wrap TensorDicts in DataProto
                 micro_batches = [
@@ -750,7 +1400,7 @@ class MegatronPPOActor(BasePPOActor):
                 
                 # Add non_tensor_batch data to each micro_batch
                 _add_non_tensor_batch_to_micro_batches(micro_batches, mini_batch, indices=indices)
-            total_seqlen = max_token_len
+            total_seqlen = effective_max_token_len
         else:
             assert micro_batch_size is not None, (
                 "micro_batch_size is needed to be passed in when not using dynamic batch size"
@@ -945,7 +1595,7 @@ class MegatronPPOActor(BasePPOActor):
             if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
                 # R3 mode: use routed_experts if available
                 layers_topk_idx = batch.batch["routed_experts"]
-                set_router_replay_data(layers_topk_idx, attention_mask, self.tf_config, vp_rank)
+                replay_layers_topk_idx = layers_topk_idx
 
                 if RouterReplayHelper.is_predictive_compute_loss_action(self.tf_config, vp_rank):
                     predictive_pair_status, predictive_pair_count, old_inputs_list, old_logits_list, old_token_positions_list = (
@@ -959,6 +1609,36 @@ class MegatronPPOActor(BasePPOActor):
                     # R3 mode: router states come from rollout.
                     # R2 mode: router states come from log_prob phase.
                     if predictive_pair_status == "valid":
+                        old_bias_list = batch.non_tensor_batch.get("old_bias")
+                        router_request_id_list = self._normalize_non_tensor_sequence(
+                            batch.non_tensor_batch.get("router_request_id")
+                        )
+                        if self.config.router_replay.mode == "R3":
+                            old_bias_list_normalized = self._normalize_non_tensor_sequence(old_bias_list)
+                            # R3 rollout router states are position-aware; routed_experts may not be.
+                            # Rebuild the replay top-k for the captured token positions before replay.
+                            replay_layers_topk_idx = self._correct_r3_routed_experts_from_rollout_states(
+                                attention_mask=attention_mask,
+                                routed_experts=layers_topk_idx,
+                                old_logits_list=old_logits_list,
+                                old_bias_list=old_bias_list_normalized,
+                                old_token_positions_list=old_token_positions_list,
+                            )
+                        self._log_predictive_alignment_debug(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            routed_experts=replay_layers_topk_idx,
+                            old_logits_list=old_logits_list,
+                            old_bias_list=old_bias_list,
+                            old_token_positions_list=(
+                                old_token_positions_list if self.config.router_replay.mode == "R3" else None
+                            ),
+                        )
+                        self._log_r3_predictive_trace(
+                            non_tensor_batch=batch.non_tensor_batch,
+                            predictive_pair_status=predictive_pair_status,
+                            predictive_pair_count=predictive_pair_count,
+                        )
                         set_router_predictive_data(
                             old_inputs_list,
                             old_logits_list,
@@ -967,6 +1647,14 @@ class MegatronPPOActor(BasePPOActor):
                             vp_rank,
                             old_token_positions_list=(
                                 old_token_positions_list if self.config.router_replay.mode == "R3" else None
+                            ),
+                            router_request_ids=router_request_id_list,
+                            global_step=self._current_r3_trace_global_step,
+                            mini_step=self._current_r3_trace_mini_step,
+                            max_total_tokens=getattr(
+                                self.config.router_replay,
+                                "predictive_max_total_tokens",
+                                None,
                             ),
                         )
                         if self.config.router_replay.mode == "R3":
@@ -980,6 +1668,11 @@ class MegatronPPOActor(BasePPOActor):
                                 f"for {predictive_pair_count}/{attention_mask.size(0)} samples"
                             )
                     else:
+                        self._log_r3_predictive_trace(
+                            non_tensor_batch=batch.non_tensor_batch,
+                            predictive_pair_status=predictive_pair_status,
+                            predictive_pair_count=predictive_pair_count,
+                        )
                         RouterReplay.clear_global_predictive_data()
                         if predictive_pair_status == "missing":
                             logger.info(
@@ -1001,6 +1694,15 @@ class MegatronPPOActor(BasePPOActor):
                                 "[Predictive Routing Replay] old_inputs/old_logits are present but all samples are empty; "
                                 "cleared predictive replay state."
                             )
+
+                # `set_router_replay_data()` also appends to the backward replay queue, so
+                # we must call it exactly once per micro-batch after finalizing replay_layers_topk_idx.
+                set_router_replay_data(
+                    replay_layers_topk_idx,
+                    attention_mask,
+                    self.tf_config,
+                    vp_rank,
+                )
 
             # R3_COLLECT_STATS: load old_bias per layer for bias ratio statistics
             if RouterReplayHelper.is_r3_collect_stats_action(self.tf_config, vp_rank):
@@ -1267,6 +1969,9 @@ class MegatronPPOActor(BasePPOActor):
         for mini_step, data in enumerate(dataloader):
             # logger.info(f"[Memory] [update_policy] Mini step {mini_step} START (after dataloader.next()): {get_system_memory_info()}")
             logger.info(f"[Data] [update_policy] Mini step {mini_step}, batch size: {data.batch['input_ids'].size(0)}")
+            self._current_r3_trace_global_step = step_for_save
+            self._current_r3_trace_mini_step = mini_step
+            predictive_pair_status = None
 
             # OPTIMIZATION: Mini-step 0 uses SKIP_PREDICTIVE, doesn't need old_inputs/old_logits
             # Remove them to save memory during forward/backward
@@ -1290,10 +1995,23 @@ class MegatronPPOActor(BasePPOActor):
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
                 # Set predictive action based on ministep
+                predictive_pair_count = 0
                 if self.config.router_replay.enable_bias_predictor:
                     if mini_step == 0:  # First ministep: skip predictive loss
                         RouterReplay.set_global_predictive_action(RouterPredictiveAction.SKIP_PREDICTIVE)
                         logger.info("[Predictive Routing Replay] Mini-step 0: set action=SKIP_PREDICTIVE.")
+                        predictive_pair_status = "skip_predictive"
+                    elif self.config.router_replay.mode == "R3" and mini_step > 1:
+                        # R3 predictor targets come from rollout-side router states captured before the
+                        # actor update. Reusing the same stale targets on later mini-steps quickly makes
+                        # the predictor over-correct once its weights become non-zero.
+                        RouterReplay.set_global_predictive_action(RouterPredictiveAction.SKIP_PREDICTIVE)
+                        predictive_pair_status = "skip_predictive_r3_extra_ministep"
+                        logger.info(
+                            "[Predictive Routing Replay] Mini-step "
+                            f"{mini_step}: R3 restricts predictive loss to mini-step 1; "
+                            "set action=SKIP_PREDICTIVE."
+                        )
                     else:  # Later ministeps: compute predictive loss
                         predictive_pair_status, predictive_pair_count, _, _, _ = self._describe_predictive_pair(
                             data.non_tensor_batch,
@@ -1301,13 +2019,24 @@ class MegatronPPOActor(BasePPOActor):
                         )
                         if mini_step > 1:
                             logger.warning(f"[Predictive Router Replay] Mini-step {mini_step}: More than 2 mini-steps detected. Mathematically this may lead to sub-optimal optimization for bias predictors due to inconsistent training objective across different mini-steps. However this is not explicitly forbidden and would still work in practice.")
-                        if predictive_pair_status == "valid":
+                        if predictive_pair_status in ("valid", "all_none"):
+                            # Keep all ranks on the predictive-loss path once the paired fields are present.
+                            # Ranks without local valid samples will build a dummy predictive loss inside the
+                            # router patch so DeepEP / EP collectives stay synchronized.
                             RouterReplay.set_global_predictive_action(RouterPredictiveAction.COMPUTE_PREDICTIVE_LOSS)
-                            logger.info(
-                                "[Predictive Routing Replay] Mini-step "
-                                f"{mini_step}: set action=COMPUTE_PREDICTIVE_LOSS with "
-                                f"{predictive_pair_count}/{data.batch['input_ids'].size(0)} valid samples."
-                            )
+                            if predictive_pair_status == "valid":
+                                logger.info(
+                                    "[Predictive Routing Replay] Mini-step "
+                                    f"{mini_step}: set action=COMPUTE_PREDICTIVE_LOSS with "
+                                    f"{predictive_pair_count}/{data.batch['input_ids'].size(0)} valid samples."
+                                )
+                            else:
+                                logger.info(
+                                    "[Predictive Routing Replay] Mini-step "
+                                    f"{mini_step}: set action=COMPUTE_PREDICTIVE_LOSS with "
+                                    f"{predictive_pair_count}/{data.batch['input_ids'].size(0)} valid samples; "
+                                    "local router layers will use dummy predictive loss for sync."
+                                )
                         else:
                             RouterReplay.set_global_predictive_action(RouterPredictiveAction.SKIP_PREDICTIVE)
                             if predictive_pair_status == "missing":
@@ -1328,15 +2057,32 @@ class MegatronPPOActor(BasePPOActor):
                             else:
                                 logger.warning(
                                     f"[Predictive Routing Replay] Mini-step {mini_step}: "
-                                    "old_inputs/old_logits are present but all samples are empty; "
+                                    f"unexpected predictive_pair_status={predictive_pair_status}; "
                                     "fallback to SKIP_PREDICTIVE."
                                 )
+                if self.config.router_replay.enable_bias_predictor:
+                    _append_r3_trace(
+                        "verl.actor.update_policy",
+                        {
+                            "global_step": step_for_save,
+                            "mini_step": mini_step,
+                            "predictive_pair_status": predictive_pair_status,
+                            "predictive_pair_count": predictive_pair_count,
+                            "batch_size": int(data.batch["input_ids"].size(0)),
+                            "uses_dummy_loss_local": predictive_pair_status == "all_none",
+                        },
+                    )
 
             self.actor_optimizer.zero_grad()
             # use use_contiguous_buffers_in_local_ddp and no overlap_dp_param_comm
             for chunk in self.actor_module:
                 # if use distributed optimizer, zero grad buffer will be handled by optimizer
                 chunk.zero_grad_buffer()
+            if self.config.router_replay.enable_bias_predictor:
+                # Predictive loss performs its own backward() inside the router patch. Clear the
+                # predictor grad state explicitly so stale main_grad buffers from the previous
+                # mini-step/global-step cannot be consumed by this optimizer.step().
+                self._clear_bias_predictor_grad_state(reason=f"mini_step_{mini_step}_pre_forward")
 
             calculate_entropy = self.config.entropy_coeff != 0
             if data.meta_info.get("micro_batch_size", None) is not None:
@@ -1346,18 +2092,52 @@ class MegatronPPOActor(BasePPOActor):
             max_token_len = None
             if self.config.use_dynamic_bsz:
                 max_token_len = self.config.ppo_max_token_len_per_gpu * self.config.megatron.context_parallel_size
-            metric_micro_batch = self.forward_backward_batch(
-                data,
-                calculate_entropy=calculate_entropy,
-                use_dynamic_bsz=self.config.use_dynamic_bsz,
-                micro_batch_size=micro_batch_size,
-                max_token_len=max_token_len,
-                mini_batch_size=self.config.ppo_mini_batch_size,
-            )
+            try:
+                metric_micro_batch = self.forward_backward_batch(
+                    data,
+                    calculate_entropy=calculate_entropy,
+                    use_dynamic_bsz=self.config.use_dynamic_bsz,
+                    micro_batch_size=micro_batch_size,
+                    max_token_len=max_token_len,
+                    mini_batch_size=self.config.ppo_mini_batch_size,
+                )
+            finally:
+                self._current_r3_trace_global_step = None
+                self._current_r3_trace_mini_step = None
             metric_micro_batch = metric_micro_batch["output"]
             for metric in metric_micro_batch:
                 # Note that o[0] is metrics, o[1] is entropy, o[2] is response_mask
                 append_to_dict(metrics, metric[0])  # append the metric from this micro-batch to global metrics.
+
+            predictor_optimizer_should_step = (
+                self.config.router_replay.enable_bias_predictor
+                and predictive_pair_status in {"valid", "all_none"}
+            )
+            if self.config.router_replay.enable_bias_predictor:
+                # Skip mini-steps must not update predictor weights, even if Adam moments from a
+                # previous predictive step are still present. Temporarily zero the predictor
+                # param-group lr on those steps and restore it on the actual predictive step.
+                self._set_bias_predictor_optimizer_enabled(
+                    enabled=predictor_optimizer_should_step,
+                    reason=f"mini_step_{mini_step}_action_{predictive_pair_status}",
+                )
+
+            if mini_step > 0 and self.config.router_replay.enable_bias_predictor:
+                self._log_actor_predictor_state("actor-live-before-step")
+
+            if self.config.router_replay.enable_bias_predictor and predictive_pair_status in {
+                "skip_predictive",
+                "skip_predictive_r3_extra_ministep",
+                "missing",
+                "missing_positions",
+                "partial",
+            }:
+                # When predictive loss is skipped, the predictor should not move at all.
+                # Explicitly scrub any stale gradients that survived outside the normal PPO
+                # backward path before optimizer.step().
+                self._clear_bias_predictor_grad_state(
+                    reason=f"mini_step_{mini_step}_pre_step_action_{predictive_pair_status}"
+                )
 
             # logger.info(f"[Memory] [update_policy] Before optimizer.step(): {get_system_memory_info()}")
             # if torch.cuda.is_available():
@@ -1366,6 +2146,9 @@ class MegatronPPOActor(BasePPOActor):
             #     logger.info(f"[GPU Memory] Before optimizer.step() - Allocated: {gpu_mem:.2f}GB, Reserved: {gpu_reserved:.2f}GB")
             
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
+
+            if mini_step > 0 and self.config.router_replay.enable_bias_predictor:
+                self._log_actor_predictor_state("actor-live-after-step")
             
             # logger.info(f"[Memory] [update_policy] After optimizer.step(): {get_system_memory_info()}, grad_norm={grad_norm}")
             # if torch.cuda.is_available():

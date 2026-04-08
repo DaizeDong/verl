@@ -129,3 +129,4 @@ router_replay:
   predictive_downsample_batch_size: null
   predictive_downsample_max_len_limit: null
   predictive_storage_dtype: bf16
+  predictive_r3_downsample_keep_rate: 1.0

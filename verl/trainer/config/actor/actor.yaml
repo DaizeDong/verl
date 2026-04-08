@@ -249,4 +249,6 @@ router_replay:
   bias_predictor_lr_mult: 1000.0
   predictive_downsample_batch_size: null
   predictive_downsample_max_len_limit: null
+  predictive_r3_downsample_keep_rate: 1.0
   predictive_storage_dtype: bf16
+  predictive_max_total_tokens: null

@@ -35,6 +35,8 @@ class TokenOutput(BaseModel):
     """response token ids"""
     log_probs: Optional[list[float]] = None
     """logprobs of response token ids"""
+    router_request_id: Optional[str] = None
+    """request id used by rollout backend for router-state tracing"""
     routed_experts: Optional[Any] = None
     """routed experts of response token ids"""
     router_inputs: Optional[Any] = None

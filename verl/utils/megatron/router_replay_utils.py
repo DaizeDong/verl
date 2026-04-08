@@ -17,6 +17,9 @@ Router Replay Utilities
 Utilities for handling router replay functionality in Megatron models.
 """
 import os
+import json
+import socket
+import zlib
 
 import logging
 
@@ -53,6 +56,71 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+def _debug_r3_trace_enabled() -> bool:
+    return os.getenv("VERL_DEBUG_R3_TRACE", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_r3_trace_save_dir() -> Optional[str]:
+    value = os.getenv("VERL_DEBUG_R3_TRACE_SAVE_DIR", "").strip()
+    return value or None
+
+
+def _checksum_value(value) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu().contiguous()
+        if tensor.dtype == torch.bfloat16:
+            tensor = tensor.to(torch.float32)
+        array = tensor.numpy()
+    else:
+        array = np.ascontiguousarray(np.asarray(value))
+        if str(array.dtype) == "bfloat16":
+            array = array.astype(np.float32, copy=False)
+    return f"{zlib.crc32(array.tobytes()) & 0xFFFFFFFF:08x}"
+
+
+def _summary_value(value) -> Optional[dict]:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        array = value.detach().cpu().contiguous()
+        shape = list(array.shape)
+        dtype = str(array.dtype)
+    else:
+        array = np.asarray(value)
+        shape = list(array.shape)
+        dtype = str(array.dtype)
+    return {
+        "shape": shape,
+        "dtype": dtype,
+        "checksum": _checksum_value(array),
+    }
+
+
+def _append_r3_trace(source: str, payload: dict) -> None:
+    if not _debug_r3_trace_enabled():
+        return
+    if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    message = json.dumps({"source": source, **payload}, sort_keys=True)
+    logger.warning("[R3Trace] %s", message)
+    save_dir = _debug_r3_trace_save_dir()
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        trace_path = os.path.join(save_dir, f"trace-{socket.gethostname()}-{os.getpid()}.jsonl")
+        with open(trace_path, "a", encoding="utf-8") as f:
+            f.write(message + "\n")
+
+
+def _save_r3_trace_pt(filename: str, payload: dict) -> None:
+    save_dir = _debug_r3_trace_save_dir()
+    if not _debug_r3_trace_enabled() or not save_dir:
+        return
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(payload, os.path.join(save_dir, filename))
 
 
 def _get_system_memory_info():
@@ -282,46 +350,47 @@ def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_lis
         None: The function has side effects only; it appends a tensor of shape
         [1, dynamic_bs_all, layer_num, topk] to mini_layer_topk_idx_list.
     """
-    with torch.no_grad():
-        print(f"Packing router top-k indices for vp_rank={vp_rank}")
-        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
-        layers_topk_idx = []
-        for router in router_instances_list:
-            layers_topk_idx.append(router.recorded_topk_idx.to(torch.uint8))  # dynamic_bs, topk
+    print(f"Packing router top-k indices for vp_rank={vp_rank}")
+    router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+    layers_topk_idx = []
+    for router in router_instances_list:
+        layers_topk_idx.append(router.recorded_topk_idx.to(torch.uint8))  # dynamic_bs, topk
 
-        # layer_num, dynamic_bs, topk  -> dynamic_bs, layer_num, topk
-        # print(f"Shape of layers_topk_idx before gather: {layers_topk_idx[0].shape}, total layers: {len(layers_topk_idx)}")
-        layers_topk_idx = torch.stack(layers_topk_idx).permute(1, 0, 2).to(device_name)
-        # dynamic_bs, layer_num, topk -> 1, dynamic_bs_all, layer_num, topk
-        layers_topk_idx = (
-            gather_from_sequence_parallel_region(layers_topk_idx, tensor_parallel_output_grad=False)
-            .unsqueeze(0)
-            .contiguous()
-        )
-        # print(f"Shape of layers_topk_idx after gather: {layers_topk_idx.shape}")
+    # layer_num, dynamic_bs, topk  -> dynamic_bs, layer_num, topk
+    # print(f"Shape of layers_topk_idx before gather: {layers_topk_idx[0].shape}, total layers: {len(layers_topk_idx)}")
+    layers_topk_idx = torch.stack(layers_topk_idx).permute(1, 0, 2).to(device_name)
+    # dynamic_bs, layer_num, topk -> 1, dynamic_bs_all, layer_num, topk
+    layers_topk_idx = (
+        gather_from_sequence_parallel_region(layers_topk_idx, tensor_parallel_output_grad=False)
+        .unsqueeze(0)
+        .contiguous()
+    )
+    # print(f"Shape of layers_topk_idx after gather: {layers_topk_idx.shape}")
 
-        batch_size, seq_len = attention_mask.shape[:2]
-        if packed_seq_params is None:
-            _, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=True)
-        layers_topk_idx = postprocess_packed_seqs(
-            layers_topk_idx, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True
-        )
-        # print(f"Shape of layers_topk_idx after postprocess: {layers_topk_idx.shape}")
-        # Move to CPU and explicitly delete GPU tensor
-        cpu_topk_idx = layers_topk_idx.cpu()
-        mini_layer_topk_idx_list.append(cpu_topk_idx)
-        
-        # Explicitly delete GPU tensors to free memory
-        del layers_topk_idx
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    batch_size, seq_len = attention_mask.shape[:2]
+    if packed_seq_params is None:
+        _, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=True)
+    layers_topk_idx = postprocess_packed_seqs(
+        layers_topk_idx, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True
+    )
+    # print(f"Shape of layers_topk_idx after postprocess: {layers_topk_idx.shape}")
 
-        # Clear recorded topk indices from router instances to free GPU memory
-        for router in router_instances_list:
-            router.recorded_topk_idx = None
+    # Move to CPU and explicitly delete GPU tensor
+    mini_layer_topk_idx_list.append(layers_topk_idx.cpu())
+
+    # Explicitly delete GPU tensors to free memory
+    del layers_topk_idx
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Clear recorded topk indices from router instances to free GPU memory
+    for router in router_instances_list:
+        router.recorded_topk_idx = None
 
     return packed_seq_params
 
+
+@torch.no_grad()
 def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=None):
     """
     Scatter the packed router top-k indices back to sequence-parallel ranks and update each local
@@ -341,24 +410,24 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
     Returns:
         None: The function updates internal RouterReplay instances in-place.
     """
-    with torch.no_grad():
-        layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
-        layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()  # 1, dynamic_bs_all, layer_num, topk
+    layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
+    layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()  # 1, dynamic_bs_all, layer_num, topk
 
-        # 1, dynamic_bs_split, layer_num, topk
-        layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
-            layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
-        ).unsqueeze(dim=0)
+    # 1, dynamic_bs_split, layer_num, topk
+    layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
+        layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
+    ).unsqueeze(dim=0)
 
-        # dynamic_bs_split, layer_num, topk -> layer_num, dynamic_bs_split, topk
-        layers_topk_idx_reshape = layers_topk_idx_rmpad_split.permute(0, 2, 1, 3).squeeze(
-            dim=0
-        )  # layer_num, dynamic_bs_all, topk
-        local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
-        offset, _ = local_rank_info["start"], local_rank_info["end"]
-        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
-        for i, router in enumerate(router_instances_list):
-            router.set_target_indices(layers_topk_idx_reshape[i + offset].to(torch.int64))
+    # dynamic_bs_split, layer_num, topk -> layer_num, dynamic_bs_split, topk
+    layers_topk_idx_reshape = layers_topk_idx_rmpad_split.permute(0, 2, 1, 3).squeeze(
+        dim=0
+    )  # layer_num, dynamic_bs_all, topk
+
+    local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
+    offset, _ = local_rank_info["start"], local_rank_info["end"]
+    router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+    for i, router in enumerate(router_instances_list):
+        router.set_target_indices(layers_topk_idx_reshape[i + offset].to(torch.int64))
 
 
 @torch.no_grad()
@@ -598,6 +667,10 @@ def set_router_predictive_data(
     tf_config,
     vp_rank=None,
     old_token_positions_list=None,
+    router_request_ids=None,
+    global_step=None,
+    mini_step=None,
+    max_total_tokens=None,
 ):
     """
     NEW: Simplified version that works with unpacked data (list of variable-shape tensors).
@@ -616,6 +689,8 @@ def set_router_predictive_data(
         old_logits_list = list(old_logits_list)
     if isinstance(old_token_positions_list, np.ndarray):
         old_token_positions_list = list(old_token_positions_list)
+    if isinstance(router_request_ids, np.ndarray):
+        router_request_ids = list(router_request_ids)
 
     # logger.info(f"old_inputs_list: type {type(old_inputs_list)}, length {len(old_inputs_list) if isinstance(old_inputs_list, list) else 'N/A'}")
     # if isinstance(old_inputs_list, list) and len(old_inputs_list) > 0 and old_inputs_list[0] is not None:
@@ -626,6 +701,7 @@ def set_router_predictive_data(
     valid_old_inputs = []
     valid_old_logits = []
     valid_old_token_positions = []
+    valid_router_request_ids = []
     seq_lens = attention_mask.sum(dim=1, dtype=torch.int32).tolist()
     for i, (old_input, old_logit) in enumerate(zip(old_inputs_list, old_logits_list)):
         if old_input is not None and old_logit is not None:
@@ -643,6 +719,18 @@ def set_router_predictive_data(
                     old_input.shape[0],
                     old_logit.shape[0],
                 )
+                _save_r3_trace_pt(
+                    f"trace-step{global_step}-mini{mini_step}-sample{i}-length-mismatch.pt",
+                    {
+                        "reason": "old_inputs_old_logits_length_mismatch",
+                        "global_step": global_step,
+                        "mini_step": mini_step,
+                        "sample_idx": i,
+                        "request_id": None if router_request_ids is None or i >= len(router_request_ids) else router_request_ids[i],
+                        "old_input": torch.from_numpy(old_input.copy()),
+                        "old_logit": torch.from_numpy(old_logit.copy()),
+                    },
+                )
                 continue
 
             old_token_positions = None
@@ -653,6 +741,18 @@ def set_router_predictive_data(
                         "Dropping predictive data for this sample.",
                         i,
                     )
+                    _save_r3_trace_pt(
+                        f"trace-step{global_step}-mini{mini_step}-sample{i}-missing-positions.pt",
+                        {
+                            "reason": "missing_old_token_positions",
+                            "global_step": global_step,
+                            "mini_step": mini_step,
+                            "sample_idx": i,
+                            "request_id": None if router_request_ids is None or i >= len(router_request_ids) else router_request_ids[i],
+                            "old_input": torch.from_numpy(old_input.copy()),
+                            "old_logit": torch.from_numpy(old_logit.copy()),
+                        },
+                    )
                     continue
                 old_token_positions = _to_numpy_array(old_token_positions_list[i], dtype=np.int32)
                 if old_token_positions is None:
@@ -660,6 +760,18 @@ def set_router_predictive_data(
                         "[Predictive Routing Replay] old_token_positions is None for sample %s while positions are required. "
                         "Dropping predictive data for this sample.",
                         i,
+                    )
+                    _save_r3_trace_pt(
+                        f"trace-step{global_step}-mini{mini_step}-sample{i}-positions-none.pt",
+                        {
+                            "reason": "old_token_positions_none",
+                            "global_step": global_step,
+                            "mini_step": mini_step,
+                            "sample_idx": i,
+                            "request_id": None if router_request_ids is None or i >= len(router_request_ids) else router_request_ids[i],
+                            "old_input": torch.from_numpy(old_input.copy()),
+                            "old_logit": torch.from_numpy(old_logit.copy()),
+                        },
                     )
                     continue
                 if len(old_token_positions.shape) != 1:
@@ -669,6 +781,19 @@ def set_router_predictive_data(
                         i,
                         old_token_positions.shape,
                     )
+                    _save_r3_trace_pt(
+                        f"trace-step{global_step}-mini{mini_step}-sample{i}-positions-ndim.pt",
+                        {
+                            "reason": "old_token_positions_ndim_mismatch",
+                            "global_step": global_step,
+                            "mini_step": mini_step,
+                            "sample_idx": i,
+                            "request_id": None if router_request_ids is None or i >= len(router_request_ids) else router_request_ids[i],
+                            "old_input": torch.from_numpy(old_input.copy()),
+                            "old_logit": torch.from_numpy(old_logit.copy()),
+                            "old_token_positions": torch.from_numpy(old_token_positions.copy()),
+                        },
+                    )
                     continue
                 if old_token_positions.shape[0] != old_input.shape[0]:
                     logger.warning(
@@ -677,6 +802,19 @@ def set_router_predictive_data(
                         i,
                         old_token_positions.shape[0],
                         old_input.shape[0],
+                    )
+                    _save_r3_trace_pt(
+                        f"trace-step{global_step}-mini{mini_step}-sample{i}-positions-length.pt",
+                        {
+                            "reason": "old_token_positions_length_mismatch",
+                            "global_step": global_step,
+                            "mini_step": mini_step,
+                            "sample_idx": i,
+                            "request_id": None if router_request_ids is None or i >= len(router_request_ids) else router_request_ids[i],
+                            "old_input": torch.from_numpy(old_input.copy()),
+                            "old_logit": torch.from_numpy(old_logit.copy()),
+                            "old_token_positions": torch.from_numpy(old_token_positions.copy()),
+                        },
                     )
                     continue
                 sample_seq_len = int(seq_lens[i])
@@ -688,12 +826,39 @@ def set_router_predictive_data(
                         sample_seq_len,
                         old_token_positions[:8].tolist(),
                     )
+                    _save_r3_trace_pt(
+                        f"trace-step{global_step}-mini{mini_step}-sample{i}-positions-range.pt",
+                        {
+                            "reason": "old_token_positions_out_of_range",
+                            "global_step": global_step,
+                            "mini_step": mini_step,
+                            "sample_idx": i,
+                            "request_id": None if router_request_ids is None or i >= len(router_request_ids) else router_request_ids[i],
+                            "sample_seq_len": sample_seq_len,
+                            "old_input": torch.from_numpy(old_input.copy()),
+                            "old_logit": torch.from_numpy(old_logit.copy()),
+                            "old_token_positions": torch.from_numpy(old_token_positions.copy()),
+                        },
+                    )
                     continue
                 if np.unique(old_token_positions).shape[0] != old_token_positions.shape[0]:
                     logger.warning(
                         "[Predictive Routing Replay] old_token_positions contains duplicates for sample %s. "
                         "Dropping predictive data for this sample.",
                         i,
+                    )
+                    _save_r3_trace_pt(
+                        f"trace-step{global_step}-mini{mini_step}-sample{i}-positions-duplicate.pt",
+                        {
+                            "reason": "old_token_positions_duplicate",
+                            "global_step": global_step,
+                            "mini_step": mini_step,
+                            "sample_idx": i,
+                            "request_id": None if router_request_ids is None or i >= len(router_request_ids) else router_request_ids[i],
+                            "old_input": torch.from_numpy(old_input.copy()),
+                            "old_logit": torch.from_numpy(old_logit.copy()),
+                            "old_token_positions": torch.from_numpy(old_token_positions.copy()),
+                        },
                     )
                     continue
 
@@ -702,9 +867,108 @@ def set_router_predictive_data(
             valid_old_logits.append(torch.from_numpy(old_logit.copy()))
             if old_token_positions is not None:
                 valid_old_token_positions.append(torch.from_numpy(old_token_positions.copy()))
+            if router_request_ids is not None and i < len(router_request_ids):
+                valid_router_request_ids.append(router_request_ids[i])
+            else:
+                valid_router_request_ids.append(None)
     del old_inputs_list, old_logits_list, old_token_positions_list  # Free memory
 
+    def _allocate_balanced_keep_counts(lengths, max_tokens):
+        total_tokens = sum(lengths)
+        if max_tokens is None or max_tokens <= 0 or total_tokens <= max_tokens:
+            return list(lengths)
+
+        keep_counts = [0 for _ in lengths]
+        remaining_lengths = list(lengths)
+        remaining_tokens = int(max_tokens)
+        active_indices = [idx for idx, length in enumerate(remaining_lengths) if length > 0]
+
+        while remaining_tokens > 0 and active_indices:
+            per_sample_share = max(1, remaining_tokens // len(active_indices))
+            next_active_indices = []
+            for idx in active_indices:
+                if remaining_tokens <= 0:
+                    break
+                take = min(remaining_lengths[idx], per_sample_share, remaining_tokens)
+                if take > 0:
+                    keep_counts[idx] += take
+                    remaining_lengths[idx] -= take
+                    remaining_tokens -= take
+                if remaining_lengths[idx] > 0:
+                    next_active_indices.append(idx)
+            active_indices = next_active_indices
+
+        return keep_counts
+
     if len(valid_old_inputs) > 0:
+        original_total_tokens = sum(int(t.shape[0]) for t in valid_old_inputs)
+        predictive_loss_scale = 1.0
+        if max_total_tokens is not None:
+            max_total_tokens = int(max_total_tokens)
+            if max_total_tokens > 0:
+                total_tokens_before_cap = sum(int(t.shape[0]) for t in valid_old_inputs)
+                if total_tokens_before_cap > max_total_tokens:
+                    lengths = [int(t.shape[0]) for t in valid_old_inputs]
+                    keep_counts = _allocate_balanced_keep_counts(lengths, max_total_tokens)
+
+                    has_positions = len(valid_old_token_positions) == len(valid_old_inputs)
+                    capped_valid_indices = []
+                    capped_valid_old_inputs = []
+                    capped_valid_old_logits = []
+                    capped_valid_old_token_positions = []
+                    capped_valid_router_request_ids = []
+
+                    for sample_idx, keep_count in enumerate(keep_counts):
+                        if keep_count <= 0:
+                            continue
+
+                        old_input = valid_old_inputs[sample_idx]
+                        old_logit = valid_old_logits[sample_idx]
+                        old_positions = valid_old_token_positions[sample_idx] if has_positions else None
+                        old_length = lengths[sample_idx]
+
+                        if keep_count < old_length:
+                            if has_positions:
+                                select_idx = torch.div(
+                                    torch.arange(keep_count, dtype=torch.long) * old_length,
+                                    keep_count,
+                                    rounding_mode="floor",
+                                )
+                            else:
+                                # Without explicit positions, keep a prefix to preserve implicit alignment.
+                                select_idx = torch.arange(keep_count, dtype=torch.long)
+                            old_input = old_input.index_select(0, select_idx)
+                            old_logit = old_logit.index_select(0, select_idx)
+                            if has_positions:
+                                old_positions = old_positions.index_select(0, select_idx)
+
+                        capped_valid_indices.append(valid_indices[sample_idx])
+                        capped_valid_old_inputs.append(old_input)
+                        capped_valid_old_logits.append(old_logit)
+                        if has_positions:
+                            capped_valid_old_token_positions.append(old_positions)
+                        capped_valid_router_request_ids.append(valid_router_request_ids[sample_idx])
+
+                    logger.warning(
+                        "[Predictive Routing Replay] Capped predictive tokens from %s to %s across %s samples "
+                        "(keep_counts_head=%s using_positions=%s cap_strategy=balanced)",
+                        total_tokens_before_cap,
+                        sum(int(t.shape[0]) for t in capped_valid_old_inputs),
+                        len(capped_valid_old_inputs),
+                        keep_counts[:8],
+                        has_positions,
+                    )
+
+                    valid_indices = capped_valid_indices
+                    valid_old_inputs = capped_valid_old_inputs
+                    valid_old_logits = capped_valid_old_logits
+                    valid_old_token_positions = capped_valid_old_token_positions if has_positions else []
+                    valid_router_request_ids = capped_valid_router_request_ids
+
+        selected_total_tokens = sum(int(t.shape[0]) for t in valid_old_inputs)
+        if original_total_tokens > 0:
+            predictive_loss_scale = min(1.0, float(selected_total_tokens) / float(original_total_tokens))
+
         logger.info(f"[Predictive Routing Replay] Loaded {len(valid_old_inputs)} valid samples (shapes: {[t.shape for t in valid_old_inputs[:3]]}...)")
 
         old_lengths = [int(t.shape[0]) for t in valid_old_inputs]
@@ -716,12 +980,30 @@ def set_router_predictive_data(
         )
         logger.info(
             "[Predictive Routing Replay] Created valid_mask with %s/%s valid tokens. "
-            "old_lens=%s selected_current_lens=%s using_positions=%s",
+            "old_lens=%s selected_current_lens=%s using_positions=%s predictive_loss_scale=%.6f",
             int(valid_mask.sum().item()),
             int(valid_mask.numel()),
             old_lengths[:8],
             selected_current_lens[:8],
             len(valid_old_token_positions) > 0,
+            predictive_loss_scale,
+        )
+        _append_r3_trace(
+            "verl.router_replay.set_predictive_data",
+            {
+                "global_step": global_step,
+                "mini_step": mini_step,
+                "num_valid_samples": len(valid_old_inputs),
+                "sample_idx": valid_indices[0],
+                "request_id": valid_router_request_ids[0],
+                "old_inputs": _summary_value(valid_old_inputs[0]),
+                "old_logits": _summary_value(valid_old_logits[0]),
+                "old_token_positions": _summary_value(valid_old_token_positions[0] if len(valid_old_token_positions) > 0 else None),
+                "valid_mask_sum": int(valid_mask.sum().item()),
+                "valid_mask_numel": int(valid_mask.numel()),
+                "selected_current_lens_head": selected_current_lens[:8],
+                "predictive_loss_scale": predictive_loss_scale,
+            },
         )
 
         # Get router instances and compute dtype
@@ -733,34 +1015,63 @@ def set_router_predictive_data(
             compute_dtype = tf_config.params_dtype
             # print(f"[Memory] Using tf_config.params_dtype: {compute_dtype}, {_get_system_memory_info()}")
 
-        # Concatenate all valid samples into single tensor: [total_valid_tokens, layers, hidden]
-        layers_old_inputs_concat = torch.cat([t.to(compute_dtype).to(device_name) for t in valid_old_inputs], dim=0)  # [total_tokens, layers, hidden]
-        layers_old_logits_concat = torch.cat([t.to(compute_dtype).to(device_name) for t in valid_old_logits], dim=0)  # [total_tokens, layers, hidden]
-        # print(f"[Predictive Routing Replay] [Debug] Concatenated {len(valid_old_inputs)} samples: inputs shape {layers_old_inputs_concat.shape}, logits shape {layers_old_logits_concat.shape}")
-
-        # Scatter to sequence parallel if needed
-        if tf_config.sequence_parallel:
-            layers_old_inputs_concat = scatter_to_sequence_parallel_region(layers_old_inputs_concat)
-            layers_old_logits_concat = scatter_to_sequence_parallel_region(layers_old_logits_concat)
-
-        # Move to CPU to free GPU memory
-        layers_old_inputs_concat = layers_old_inputs_concat.cpu()
-        layers_old_logits_concat = layers_old_logits_concat.cpu()
         valid_mask = valid_mask.cpu()
 
         # Set to each router layer with valid_mask (created externally)
         local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
         offset = local_rank_info["start"]
-        for i, router in enumerate(router_instances_list):
-            router.set_predictive_data(
-                inputs=layers_old_inputs_concat[:, i + offset, :].unsqueeze(1).contiguous(),  # [total_valid_tokens, 1, hidden]
-                logits=layers_old_logits_concat[:, i + offset, :].unsqueeze(1).contiguous(),  # [total_valid_tokens, 1, num_experts]
-                valid_mask=valid_mask  # Token-level mask to filter current_input in router_replay_patch
+        if not tf_config.sequence_parallel:
+            # Fast path for current experiments (TP=1 / no sequence parallel): avoid staging the
+            # full [tokens, layers, hidden] tensor on GPU just to split it back per router layer.
+            for i, router in enumerate(router_instances_list):
+                layer_inputs_concat = torch.cat(
+                    [t[:, i + offset, :].to(dtype=compute_dtype, copy=False) for t in valid_old_inputs],
+                    dim=0,
+                ).unsqueeze(1).contiguous()
+                layer_logits_concat = torch.cat(
+                    [t[:, i + offset, :].to(dtype=compute_dtype, copy=False) for t in valid_old_logits],
+                    dim=0,
+                ).unsqueeze(1).contiguous()
+                router.set_predictive_data(
+                    inputs=layer_inputs_concat,
+                    logits=layer_logits_concat,
+                    valid_mask=valid_mask,
+                    loss_scale=predictive_loss_scale,
+                )
+                logger.info(
+                    f"[Predictive Routing Replay] Set layer {i} predictive data with layer_inputs shape "
+                    f"{router.recorded_old_inputs.shape}, layer_logits shape {router.recorded_old_logits.shape}"
+                )
+                del layer_inputs_concat, layer_logits_concat
+        else:
+            # Sequence-parallel path still needs GPU scatter before per-layer slicing.
+            layers_old_inputs_concat = torch.cat(
+                [t.to(compute_dtype).to(device_name) for t in valid_old_inputs], dim=0
             )
-            logger.info(f"[Predictive Routing Replay] Set layer {i} predictive data with layers_old_inputs_concat shape {router.recorded_old_inputs.shape}, layers_old_logits_concat shape {router.recorded_old_logits.shape}")
+            layers_old_logits_concat = torch.cat(
+                [t.to(compute_dtype).to(device_name) for t in valid_old_logits], dim=0
+            )
 
-        # Explicitly delete large intermediate tensors to free GPU memory
-        del layers_old_inputs_concat, layers_old_logits_concat
+            layers_old_inputs_concat = scatter_to_sequence_parallel_region(layers_old_inputs_concat)
+            layers_old_logits_concat = scatter_to_sequence_parallel_region(layers_old_logits_concat)
+
+            layers_old_inputs_concat = layers_old_inputs_concat.cpu()
+            layers_old_logits_concat = layers_old_logits_concat.cpu()
+
+            for i, router in enumerate(router_instances_list):
+                router.set_predictive_data(
+                    inputs=layers_old_inputs_concat[:, i + offset, :].unsqueeze(1).contiguous(),
+                    logits=layers_old_logits_concat[:, i + offset, :].unsqueeze(1).contiguous(),
+                    valid_mask=valid_mask,
+                    loss_scale=predictive_loss_scale,
+                )
+                logger.info(
+                    f"[Predictive Routing Replay] Set layer {i} predictive data with layers_old_inputs_concat shape "
+                    f"{router.recorded_old_inputs.shape}, layers_old_logits_concat shape {router.recorded_old_logits.shape}"
+                )
+
+            del layers_old_inputs_concat, layers_old_logits_concat
+
         del valid_old_inputs, valid_old_logits, valid_old_token_positions
         import gc
         gc.collect()
@@ -769,6 +1080,19 @@ def set_router_predictive_data(
     else:
         # For processes without valid samples, also set empty predictive data
         logger.warning(f"[Predictive Routing Replay] No valid old_inputs/old_logits found. Setting None to all routers.")
+        _append_r3_trace(
+            "verl.router_replay.set_predictive_data",
+            {
+                "global_step": global_step,
+                "mini_step": mini_step,
+                "num_valid_samples": 0,
+                "sample_idx": None,
+                "request_id": None,
+                "valid_mask_sum": 0,
+                "valid_mask_numel": 0,
+                "selected_current_lens_head": [],
+            },
+        )
         router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
         for i, router in enumerate(router_instances_list):
             router.set_predictive_data(
@@ -842,102 +1166,6 @@ def set_router_predictive_bias_data(
     del bias_concat
     import gc
     gc.collect()
-
-
-def combine_topk_indices(
-    original_top_indices,
-    Corrected_top_indices,
-    scores=None,
-    use_pre_softmax=False,
-    *,
-    scores_shape=None,
-    scores_device=None,
-):
-    """Combine recorded and current top-k indices with union semantics.
-
-    This function computes the union of recorded and current expert selections,
-    then ensures all tokens select exactly ``max_select`` experts (the maximum union size).
-
-    Args:
-        original_top_indices: Previously recorded expert indices ``[num_tokens, topk]``.
-        Corrected_top_indices: Expert indices with bias correction applied ``[num_tokens, topk]``.
-        scores: Router scores ``[num_tokens, num_experts]``. Optional.
-            If ``None``, the caller must provide ``scores_shape`` and ``scores_device`` so
-            synthetic scores can be created for padding/randomization. In that case the
-            returned ``probs`` will be ``None``.
-        use_pre_softmax: If ``True``, return probs & selected union mask for pre-softmax masking.
-        scores_shape: Shape tuple ``(num_tokens, num_experts)`` to use when ``scores`` is ``None``.
-        scores_device: Torch device for the synthetic scores / union mask when ``scores`` is ``None``.
-
-    Returns:
-        probs: Scores for selected experts ``[num_tokens, max_select]`` or ``None`` if ``scores`` is ``None``.
-        top_indices: Selected expert indices ``[num_tokens, max_select]``.
-        selected_union_mask: Mask indicating which experts are in union ``[num_tokens, max_select]``.
-    """
-    if scores is None:
-        if scores_shape is None or scores_device is None:
-            raise ValueError("scores_shape and scores_device must be provided when scores is None.")
-        base_scores = torch.rand(scores_shape, dtype=torch.float32, device=scores_device)
-        return_probs = False
-    else:
-        base_scores = scores
-        return_probs = True
-        if scores_shape is None:
-            scores_shape = scores.shape
-        if scores_device is None:
-            scores_device = scores.device
-
-    # Step 1: Compute union of recorded and current expert selections
-    union_indices = torch.cat([Corrected_top_indices, original_top_indices], dim=-1)
-    union_mask = torch.zeros(scores_shape, dtype=torch.bool, device=scores_device)
-    union_mask.scatter_(dim=-1, index=union_indices, value=True)
-
-    num_selects = union_mask.sum(-1)  # [num_tokens], number of experts in union per token
-    max_select = num_selects.max().item()  # Maximum union size across all tokens
-
-    # Step 2: Ensure all tokens select exactly max_select experts
-    # Use score boosting to guarantee all union experts are selected first,
-    # then pad with highest-scoring non-union experts for tokens with union_size < max_select
-    masked_scores = base_scores.clone()
-    boost_value = base_scores.abs().max() + 100.0  # Large enough to ensure union experts rank highest
-    masked_scores = torch.where(union_mask, masked_scores + boost_value, masked_scores)
-
-    # Select top max_select experts (includes all union experts + padding)
-    _, original_top_indices = torch.topk(masked_scores, k=max_select, dim=1, sorted=False)
-
-    # Step 3: Gather probs & selected_union_mask if needed
-    if use_pre_softmax:  # probs already softmaxed before, mask should be 1/0
-        # selected_union_mask: 1.0 for experts that are in the union, 0.0 for padding
-        selected_union_mask = union_mask.gather(1, original_top_indices).float()  # [num_tokens, max_select]
-        # adjust scores for the selected experts
-        if return_probs:
-            probs = base_scores.gather(1, original_top_indices)
-            probs = probs * selected_union_mask  # Zero out padding experts
-        else:
-            probs = None
-
-    else:  # probs will be softmaxed later, mask should be 0/-inf
-        # selected_union_mask: 0.0 for experts that are in the union, -inf for padding
-        selected_union_mask = torch.where(
-            union_mask.gather(1, original_top_indices),
-            torch.zeros_like(original_top_indices, dtype=torch.float32, device=scores_device),
-            torch.full_like(original_top_indices, float('-inf'), dtype=torch.float32, device=scores_device)
-        )  # [num_tokens, max_select]
-        # adjust scores for the selected experts
-        if return_probs:
-            probs = base_scores.gather(1, original_top_indices)
-            probs = probs + selected_union_mask  # Set padding experts to -inf
-        else:
-            probs = None
-
-    # Sanity check: detect NaN/Inf early (only in debug mode)
-    # if torch.isnan(probs).any() or torch.isinf(probs).any():
-    #     import torch.distributed as dist
-    #     rank = dist.get_rank() if dist.is_initialized() else 0
-    #     print(f"[WARNING] Rank {rank}: Detected NaN/Inf in routing probs after combine_topk_indices!")
-    #     print(f"  probs stats: min={probs.min()}, max={probs.max()}, nan={torch.isnan(probs).sum()}, inf={torch.isinf(probs).sum()}")
-
-    return probs, original_top_indices, selected_union_mask
 
 
 def reorder_list_for_vpp(

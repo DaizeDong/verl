@@ -19,6 +19,7 @@ import copy
 import datetime
 import logging
 import os
+import re
 import time
 from typing import Any, Optional
 
@@ -84,6 +85,46 @@ from verl.workers.rollout import get_rollout_class
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _predictor_sync_debug_enabled() -> bool:
+    return os.getenv("VERL_DEBUG_PREDICTOR_SYNC", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _format_predictor_sync_stats(tensor: torch.Tensor) -> str:
+    tensor = tensor.detach().float()
+    return (
+        f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+        f"l2={tensor.norm().item():.6e} "
+        f"maxabs={tensor.abs().max().item():.6e} "
+        f"checksum={tensor.sum().item():.6e}"
+    )
+
+
+def _wrap_predictor_sync_debug(
+    weights: Any,
+    *,
+    num_hidden_layers: int,
+    logger: logging.Logger,
+):
+    if not _predictor_sync_debug_enabled():
+        return weights
+
+    target_layers = {0, max(num_hidden_layers - 1, 0)}
+    pattern = re.compile(r"layers\.(\d+)\.mlp\.(bias_predictor|gate|router)\.weight$")
+
+    def generator():
+        for name, tensor in weights:
+            match = pattern.search(name)
+            if match is not None and int(match.group(1)) in target_layers:
+                logger.info(
+                    "[PredictorSync][actor-export] %s %s",
+                    name,
+                    _format_predictor_sync_stats(tensor),
+                )
+            yield name, tensor
+
+    return generator()
 
 
 def set_random_seed(seed, only_rollout=False):
@@ -353,11 +394,20 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         # normalize config
         if self._is_actor:
+            original_ppo_mini_batch_size = self.config.actor.ppo_mini_batch_size
+            dp_world_size = mpu.get_data_parallel_world_size()
             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
-            self.config.actor.ppo_mini_batch_size //= mpu.get_data_parallel_world_size()
+            self.config.actor.ppo_mini_batch_size //= dp_world_size
+            if self.config.actor.ppo_mini_batch_size <= 0:
+                raise ValueError(
+                    "actor.ppo_mini_batch_size collapsed to zero after Megatron normalization: "
+                    f"original={original_ppo_mini_batch_size}, rollout.n={self.config.rollout.n}, "
+                    f"dp_world_size={dp_world_size}. Increase actor.ppo_mini_batch_size or reduce "
+                    "data parallel world size."
+                )
             if self.config.actor.get("ppo_micro_batch_size", None):
-                self.config.actor.ppo_micro_batch_size //= mpu.get_data_parallel_world_size()
-                self.config.rollout.log_prob_micro_batch_size //= mpu.get_data_parallel_world_size()
+                self.config.actor.ppo_micro_batch_size //= dp_world_size
+                self.config.rollout.log_prob_micro_batch_size //= dp_world_size
                 self.config.actor.ppo_micro_batch_size_per_gpu = self.config.actor.ppo_micro_batch_size
                 self.config.rollout.log_prob_micro_batch_size_per_gpu = self.config.rollout.log_prob_micro_batch_size
 
@@ -755,6 +805,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 self.tf_config,
                 self.layer_name_mapping,
             )
+        per_tensor_param = _wrap_predictor_sync_debug(
+            per_tensor_param,
+            num_hidden_layers=getattr(self.hf_config, "num_hidden_layers", 1),
+            logger=logger,
+        )
 
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
@@ -1210,10 +1265,19 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
         self._is_offload_optimizer = self.config.megatron.optimizer_offload
 
         # normalize config
+        original_ppo_mini_batch_size = self.config.ppo_mini_batch_size
+        dp_world_size = mpu.get_data_parallel_world_size()
         self.config.ppo_mini_batch_size *= self.config.rollout_n
-        self.config.ppo_mini_batch_size //= mpu.get_data_parallel_world_size()
+        self.config.ppo_mini_batch_size //= dp_world_size
+        if self.config.ppo_mini_batch_size <= 0:
+            raise ValueError(
+                "ppo_mini_batch_size collapsed to zero after Megatron normalization: "
+                f"original={original_ppo_mini_batch_size}, rollout_n={self.config.rollout_n}, "
+                f"dp_world_size={dp_world_size}. Increase ppo_mini_batch_size or reduce "
+                "data parallel world size."
+            )
         if self.config.get("ppo_micro_batch_size", None):
-            self.config.ppo_micro_batch_size //= mpu.get_data_parallel_world_size()
+            self.config.ppo_micro_batch_size //= dp_world_size
             self.config.ppo_micro_batch_size_per_gpu = self.config.ppo_micro_batch_size
 
         # TODO(sgm): support critic model offload
