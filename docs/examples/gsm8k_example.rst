@@ -10,7 +10,7 @@ In this example, we train an LLM to tackle the GSM8k task.
 
 Paper: https://arxiv.org/pdf/2110.14168
 
-Dataset: https://huggingface.co/datasets/gsm8k
+Dataset: https://huggingface.co/datasets/openai/gsm8k
 
 Note that the original paper mainly focuses on training a verifier (a
 reward model) to solve math problems via Best-of-N sampling. In this
@@ -57,7 +57,7 @@ There're three ways to prepare the model checkpoints for post-training:
 
 .. code:: bash
 
-   huggingface-cli download deepseek-ai/deepseek-math-7b-instruct --local-dir ~/models/deepseek-math-7b-instruct --local-dir-use-symlinks False
+   hf download deepseek-ai/deepseek-math-7b-instruct --local-dir ~/models/deepseek-math-7b-instruct --local-dir-use-symlinks False
    # or
    modelscope download --model deepseek-ai/deepseek-math-7b-instruct --local_dir ~/models/deepseek-math-7b-instruct
 
@@ -75,7 +75,7 @@ model.
 ---------------------------------
 
 We provide a SFT Trainer using PyTorch FSDP in
-`fsdp_sft_trainer.py <https://github.com/volcengine/verl/blob/main/verl/trainer/fsdp_sft_trainer.py>`_. 
+`sft_trainer.py <https://github.com/volcengine/verl/blob/main/verl/trainer/sft_trainer.py>`_. 
 Users can customize their own SFT
 script using our FSDP SFT Trainer.
 
@@ -85,13 +85,12 @@ We also provide various training scripts for SFT on GSM8K dataset in `gsm8k sft 
 
    set -x
 
-   torchrun -m verl.trainer.fsdp_sft_trainer \
+   torchrun -m verl.trainer.sft_trainer \
        data.train_files=$HOME/data/gsm8k/train.parquet \
        data.val_files=$HOME/data/gsm8k/test.parquet \
-       data.prompt_key=question \
-       data.response_key=answer \
+       data.messages_key=messages \
        data.micro_batch_size_per_gpu=8 \
-       model.partial_pretrain=deepseek-ai/deepseek-coder-6.7b-instruct \
+       model.path=deepseek-ai/deepseek-coder-6.7b-instruct \
        trainer.project_name=gsm8k-sft \
        trainer.experiment_name=gsm8k-sft-deepseek-coder-6.7b-instruct \
        trainer.total_epochs=4 \
@@ -165,8 +164,8 @@ The script of run_deepseek7b_llm.sh
       critic.model.path=deepseek-ai/deepseek-llm-7b-chat \
       critic.model.enable_gradient_checkpointing=True \
       critic.ppo_micro_batch_size_per_gpu=32 \
-      critic.model.fsdp_config.param_offload=False \
-      critic.model.fsdp_config.optimizer_offload=False \
+      critic.fsdp.param_offload=False \
+      critic.fsdp.optimizer_offload=False \
       algorithm.kl_ctrl.kl_coef=0.001 \
       trainer.critic_warmup=0 \
       trainer.logger='["console","wandb"]' \

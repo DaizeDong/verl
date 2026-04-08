@@ -1,9 +1,9 @@
 set -x
 
 python3 -m verl.trainer.main_ppo \
-    reward_model.sandbox_fusion.url='https://xxxxxxxxx.apigateway-cn-beijing.volceapi.com/run_code' \
-    reward_model.sandbox_fusion.max_concurrent=128 \
-    reward_model.reward_manager=prime \
+    reward.sandbox_fusion.url='https://xxxxxxxxx.apigateway-cn-beijing.volceapi.com/run_code' \
+    reward.sandbox_fusion.max_concurrent=128 \
+    reward.reward_manager.name=prime \
     algorithm.adv_estimator=gae \
     data.train_files=$HOME/data/Eurus-2-RL-Data/train.parquet \
     data.val_files=$HOME/data/Eurus-2-RL-Data/validation.parquet \
@@ -30,8 +30,8 @@ python3 -m verl.trainer.main_ppo \
     critic.model.path=deepseek-ai/deepseek-llm-7b-chat \
     critic.model.enable_gradient_checkpointing=True \
     critic.ppo_micro_batch_size_per_gpu=32 \
-    critic.model.fsdp_config.param_offload=False \
-    critic.model.fsdp_config.optimizer_offload=False \
+    critic.fsdp.param_offload=False \
+    critic.fsdp.optimizer_offload=False \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \

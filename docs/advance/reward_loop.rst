@@ -5,45 +5,205 @@ Reward Loop
 
 Author: `Yuyang Ding <https://yyding1.github.io>`_
 
-Last updated: 12/3/2025.
+Last updated: 2/10/2026.
 
-.. warning::
-   Reward Loop is ready for use, but the API may change in future releases.
+Introduction
+------------
 
-Reward Loop is designed to support flexible and user-friendly reward computation, with most implementation in ``verl/experimental/reward``.
+Reward Loop is the default reward computation implementation in verl.
+It is designed to support efficient, flexible, and easy-to-use reward computation.
 
-Reward Function Usage
----------------------
+This document introduces the usage and architectural design.
 
-Reward Loop covers all typical reward-computation scenarios.
+Key features include:
 
-- **Rule-based Reward**: The reward is determined by predefined rules, e.g., checking whether the predicted answer matches the ground truth via simple string matching.
+1. **Distributed reward manager**, enabling scalable and efficient reward computation.
+2. **Support for hybrid reward settings**, including both generative and discriminative reward models, as well as more complex reward scenarios.
+3. **Simple and extensible interface**, for easily defining customized reward functions.
+
+Distributed Reward manager
+--------------------------
+
+.. image:: https://github.com/yyDing1/verl-materials/blob/main/distributed_reward_manager.svg?raw=true
+
+How distributed
+~~~~~~~~~~~~~~~
+
+Under the single_controller setup, actor rollout and reward computation can be abstracted as:
+
+.. code:: python
+
+   # initalize rollout manager and async reward loop manager
+   async_rollout_manager = AgentLoopManager(config)
+   async_reward_manager = RewardLoopManager(config)
+   # actor rollout using `async_rollout_manager`
+   gen_batch = async_rollout_manager.generate_sequences(batch)
+   # compute reward using `async_reward_manager`
+   reward_batch = async_reward_manager.compute_rm_score(gen_batch)
+
+Within the ``RewardLoopManager``, multiple ``RewardWorker`` are launched across all nodes to enable distributed reward computation. 
+The number of parallel workers can be configured via ``config.reward.num_workers``.
+
+Upon receiving a batch reward request, the batch is partitioned into smaller chunks and distributed to each reward worker for parallel execution.
+User only need to invoke ``compute_rm_score``.
+
+.. code:: python
+
+   class RewardLoopManager:
+      """
+      RewardLoopManager run in single controller.
+      This class will create reward loop workers and manage them.
+      """
+      def _init_reward_loop_workers(self):
+         self.reward_loop_workers = [...]
+
+      def compute_rm_score(self, data):
+         chunks = data.chunk(len(self.reward_loop_workers))
+         outputs = ray.get(
+            [
+               worker.compute_score_batch.remote(chunk)
+               for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
+            ]
+         )
+         outputs_flat = [item for sublist in outputs for item in sublist]
+         ...
+
+This is how the reward manager is parallelized and distributed across all nodes.
+
+Streaming Reward with Rollout
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Furthermore, we check whether actor rollout and reward computation can be performed in a streaming manner,
+where the reward is calculated as soon as each sample is rolled out.
+
+.. code:: python
+
+   # agent_reward_loop: streaming reward computation with actor rollout
+   # two conditions satisfied: (1) rule-based reward, or (2) reward model with extra resource pool
+   enable_agent_reward_loop = not use_rm or config.reward.reward_model.enable_resource_pool
+
+   # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
+   # to stream reward computation with actor rollout
+   reward_loop_worker_handles = async_reward_manager.reward_loop_workers if enable_agent_reward_loop else None
+   async_rollout_manager = AgentLoopManager(
+      config=config,
+      worker_group=actor_rollout_wg,
+      rollout_resource_pool=actor_rollout_resource_pool,
+      reward_loop_worker_handles=reward_loop_worker_handles,
+   )
+
+Hybrid Reward Scenarios Usage
+-----------------------------
+
+As described above, each ``reward_loop_worker`` is responsible for handling reward requests.
+The rewards can be categorized as follows:
+
+- **Rule-based Reward**: The reward is determined by predefined rules, e.g., checking whether the predicted answer matches the ground truth via string matching.
 - **Discriminative Reward Model (DisRM)**: The reward is produced by a specified discriminative reward model, such as ``Skywork/Skywork-Reward-Llama-3.1-8B-v0.2``.
 - **Generative Reward Model (GenRM)**: The reward is obtained using a generative reward model, for example ``dyyyyyyyy/FAPO-GenRM-4B``.
-- **Hybrid Reward Scenarios**: Reward Loop provides interfaces for plugging in reward models, allowing users to define custom reward logic based on their needs (e.g., combining rule-based methods with GenRM).
+- **Hybrid Reward Scenarios**: A combination of the above reward types, e.g., rule + GenRM.
 
-.. warning::
-   For reward-model scenarios, users should set the extra configuration, i.e., ``--config-path recipe/fapo/config --config-name rm_config.yaml``. This configuration will be adopted as the default in a future release.
+.. code:: python
 
-Rule-based Reward
+   class RewardLoopWorker:
+
+      async def compute_score_batch(self, data: DataProto) -> list[dict]:
+         tasks = []
+         for i in range(len(data)):
+            tasks.append(asyncio.create_task(self.compute_score(data[i : i + 1])))
+         outputs = await asyncio.gather(*tasks)
+         return outputs
+
+      async def compute_score(self, data: DataProto) -> dict:
+         assert len(data) == 1, "RewardLoopWorker only support single data item"
+         if self.config.reward.custom_reward_function.path is not None:
+            # directly use user-customized reward function
+            return await self.reward_manager.run_single(data)
+         else:
+            if self.config.reward.reward_model.enable:
+               # we assume the rm is disrm
+               # genrm must set custom_reward_function
+               return await self.compute_score_disrm(data)
+            else:
+               return await self.reward_manager.run_single(data)
+
+Each ``RewardLoopWorker`` will initalize one ``RewardManager``, splits the batch into individual data items and processes them in parallel using asynchronous tasks.
+
+Reward Manager
+~~~~~~~~~~~~~~
+
+The ``RewardManager`` maintains a reward function and defines its computation logic, including:
+
+- **naive**: The simplest implementation.
+- **dapo**: DAPO implementation with an overlong reward penalty.
+- **limit**: Restricts the concurrency of the reward function, useful when external API calls are rate-limited.
+- **remote**: Runs in a separate process, effective for CPU-intensive tasks such as ``Math-Verify``.
+
+Users can also customize their own ``RewardManager``, inheriting from ``RewardManagerBase``, and implementing the ``run_single`` function.
+
+.. code:: python
+
+   @register("user_costomized")
+   class UserCostomizedRewardManager(RewardManagerBase):
+      async def run_single(self, data: DataProto) -> dict:
+         assert len(data) == 1, "Only support single data item"
+         # your own reward manager
+         ...
+
+After defining it, users can specify their custom reward manager by setting ``reward.reward_manager.name=user_costomized``.
+
+Rule-Based Reward
 ~~~~~~~~~~~~~~~~~
 
-If ``--custom_reward_function`` is not provided, the reward loop will fall back to the default rule-based reward function.
-Otherwise, only the user-defined reward function will be used. The files under ``verl/utils/reward_score/`` provide some examples.
+If ``reward.custom_reward_function`` is provided, the user-defined reward function will be used. Otherwise, it falls back to the default reward function.
 
-Reward Loop supports both synchronous and asynchronous user-defined reward functions. It automatically detects the function type and executes it accordingly, ensuring that reward computation remains non-blocking and efficient.
+Note that The custom function can be either synchronous or asynchronous; the system automatically detects its type and loads it accordingly.
 
-Discriminative Reward Model (DisRM)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We recommend **using asynchronous functions** when reward computation need to involve external model API calls or sandboxed execution, as they are significantly more efficient.
 
-For scenarios involving a discriminative reward model, users should provide ``--reward_model.model.path`` to specify the reward model.
+.. code:: python
 
-The Reward Loop will pass the question and the model rollout as inputs to the reward model and obtain a reward score from its output.
+   async def compute_score(data_source, solution_str, ground_truth, extra_info):
+      """Compute a score by sending an async request to a remote service."""
+      
+      # prepare request payload
+      payload = {"messages": [{"role": "user", "content": "check the correcness of the question and response ..."}], ...}
 
-Generative Reward Model (GenRM)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+      # send async HTTP request
+      async with aiohttp.ClientSession() as session:
+         async with session.post("https://api.openai.com/v1/chat/completions", json=payload) as resp:
+               result = await resp.json()
 
-For generative reward model scenarios, users need to specify both ``--reward_model.model.path`` and ``--custom_reward_function``.
+      # parse and return score
+      score = int(result["choices"][0]["message"]["content"].strip().split("\n")[-1])
+      return {"score": score}
+
+Model-Base Reward
+~~~~~~~~~~~~~~~~~
+
+**For discriminative reward model (DisRM)**, we provide a simple implementation:
+
+.. code:: python
+
+   class RewardLoopWorker:
+      async def compute_score_disrm(self, data) -> dict:
+         disrm_prompt = await self._preprocess_reward_inputs(data)
+         payloads = {
+            "model": model_name,
+            "input": disrm_prompt,
+            "activation": False,
+         }
+         output = await self._post_request(payloads, "classify")
+         rm_score = output["data"][-1]["probs"][-1]
+         return {"reward_score": rm_score}
+
+pass the question and the model rollout as inputs to the reward model and obtain a reward score. This is also the standard practice for most DisRM.
+
+Users should provide ``reward.reward_model.model_path`` to specify the reward model.
+
+**For generative reward model (GenRM)**
+
+For generative reward model scenarios, users need to specify both ``reward.reward_model.model_path`` and ``reward.custom_reward_function``.
 
 The custom reward function should implement the following components:
 
@@ -90,124 +250,28 @@ Below we provide an example of a custom reward function using GenRM.
 
       return {"score": score}
 
-Hybrid Reward Scenarios
-~~~~~~~~~~~~~~~~~~~~~~~
+**For hybrid reward scenarios**, such as combining rule-based rewards with GenRM similarly as above,
 
-For more complex application settings, such as combining rule-based rewards with GenRM, or mixing rule-based rewards with DisRM, users can also achieve this by specifying the ``--reward_model.model.path`` together with the ``--custom_reward_function``.
-The implementation of the customized reward function follows the same pattern as illustrated above.
+.. _recipe/fapo: https://github.com/verl-project/verl-recipe/tree/main/fapo
 
-A runnable and reproducible example that demonstrates how to use a rule-based reward function together with a GenRM is provided in the ``recipe/fapo`` directory for reference. Welcome to use and cite.
+A runnable and reproducible example that demonstrates how to use a rule-based reward function together with a GenRM is provided in the `recipe/fapo`_ directory for reference. Welcome to use and cite.
 
-Architecture Design
--------------------
+Reward Model Arch Design
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Reward Loop supports multiple execution modes for reward training:
+We support multiple execution modes for reward models during:
 
 - **Colocate Mode**: The reward model shares the same resource pool as the actor/rollout/reference models. In this setup, all rollouts must complete first, after which the reward model is awakened to perform inference.
 - **Standalone Mode**: The reward model runs on a separate resource pool, independent from the actor/rollout/reference models. In this setup, each sample is evaluated by the reward model immediately after its rollout finishes.
 
+The standalone mode can enable the streaming manner stated above.
+
+By default, the system runs in colocate mode. Users can enable standalone mode by setting ``reward.reward_model.enable_resource_pool=True`` and allocating the corresponding resources via ``reward.reward_model.nnodes`` and ``reward.reward_model.n_gpus_per_node``.
+
 .. image:: https://github.com/yyDing1/verl-materials/blob/main/reward_loop.svg?raw=true
 
-RewardLoopWorker
-~~~~~~~~~~~~~~~~~
 
-The ``RewardLoopWorker`` is responsible for handling batch-level reward computation across all supported execution modes, operating in an asynchronous manner.
-
-.. image:: https://github.com/yyDing1/verl-materials/blob/main/reward_loop_worker.svg?raw=true
-
-For each sample, the reward is computed according to the following logic:
-
-- if ``--custom_reward_function`` is provided, we directly use user-customized reward function
-- if ``--custom_reward_function`` is not provided:
-   - **reward model is not enabled**: use default rule-based reward function
-   - **reward model is discriminative**: compute reward score using disrm
-   - **reward model is generative**: this is not permitted (user-customized reward func **must be** provided)
-
-In most cases, we encourage users to define and use their own customized reward functions.
-
-.. code:: python
-
-   @ray.remote
-   class RewardLoopWorker:
-      async def compute_score_batch(self, data: DataProto) -> list[dict]:
-         tasks = []
-         for i in range(len(data)):
-            tasks.append(asyncio.create_task(self.compute_score(data[i : i + 1])))
-         outputs = await asyncio.gather(*tasks)
-         return outputs
-
-   async def compute_score(self, data: DataProto) -> dict:
-      assert len(data) == 1, "RewardLoopWorker only support single data item"
-      if self.config.custom_reward_function.path is not None:
-         # directly use user-customized reward function
-         return await self.reward_loop.run_single(data)
-      else:
-         if self.config.reward_model.enable:
-            # we assume the rm is disrm
-            # genrm must set custom_reward_function
-            return await self.compute_score_disrm(data)
-         else:
-            return await self.reward_loop.run_single(data)
-
-
-RewardLoopManager
-~~~~~~~~~~~~~~~~~
-
-In **standalone mode**, we directly launch one ``RewardLoopWorker`` for each ``AgentLoopWorker`` to handle reward computation independently.
-
-In **colocate mode**, we launch a ``RewardLoopManager`` to
-
-1. launch reward model if enabled
-2. manage multiple ``RewardLoopWorker`` instances to handle CPU-intensive tasks such as code.
-
-.. code:: python
-
-   class RewardLoopManager:
-      """
-      RewardLoopManager run in single controller.
-      This class will create reward loop workers and manage them.
-      RewardLoopManager will deprecate fsdp/megatron RewardModelWorker in the future.
-      """
-   def __init__(self, config: DictConfig, rm_resource_pool: RayResourcePool = None):
-      self.config = config
-      if self.config.reward_model.enable:
-         self.reward_model_manager = RewardModelManager(config.reward_model, rm_resource_pool)
-         self.reward_router_address = self.reward_model_manager.get_router_address()
-      else:
-         self.reward_model_manager = None
-         self.reward_router_address = None
-
-      self._init_reward_loop_workers()
-
-   def _init_reward_loop_workers(self):
-      self.reward_loop_workers = []
-      num_workers = self.config.reward_model.get("num_workers", 1)
-      node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
-
-      for i in range(num_workers):
-         # Round-robin scheduling over the all nodes
-         node_id = node_ids[i % len(node_ids)]
-         self.reward_loop_workers.append(
-            RewardLoopWorker.options(
-               name=f"reward_loop_worker_{i}",
-               scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                  node_id=node_id,
-                  soft=True,
-               ),
-            ).remote(self.config, self.reward_router_address)
-         )
-
-   def compute_rm_score(self, data: DataProto) -> DataProto:
-      """
-      Compute reward score for the given data.
-      """
-      ...
-
-
-RewardModelManager
-~~~~~~~~~~~~~~~~~~
-
-To support flexible and scalable reward model computation, Reward Loop implement a reward router that coordinates requests among multiple reward model servers.
+To support flexible and scalable reward model computation, we implement a reward router that coordinates requests among multiple reward model servers.
 
 Each reward model runs as an independent server and is registered with the router.
 This router will forward the requests to the registered reward servers with load balancing and return the results.
@@ -236,6 +300,4 @@ This design allows us to expose a single unified router address to user-defined 
          self.resource_pool = resource_pool
          self._initialize_llm_servers()
          self._initialize_router()
-         assert self.config.rollout.skip_tokenizer_init is False, "Reward model should not skip tokenizer init."
-         if self.config.rollout.free_cache_engine:
-               self.sleep()
+

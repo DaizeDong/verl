@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import json
 import logging
 import os
@@ -19,12 +20,14 @@ import random
 from collections.abc import Callable
 from dataclasses import asdict
 
+import megatron.core
 import numpy as np
 import torch
 import torch.distributed
-from megatron.core import mpu, tensor_parallel
+from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.transformer.enums import AttnBackend
+from packaging import version
 from transformers import GenerationConfig
 
 from verl.models.weight_loader_registry import get_weight_saver
@@ -43,6 +46,12 @@ from .checkpoint_manager import BaseCheckpointManager
 # Setup logging
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+mcore_ge_014 = version.parse(megatron.core.__version__) >= version.parse("0.14.0")
+if not mcore_ge_014:
+    logger.warning(
+        "Detected megatron.core %s, recommend upgrading to >= 0.14.0 for better checkpoint compatibility",
+        megatron.core.__version__,
+    )
 
 
 class MegatronCheckpointManager(BaseCheckpointManager):
@@ -244,27 +253,41 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         generate_optimizer: bool = True,
         generate_extra: bool = True,
         is_loading: bool = False,
+        metadata: dict | None = None,
     ):
         # For save dist checkpointing
         state_dict = {}
+        base_metadata = metadata or self._build_sharded_state_dict_metadata()
 
-        # Should always generate model state dict
-        # All ranks Save Model to reduce memory pressure
-        # Get sharded state dict, notice that state_dict will collect among dp groups, causing memory pressure
-        for vpp_rank, model in enumerate(self.model):
-            if len(self.model) > 1:
-                mpu.set_virtual_pipeline_model_parallel_rank(vpp_rank)
-                key = f"model{vpp_rank}" if len(self.model) > 1 else "model"
-            else:
-                key = "model"
-            if hasattr(model, "module"):
-                model = model.module
-            state_dict[key] = model.sharded_state_dict()
+        should_generate_model_sections = generate_model or generate_optimizer
+
+        # All ranks save model state dict when it is needed for either model checkpointing
+        # or optimizer sharded_state_dict generation.
+        if should_generate_model_sections:
+            for vpp_rank, model in enumerate(self.model):
+                if len(self.model) > 1:
+                    mpu.set_virtual_pipeline_model_parallel_rank(vpp_rank)
+                    key = f"model{vpp_rank}" if len(self.model) > 1 else "model"
+                else:
+                    key = "model"
+                if hasattr(model, "module"):
+                    model = model.module
+
+                # GPTModel's sharded_state_dict function when having mtp requires metadata['dp_cp_group']
+                model_metadata = dict(base_metadata)
+                model_metadata["dp_cp_group"] = mpu.get_data_parallel_group(with_context_parallel=True)
+                kwargs = {"metadata": model_metadata}
+                state_dict[key] = model.sharded_state_dict(**kwargs)
 
         # Optimizer State Dict
         if generate_optimizer:
             torch.distributed.barrier()
-            optimizer_sharded_states = self.optimizer.sharded_state_dict(state_dict, is_loading=is_loading)
+            sharded_state_dict_kwargs = {"is_loading": is_loading}
+            if base_metadata is not None:
+                # https://github.com/NVIDIA/Megatron-LM/blob/core_v0.14.0/megatron/core/optimizer/distrib_optimizer.py#L1109-L1123
+                if mcore_ge_014:
+                    sharded_state_dict_kwargs["metadata"] = base_metadata
+            optimizer_sharded_states = self.optimizer.sharded_state_dict(state_dict, **sharded_state_dict_kwargs)
             state_dict["optimizer"] = optimizer_sharded_states
 
             if self.lr_scheduler is not None:
@@ -272,7 +295,9 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 state_dict["lr_scheduler"] = lr_state_dict
 
         if not generate_model:
-            state_dict.pop("model", None)
+            for key in list(state_dict.keys()):
+                if self._is_model_state_key(key):
+                    state_dict.pop(key)
 
         # RNG States State Dict
         if generate_extra:
@@ -281,6 +306,81 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             state_dict["rng_state"] = rng_state
 
         return state_dict
+
+    def _build_sharded_state_dict_metadata(self) -> dict:
+        """Builds metadata used for sharded_state_dict versioning.
+
+
+        The whole content metadata is passed to ``sharded_state_dict`` model and optimizer methods
+        and therefore affects only the logic behind sharded_state_dict creation.
+        The content metadata should be minimalistic, ideally flat (or with a single nesting level)
+        and with semantically meaningful flag names (e.g. `distrib_optim_sharding_type`).
+        In particular, a simple integer (or SemVer) versioning flag (e.g. `metadata['version'] = 3.4`)
+        is discouraged, because the metadata serves for all models and optimizers and it's practically
+        impossible to enforce a linearly increasing versioning for this whole space.
+        """
+        metadata: dict = {}
+
+        if not mcore_ge_014:
+            # For backward compatibility with Megatron core < v0.14.0
+            if self.use_distributed_optimizer:
+                metadata["distrib_optim_sharding_type"] = "fully_sharded_model_space"
+            return metadata
+
+        if self.use_distributed_optimizer:
+            megatron_config = getattr(self.config, self.role, self.config).megatron
+            dist_ckpt_optim_fully_reshardable = megatron_config.dist_ckpt_optim_fully_reshardable
+            distrib_optim_fully_reshardable_mem_efficient = (
+                megatron_config.distrib_optim_fully_reshardable_mem_efficient
+            )
+            if dist_ckpt_optim_fully_reshardable:
+                metadata["distrib_optim_sharding_type"] = "fully_reshardable"
+                metadata["distrib_optim_fully_reshardable_mem_efficient"] = (
+                    distrib_optim_fully_reshardable_mem_efficient
+                )
+            else:
+                metadata["distrib_optim_sharding_type"] = "dp_reshardable"
+
+        metadata["singleton_local_shards"] = False
+        metadata["chained_optim_avoid_prefix"] = True
+        return metadata
+
+    @staticmethod
+    def _is_model_state_key(key: str) -> bool:
+        return key == "model" or (key.startswith("model") and key[5:].isdigit())
+
+    @staticmethod
+    def _has_checkpoint_files(path: str) -> bool:
+        return os.path.isdir(path) and any(os.scandir(path))
+
+    def _raise_for_unsupported_peft_checkpoint_layout(self, local_path: str, dist_checkpoint_path: str):
+        if self.peft_cls is None or not self.should_load_model or self._has_checkpoint_files(dist_checkpoint_path):
+            return
+
+        legacy_adapter_ckpt_path = os.path.join(local_path, "adapter_checkpoint")
+        hf_adapter_ckpt_path = os.path.join(local_path, "huggingface", "adapter")
+
+        if os.path.isdir(legacy_adapter_ckpt_path):
+            raise RuntimeError(
+                f"Found legacy PEFT checkpoint at {legacy_adapter_ckpt_path}, but checkpoint resume now expects "
+                f"adapter weights in {dist_checkpoint_path}. Resave/convert the checkpoint or load the adapter via "
+                "`lora.adapter_path`."
+            )
+
+        if os.path.isfile(os.path.join(hf_adapter_ckpt_path, "adapter_config.json")):
+            raise RuntimeError(
+                f"Found exported HF PEFT adapter at {hf_adapter_ckpt_path}, but `load_checkpoint()` resumes from "
+                f"{dist_checkpoint_path}. HF adapter exports are not used for trainer resume; keep the distributed "
+                "checkpoint or load the adapter separately via `lora.adapter_path`."
+            )
+
+    def _maybe_filter_peft_state_dict(self, state_dict: dict):
+        if self.peft_cls is None:
+            return state_dict
+
+        from megatron.bridge.training.checkpointing import apply_peft_adapter_filter_to_state_dict
+
+        return apply_peft_adapter_filter_to_state_dict(state_dict, self.peft_cls)
 
     def load_rng_states(self, rng_states, data_parallel_random_init=False, use_dist_ckpt=True):
         # access rng_state for data parallel rank
@@ -305,20 +405,44 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             assert os.path.exists(local_path), f"Checkpoint path {local_path} does not exist."
 
         # For load optimizer dist_ckpt
-        import transformer_engine
+        try:
+            import transformer_engine
 
-        torch.serialization.add_safe_globals([torch.optim.AdamW])
-        torch.serialization.add_safe_globals([transformer_engine.pytorch.optimizers.fused_adam.FusedAdam])
+            torch.serialization.add_safe_globals([torch.optim.AdamW])
+            torch.serialization.add_safe_globals([transformer_engine.pytorch.optimizers.fused_adam.FusedAdam])
+        except Exception:
+            pass
 
         dist_checkpoint_path = get_dist_checkpoint_path(local_path)
+        self._raise_for_unsupported_peft_checkpoint_layout(local_path, dist_checkpoint_path)
+
+        load_content_metadata = getattr(dist_checkpointing, "load_content_metadata", None)
+        if load_content_metadata is None:
+            # For backward compatibility
+            sharded_sd_metadata = None
+        else:
+            sharded_sd_metadata = load_content_metadata(checkpoint_dir=dist_checkpoint_path)
+        if sharded_sd_metadata is None:
+            if self.use_distributed_optimizer:
+                # Backward-compatibility with old checkpoints which don't have content versioning
+                # Can be removed after ending support for MLM optimizer checkpoints with MCore < v0.13
+                # (for MCore v0.13+ checkpoints `sharded_sd_metadata is not None`)
+                sharded_sd_metadata = {
+                    "distrib_optim_sharding_type": "fully_sharded_model_space",
+                }
+            else:
+                sharded_sd_metadata = self._build_sharded_state_dict_metadata()
 
         # Get State Dict for loading
+        should_load_dist_model = self.should_load_model and (self.use_dist_checkpointing or self.peft_cls is not None)
         sharded_state_dict = self.generate_state_dict(
-            self.should_load_model and self.use_dist_checkpointing,
+            should_load_dist_model,
             self.should_load_optimizer,
             self.should_load_extra,
             is_loading=True,
+            metadata=sharded_sd_metadata,
         )
+        sharded_state_dict = self._maybe_filter_peft_state_dict(sharded_state_dict)
         log_with_rank(f"Generated state dict for loading: {sharded_state_dict.keys()}", rank=self.rank, logger=logger)
 
         # Load Dist Checkpointing
@@ -327,7 +451,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             ckpt_dir=dist_checkpoint_path,
         )
 
-        if self.should_load_model and self.use_dist_checkpointing:
+        if should_load_dist_model:
             assert "model" in state_dict or any(
                 f"model{vpp_rank}" in state_dict for vpp_rank in range(len(self.model))
             ), f"Model state dict not found in {state_dict.keys()}. Please check the checkpoint file {local_path}."
@@ -338,8 +462,13 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     assert f"model{vpp_rank}" in state_dict, f"model{vpp_rank} not found in state_dict"
                     model_state_dict = state_dict[f"model{vpp_rank}"]
                 mpu.set_virtual_pipeline_model_parallel_rank(vpp_rank)
-                self.model[vpp_rank].load_state_dict(model_state_dict)
-            log_with_rank(f"Loaded sharded model checkpoint from {local_path}", rank=self.rank, logger=logger)
+                self.model[vpp_rank].load_state_dict(model_state_dict, strict=self.peft_cls is None)
+            if self.peft_cls is not None:
+                log_with_rank(
+                    f"Loaded PEFT adapter checkpoint from {dist_checkpoint_path}", rank=self.rank, logger=logger
+                )
+            else:
+                log_with_rank(f"Loaded sharded model checkpoint from {local_path}", rank=self.rank, logger=logger)
 
         # Skip HF checkpoint loading if PEFT is used
         elif self.should_load_model and self.use_hf_checkpoint and self.peft_cls is None:
@@ -349,29 +478,6 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             else:
                 self.bridge.load_hf_weights(self.model, hf_model_path)
             log_with_rank(f"Loaded HF model checkpoint from {hf_model_path} with bridge", rank=self.rank, logger=logger)
-        # Load PEFT adapter checkpoint if available
-        if self.should_load_model and self.peft_cls is not None:
-            adapter_ckpt_path = os.path.join(local_path, "adapter_checkpoint")
-            if os.path.exists(adapter_ckpt_path):
-                from verl.utils.megatron_peft_utils import load_adapter_checkpoint
-
-                # TODO: a better format for adapter checkpoint, waiting megatron-bridge support
-
-                load_adapter_checkpoint(
-                    self.model,
-                    adapter_ckpt_path,
-                )
-                log_with_rank(
-                    f"Loaded adapter checkpoint from {adapter_ckpt_path}",
-                    rank=self.rank,
-                    logger=logger,
-                )
-            else:
-                log_with_rank(
-                    f"PEFT config is set but no adapter checkpoint found at {adapter_ckpt_path}",
-                    rank=self.rank,
-                    logger=logger,
-                )
 
         if self.should_load_optimizer:
             assert "optimizer" in state_dict, (
@@ -412,16 +518,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         # record the previous global step
         self.previous_global_step = global_step
 
-        # remove previous local_path
-        if (
-            max_ckpt_to_keep
-            and isinstance(max_ckpt_to_keep, int)
-            and max_ckpt_to_keep > 0
-            and len(self.previous_saved_paths) >= max_ckpt_to_keep
-        ):
-            keep_start = len(self.previous_saved_paths) - max_ckpt_to_keep + 1
-            self.remove_previous_save_local_path(self.previous_saved_paths[:keep_start])
-            self.previous_saved_paths = self.previous_saved_paths[keep_start:]
+        if not self.checkpoint_config.async_save:
+            self.ensure_checkpoint_capacity(max_ckpt_to_keep)
 
         local_path = local_mkdir_safe(local_path)
         dist_checkpoint_path = get_dist_checkpoint_path(local_path)
@@ -430,9 +528,14 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         # together in a state dict, we save them in one time
         if self.use_dist_checkpointing:
             # Generate state dict for saving
+            sharded_sd_metadata = self._build_sharded_state_dict_metadata()
             state_dict = self.generate_state_dict(
-                self.should_save_model, self.should_save_optimizer, self.should_save_extra
+                self.should_save_model,
+                self.should_save_optimizer,
+                self.should_save_extra,
+                metadata=sharded_sd_metadata,
             )
+            state_dict = self._maybe_filter_peft_state_dict(state_dict)
             log_with_rank(f"Generated state dict for saving: {state_dict.keys()}", rank=self.rank, logger=logger)
             for vpp_rank, model in enumerate(self.model):
                 if len(self.model) > 1:
@@ -447,6 +550,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 sharded_state_dict=state_dict,
                 ckpt_path=dist_checkpoint_path,
                 async_save=self.checkpoint_config.async_save,
+                content_metadata=sharded_sd_metadata,
             )
 
             # Synchronize all async save requests
@@ -456,17 +560,21 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         else:
             assert self.use_hf_checkpoint, "When not using distributed checkpointing, use_hf_checkpoint should be True."
             # Generate optimizer and exra state dicts
+            sharded_sd_metadata = self._build_sharded_state_dict_metadata()
             state_dict = self.generate_state_dict(
-                generate_model=False,
+                generate_model=self.should_save_model and self.peft_cls is not None,
                 generate_optimizer=self.should_save_optimizer,
                 generate_extra=self.should_save_extra,
+                metadata=sharded_sd_metadata,
             )
+            state_dict = self._maybe_filter_peft_state_dict(state_dict)
             # Save optimizer and extra states to local path
             # Start Async save if enabled
             async_save_request = save_dist_checkpointing(
                 sharded_state_dict=state_dict,
                 ckpt_path=dist_checkpoint_path,
                 async_save=self.checkpoint_config.async_save,
+                content_metadata=sharded_sd_metadata,
             )
 
             # Synchronize all async save requests
@@ -480,35 +588,31 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         gc.collect()
 
         if self.should_save_model:
-            # Save adapter-only checkpoint if PEFT is enabled
-            if self.peft_cls is not None:
-                from verl.utils.megatron_peft_utils import save_adapter_checkpoint
-
-                adapter_ckpt_path = os.path.join(local_path, "adapter_checkpoint")
-
-                # Save adapter weights only (much smaller than full model)
-                save_adapter_checkpoint(
-                    self.model,
-                    adapter_ckpt_path,
-                    self.rank,
-                )
-
-                log_with_rank(
-                    f"Saved adapter-only checkpoint to {adapter_ckpt_path}",
-                    rank=self.rank,
-                    logger=logger,
-                    log_only_rank_0=True,
-                )
             if self.use_hf_checkpoint:
                 # Use mbridge to save HF model checkpoint
                 log_with_rank(f"Saving HF model checkpoint to {local_path} with bridge", rank=self.rank, logger=logger)
                 hf_ckpt_path = get_hf_model_checkpoint_path(local_path)
                 if self.vanilla_bridge:
-                    self.bridge.save_weights(
-                        self.model, hf_ckpt_path, distributed_filesystem=True, memory_efficient=True
-                    )
+                    extended_args = {}
+                    mbridge_config = getattr(self.checkpoint_config, "mbridge_config", None) or {}
+                    for sig in inspect.signature(self.bridge.save_weights).parameters:
+                        if sig == "weights_path" or sig == "models":
+                            continue
+                        if sig in mbridge_config:
+                            extended_args[sig] = mbridge_config[sig]
+                    self.bridge.save_weights(self.model, hf_ckpt_path, **extended_args)
                 else:
-                    self.bridge.save_hf_weights(self.model, hf_ckpt_path)
+                    if self.peft_cls is not None:
+                        hf_adapter_ckpt_path = os.path.join(hf_ckpt_path, "adapter")
+                        self.bridge.save_hf_adapter(self.model, hf_adapter_ckpt_path, self.peft_cls)
+                        log_with_rank(
+                            f"Saved HF PEFT adapter checkpoint to {hf_adapter_ckpt_path}",
+                            rank=self.rank,
+                            logger=logger,
+                            log_only_rank_0=True,
+                        )
+                    else:
+                        self.bridge.save_hf_weights(self.model, hf_ckpt_path)
 
                 log_with_rank(f"Saved bridge checkpoint to {hf_ckpt_path}", rank=self.rank, logger=logger)
 
@@ -546,6 +650,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     "grad_sync_func",
                     "param_sync_func",
                     "generation_config",
+                    "_pg_collection",
                 ]
                 backup = {}
                 for k in bypass_keys:
@@ -576,9 +681,14 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             if self.bridge is not None:
                 hf_model_ckpt_path = get_hf_model_checkpoint_path(local_path)
                 if self.vanilla_bridge:
-                    self.bridge.save_weights(
-                        self.model, hf_model_ckpt_path, distributed_filesystem=True, memory_efficient=True
-                    )
+                    extended_args = {}
+                    mbridge_config = getattr(self.checkpoint_config, "mbridge_config", None) or {}
+                    for sig in inspect.signature(self.bridge.save_weights).parameters:
+                        if sig == "weights_path" or sig == "models":
+                            continue
+                        if sig in mbridge_config:
+                            extended_args[sig] = mbridge_config[sig]
+                    self.bridge.save_weights(self.model, hf_model_ckpt_path, **extended_args)
                 else:
                     self.bridge.save_hf_weights(self.model, hf_model_ckpt_path)
             else:
@@ -639,11 +749,6 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 f"Dist checkpointing save completed for {dist_checkpoint_path}", rank=self.rank, logger=logger
             )
             if self.rank == 0:
-                local_latest_checkpointed_iteration = os.path.join(
-                    os.path.dirname(os.path.dirname(local_path)), "latest_checkpointed_iteration.txt"
-                )
-                with open(local_latest_checkpointed_iteration, "w") as f:
-                    f.write(str(global_step))
                 if hdfs_path is not None:
                     log_with_rank(f"Uploading checkpoint to {hdfs_path}", rank=self.rank, logger=logger)
                     from verl.utils import hdfs_io
@@ -651,6 +756,21 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     hdfs_io.makedirs(hdfs_path, exist_ok=True)
                     hdfs_io.copy(src=dist_checkpoint_path, dst=hdfs_path, dirs_exist_ok=True)
                     hdfs_io.copy(src=hf_config_tokenizer_path, dst=hdfs_path, dirs_exist_ok=True)
+
+            # update latest_checkpointed_iteration.txt when async_save is True
+            if self.checkpoint_config.async_save and self.rank == 0:
+                log_with_rank(
+                    f"Update latest_checkpointed_iteration.txt to step {global_step}",
+                    rank=self.rank,
+                    logger=logger,
+                )
+                local_latest_checkpointed_iteration = os.path.join(
+                    os.path.dirname(os.path.dirname(local_path)), "latest_checkpointed_iteration.txt"
+                )
+                with open(local_latest_checkpointed_iteration, "w") as f:
+                    f.write(str(global_step))
+
+            self.register_checkpoint(local_path, max_ckpt_to_keep)
 
         if self.checkpoint_config.async_save:
             assert async_save_request is not None, "Async save request should not be None when using async save."

@@ -49,6 +49,7 @@ if os.getenv("VERL_USE_MODELSCOPE", "False").lower() == "true":
 
     patch_hub()
 
+
 if is_npu_available:
     # Workaround for torch-npu's lack of support for creating nested tensors from NPU tensors.
     #
@@ -69,9 +70,6 @@ if is_npu_available:
             torch.nested.as_nested_tensor = torch.nested.as_nested_tensor.__wrapped__
     except AttributeError:
         pass
-
-    # Apply patches about transformers
-    from .models.transformers import npu_patch as npu_patch  # noqa
 
     # In verl, the driver process aggregates the computation results of workers via Ray.
     # Therefore, after a worker completes its computation job, it will package the output

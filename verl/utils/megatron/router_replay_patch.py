@@ -11,10 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import warnings
+import inspect
 import logging
+import os
+import types
+import warnings
 from enum import Enum
+from functools import wraps
 
 import torch
 from torch import no_grad
@@ -28,15 +31,16 @@ except ImportError:
 
 try:
     from megatron.core.transformer.moe.moe_utils import (
+        MoEAuxLossAutoScaler,
+        apply_random_logits,
         apply_router_token_dropping,
         compute_routing_scores_for_aux_loss,
         group_limited_topk,
-        apply_random_logits,
-        MoEAuxLossAutoScaler,
     )
+    from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 except ImportError:
     warnings.warn("NPU not support router replay for now.", stacklevel=2)
-    pass
+    MoEAlltoAllTokenDispatcher = None
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -54,12 +58,14 @@ class RouterReplayAction(Enum):
 
 class RouterReplayCacheAction(Enum):
     """Enum for logits cache recording phases."""
+
     COMPUTE_LOG_PROB = "compute_log_prob"
     TRAINING = "training"
 
 
 class RouterPredictiveAction(Enum):
     """Enum for router predictive actions."""
+
     DISABLED = "disabled"
     RECORD = "record"  # R2 log_prob阶段：记录inputs和logits
     SKIP_PREDICTIVE = "skip_predictive"  # training ministep==0：跳过loss计算
@@ -300,7 +306,7 @@ class RouterReplay:
 
     def set_predictive_data(self, inputs: torch.Tensor, logits: torch.Tensor, valid_mask=None, loss_scale: float = 1.0):
         """Set old inputs and logits for this layer.
-        
+
         Args:
             inputs: Old router inputs
             logits: Old router logits
@@ -326,7 +332,7 @@ class RouterReplay:
         """Record inputs and logits for this layer (like record_indices)."""
         # Keep on GPU for merge function, which will handle CPU transfer uniformly
         # Use .detach() to break gradient graph and reduce memory footprint
-        
+
         # Detach and create contiguous copies to allow original tensors to be freed
         self.recorded_old_inputs = inputs.squeeze().detach().contiguous()
         self.recorded_old_logits = logits.squeeze().detach().contiguous()
@@ -573,7 +579,29 @@ def _patched_topk_routing_with_score_function(
     return routing_probs, routing_map
 
 
-def patched_routing(self, logits: torch.Tensor):
+def _get_aux_loss_coeff(_self, aux_loss_type: str) -> float:
+    """Return the aux loss coeff for the given auxiliary loss type."""
+    if isinstance(_self.routing_type, str):
+        if _self.routing_type == aux_loss_type:
+            return _self.config.moe_aux_loss_coeff
+    if isinstance(_self.routing_type, list):
+        try:
+            idx = _self.routing_type.index(aux_loss_type)
+            return _self.config.moe_aux_loss_coeff[idx]
+        except (ValueError, IndexError):
+            return 0.0
+    return 0.0
+
+
+def _is_aux_loss_enabled(_self) -> bool:
+    """Check if the auxiliary loss is enabled."""
+    for aux_loss_type in ["aux_loss", "seq_aux_loss", "global_aux_loss"]:
+        if _get_aux_loss_coeff(_self, aux_loss_type) > 0:
+            return True
+    return False
+
+
+def patched_routing(self, logits: torch.Tensor, *args, **kwargs):
     """Top-k routing function
 
     Args:
@@ -592,6 +620,8 @@ def patched_routing(self, logits: torch.Tensor):
     # Apply Z-Loss
     logits = self.apply_z_loss(logits)
 
+    moe_router_fusion = getattr(self.config, "moe_router_fusion", False)
+
     # Calculate probs and routing_map for token dispatching
     if self.routing_type == "sinkhorn":
         probs, routing_map = self.sinkhorn_load_balancing(logits)
@@ -605,7 +635,7 @@ def patched_routing(self, logits: torch.Tensor):
             scaling_factor=self.config.moe_router_topk_scaling_factor,
             score_function=self.score_function,
             expert_bias=self.expert_bias,
-            fused=self.config.moe_router_fusion,
+            fused=moe_router_fusion,
             router_replay=self.router_replay,
             layer_number=self.layer_number,  # Pass layer_number for logits recording
         )
@@ -621,11 +651,14 @@ def patched_routing(self, logits: torch.Tensor):
             pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
         )
 
+    if not hasattr(self, "is_aux_loss_enabled"):
+        self.is_aux_loss_enabled = types.MethodType(_is_aux_loss_enabled, self)
+
     # Apply each aux loss type and attach aux loss autograd function to probs
     if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
         # Calculate scores and routing_map for aux loss
         routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
-            logits, self.topk, self.score_function, fused=self.config.moe_router_fusion
+            logits, self.topk, self.score_function, fused=moe_router_fusion
         )
         probs = self._apply_aux_loss(probs, scores_for_aux_loss, routing_map_for_aux_loss)
         probs = self._apply_seq_aux_loss(probs, scores_for_aux_loss, routing_map_for_aux_loss, seq_length, bsz)
@@ -978,65 +1011,104 @@ def patched_forward(self, input: torch.Tensor):
 def apply_router_replay_patch():
     """
     Applies the monkey patch for MoE Router Replay functionality.
-    This patch dynamically adds the 'enable_routing_replay' attribute to TransformerConfig
+    This patch dynamically adds router replay / predictive attributes to TransformerConfig
     and modifies the TopKRouter to support recording and replaying of routing decisions.
-    
-    Also supports router bias predictor for R2-only predicted routing replay.
     """
     logger.info("Applying Router Replay Patch...")
-    # Clear router instances to avoid state leakage between model initializations.
     RouterReplay.router_instances.clear()
-    # Step 1: Patch TransformerConfig to include the feature flags
-    if not hasattr(TransformerConfig, "enable_routing_replay"):
-        # Add class attribute with default value
-        TransformerConfig.enable_routing_replay = False
+    try:
+        sig = inspect.signature(TransformerConfig.__init__)
+        native_params = sig.parameters
+        params = list(sig.parameters.values())
+    except Exception:
+        sig = None
+        native_params = {}
+        params = []
 
-        # Store original __init__ method
+    ext_attrs = {
+        "enable_routing_replay": False,
+        "enable_router_bias_predictor": False,
+        "bias_predictor_loss_type": "kl",
+        "bias_predictor_lr_mult": 1000.0,
+    }
+
+    for attr, default in ext_attrs.items():
+        if attr not in native_params and sig is not None:
+            new_param = inspect.Parameter(attr, inspect.Parameter.KEYWORD_ONLY, default=default)
+            if params and params[-1].kind == inspect.Parameter.VAR_KEYWORD:
+                params.insert(-1, new_param)
+            else:
+                params.append(new_param)
+
+    if sig is not None:
+        try:
+            TransformerConfig.__init__.__signature__ = sig.replace(parameters=params)
+        except Exception as e:
+            logger.warning("Failed to update TransformerConfig signature metadata: %s", e)
+
+    if not hasattr(TransformerConfig, "_verl_router_patched"):
+        TransformerConfig.enable_routing_replay = ext_attrs["enable_routing_replay"]
+        TransformerConfig.enable_router_bias_predictor = ext_attrs["enable_router_bias_predictor"]
+        TransformerConfig.bias_predictor_loss_type = ext_attrs["bias_predictor_loss_type"]
+        TransformerConfig.bias_predictor_lr_mult = ext_attrs["bias_predictor_lr_mult"]
+
         original_tf_config_init = TransformerConfig.__init__
 
-        # Define new __init__ method that safely handles enable_routing_replay parameter
+        @wraps(original_tf_config_init)
         def patched_tf_config_init(self, *args, **kwargs):
-            # Simple solution: remove the unknown parameter before calling original constructor
-            enable_routing_replay = kwargs.pop("enable_routing_replay", TransformerConfig.enable_routing_replay)
+            values = {}
+            for attr, default in ext_attrs.items():
+                if attr in native_params:
+                    values[attr] = kwargs.get(attr, default)
+                else:
+                    values[attr] = kwargs.pop(attr, default)
 
-            # Also handle router bias predictor parameters
-            enable_router_bias_predictor = kwargs.pop("enable_router_bias_predictor", False)
-            bias_predictor_loss_type = kwargs.pop("bias_predictor_loss_type", "kl")
-            bias_predictor_lr_mult = kwargs.pop("bias_predictor_lr_mult", 1000.0)
-
-            # Call original constructor with remaining kwargs
             original_tf_config_init(self, *args, **kwargs)
 
-            # Set the instance attributes
-            self.enable_routing_replay = enable_routing_replay
-            self.enable_router_bias_predictor = enable_router_bias_predictor
-            self.bias_predictor_loss_type = bias_predictor_loss_type
-            self.bias_predictor_lr_mult = bias_predictor_lr_mult
+            for attr, value in values.items():
+                setattr(self, attr, value)
 
-        # Apply the patch
         TransformerConfig.__init__ = patched_tf_config_init
+        TransformerConfig._verl_router_patched = True
 
-    # Step 2: Patch TopKRouter only once to ensure idempotency.
     if hasattr(TopKRouter, "_router_replay_patched"):
         return
 
     original_init = TopKRouter.__init__
 
-    # Step 3: Define the new __init__ method
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         self.router_replay = None
-        if self.config.enable_routing_replay:
+        if getattr(self.config, "enable_routing_replay", False):
             self.router_replay = RouterReplay()
 
-    # Step 4: Apply the patches
+    if MoEAlltoAllTokenDispatcher is not None and not hasattr(MoEAlltoAllTokenDispatcher, "_preprocess_patched"):
+        original_preprocess = MoEAlltoAllTokenDispatcher.preprocess
+
+        def patched_preprocess(self, routing_map):
+            result = original_preprocess(self, routing_map)
+            if (
+                getattr(self.config, "enable_routing_replay", False)
+                and not self.drop_and_pad
+                and self.config.moe_expert_capacity_factor is None
+                and not (
+                    getattr(self.config, "moe_router_padding_for_quantization", None)
+                    or getattr(self.config, "moe_router_padding_for_fp8", None)
+                )
+            ):
+                self.num_out_tokens = int(routing_map.sum().item())
+            return result
+
+        MoEAlltoAllTokenDispatcher.preprocess = patched_preprocess
+        MoEAlltoAllTokenDispatcher._preprocess_patched = True
+
     TopKRouter.__init__ = patched_init
     TopKRouter.routing = patched_routing
-    TopKRouter._router_replay_patched = True
-    # predictive routing replay
-    # TopKRouter.apply_predictive_loss = apply_predictive_loss
     TopKRouter.forward = patched_forward
+    TopKRouter._router_replay_patched = True
 
-    logger.info(f"Router Replay Patch applied successfully. "
-                f"enable_routing_replay={TransformerConfig.enable_routing_replay}, "
-                f"enable_router_bias_predictor={TransformerConfig.enable_router_bias_predictor}")
+    logger.info(
+        "Router Replay Patch applied successfully. enable_routing_replay=%s, enable_router_bias_predictor=%s",
+        getattr(TransformerConfig, "enable_routing_replay", False),
+        getattr(TransformerConfig, "enable_router_bias_predictor", False),
+    )

@@ -69,6 +69,15 @@ def is_trl_available():
     return trl_spec is not None
 
 
+@cache
+def is_msprobe_available():
+    try:
+        msprobe_spec = importlib.util.find_spec("msprobe")
+    except ModuleNotFoundError:
+        msprobe_spec = None
+    return msprobe_spec is not None
+
+
 def import_external_libs(external_libs=None):
     if external_libs is None:
         return
@@ -195,6 +204,39 @@ def load_extern_object(module_path: str, object_name: str) -> object:
         raise AttributeError(f"Object not found in module: {object_name=}, {module_path=}.")
 
     return getattr(module, object_name)
+
+
+def load_class_from_fqn(fqn: str, description: str = "class") -> type:
+    """Load a class from its fully qualified name.
+
+    Args:
+        fqn: Fully qualified class name (e.g., 'mypackage.module.ClassName').
+        description: Description for error messages (e.g., 'AgentLoopManager').
+
+    Returns:
+        The loaded class.
+
+    Raises:
+        ValueError: If fqn format is invalid (missing dot separator).
+        ImportError: If the module cannot be imported.
+        AttributeError: If the class is not found in the module.
+
+    Example:
+        >>> cls = load_class_from_fqn("verl.experimental.agent_loop.AgentLoopManager")
+        >>> instance = cls(config=config, ...)
+    """
+    if "." not in fqn:
+        raise ValueError(
+            f"Invalid {description} '{fqn}'. Expected fully qualified class name (e.g., 'mypackage.module.ClassName')."
+        )
+    try:
+        module_path, class_name = fqn.rsplit(".", 1)
+        module = importlib.import_module(module_path)
+        return getattr(module, class_name)
+    except ImportError as e:
+        raise ImportError(f"Failed to import module '{module_path}' for {description}: {e}") from e
+    except AttributeError as e:
+        raise AttributeError(f"Class '{class_name}' not found in module '{module_path}': {e}") from e
 
 
 @deprecated(replacement="load_module(file_path); getattr(module, type_name)")

@@ -1,5 +1,4 @@
 set -x
-export VLLM_ASCEND_ENABLE_NZ=0
 
 MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-0.5B-Instruct}  # TODO: change to Qwen3-0.6B when CI server is ready
 MODEL_PATH=${MODEL_PATH:-${HOME}/.cache/models/${MODEL_ID}}
@@ -31,14 +30,15 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enforce_eager=False \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode="FULL_AND_PIECEWISE" \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
     critic.model.path="${MODEL_PATH}" \
     critic.model.enable_gradient_checkpointing=True \
     critic.ppo_micro_batch_size_per_gpu=1 \
     critic.ulysses_sequence_parallel_size=2 \
-    critic.model.fsdp_config.param_offload=True \
-    critic.model.fsdp_config.optimizer_offload=True \
+    critic.fsdp.param_offload=True \
+    critic.fsdp.optimizer_offload=True \
     critic.use_dynamic_bsz=True \
     trainer.critic_warmup=0 \
     trainer.logger='["console"]' \
@@ -49,5 +49,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
     trainer.total_epochs=1 \
-    trainer.total_training_steps=1 \
-    trainer.device=npu $@
+    trainer.total_training_steps=1 $@

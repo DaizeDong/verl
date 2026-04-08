@@ -36,8 +36,9 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint import CheckpointHandler, OrchestrationMode
 from verl.utils.dataset.dataset_utils import SFTTensorCollator
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
-from verl.utils.device import get_device_name
+from verl.utils.device import auto_set_device, get_device_name
 from verl.utils.logger import log_with_rank
+from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions
 from verl.utils.tracking import Tracking
 from verl.workers.engine_workers import TrainingWorker
 
@@ -90,6 +91,19 @@ class SFTTrainer:
         self.engine_config = omega_conf_to_dataclass(self.config.engine)
         self.optimizer_config = omega_conf_to_dataclass(self.config.optim)
         self.checkpoint_config = omega_conf_to_dataclass(self.config.checkpoint)
+        self.profiler_config = omega_conf_to_dataclass(self.config.profiler)
+
+        # check profile interval
+        self.profiler_interval = self.config.trainer.profile_interval
+        self._validate_profiler_interval()
+
+    def _validate_profiler_interval(self):
+        assert len(self.profiler_interval) == 2
+        self.start_profile_step = self.profiler_interval[0]
+        self.end_profile_step = self.profiler_interval[1]
+        assert self.end_profile_step >= self.start_profile_step
+        if self.start_profile_step < 0:
+            assert self.end_profile_step < 0
 
     def _build_engine(self):
         from verl.workers.engine_workers import TrainingWorkerConfig
@@ -103,7 +117,17 @@ class SFTTrainer:
             engine_config=self.engine_config,
             optimizer_config=self.optimizer_config,
             checkpoint_config=self.checkpoint_config,
+            profiler_config=self.profiler_config,
         )
+
+        wg_kwargs = {}
+        if self.start_profile_step != -1:
+            wg_kwargs["profile_steps"] = list(range(self.start_profile_step, self.end_profile_step + 1))
+            # Only require nsight worker options when tool is nsys
+            if OmegaConf.select(self.config.profiler, "tool") == "nsys":
+                wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                )
 
         # create resource pool and worker group
         from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
@@ -112,19 +136,33 @@ class SFTTrainer:
         nnodes = self.config.trainer.nnodes
         self.resource_pool = RayResourcePool(process_on_nodes=[n_gpus_per_node] * nnodes)
         ray_cls_with_init = RayClassWithInitArgs(ray.remote(TrainingWorker), config=config)
-        self.training_client = RayWorkerGroup(resource_pool=self.resource_pool, ray_cls_with_init=ray_cls_with_init)
+        self.training_client = RayWorkerGroup(
+            resource_pool=self.resource_pool,
+            ray_cls_with_init=ray_cls_with_init,
+            device_name=self.config.trainer.device,
+            **wg_kwargs,
+        )
         self.training_client.set_loss_fn(loss_fn=self.loss_fn)
         self.training_client.reset()
 
     def _build_dataset(self):
         config = self.config
         tokenizer = self.model_config.tokenizer
+        processor = self.model_config.processor
         train_dataset = create_sft_dataset(
-            config.data.train_files, config.data, tokenizer, max_samples=config.data.get("train_max_samples", -1)
+            config.data.train_files,
+            config.data,
+            tokenizer,
+            processor=processor,
+            max_samples=config.data.get("train_max_samples", -1),
         )
         if config.data.val_files:
             val_dataset = create_sft_dataset(
-                config.data.val_files, config.data, tokenizer, max_samples=config.data.get("val_max_samples", -1)
+                config.data.val_files,
+                config.data,
+                tokenizer,
+                processor=processor,
+                max_samples=config.data.get("val_max_samples", -1),
             )
         else:
             val_dataset = None
@@ -157,7 +195,7 @@ class SFTTrainer:
             sampler=self.train_sampler,
             collate_fn=self.collate_fn,
             num_workers=8,
-            pin_memory=True,
+            pin_memory=False,
             drop_last=True,
             pin_memory_device=device_name,
         )
@@ -172,7 +210,7 @@ class SFTTrainer:
                 sampler=self.val_sampler,
                 collate_fn=self.collate_fn,
                 num_workers=8,
-                pin_memory=True,
+                pin_memory=False,
                 drop_last=True,
                 pin_memory_device=device_name,
             )
@@ -264,15 +302,40 @@ class SFTTrainer:
                 global_step += 1
                 # construct tensordict
                 data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=meta_info)
-                batch_seqlens = self._get_batch_seqlens(data=data)
+                batch_seqlens = self._get_batch_seqlens(data=data).tolist()
                 # this is necessary. Otherwise, it is interpreted as NonTensorStack
-                batch_seqlens = NonTensorData(batch_seqlens.tolist())
+                batch_seqlens_ntd = NonTensorData(batch_seqlens)
 
-                tu.assign_non_tensor(data, update_lr_scheduler=True, global_token_num=batch_seqlens)
+                tu.assign_non_tensor(data, update_lr_scheduler=True, global_token_num=batch_seqlens_ntd)
+
+                if self.config.trainer.balance_batch:
+                    global_seqlen_lst = torch.Tensor([item.size()[0] for item in data["input_ids"]])
+                    global_seqlen_lst = calculate_workload(global_seqlen_lst)
+                    dp_size = max(self.training_client._query_dispatch_info("train")) + 1
+
+                    global_partition_lst = get_seqlen_balanced_partitions(
+                        global_seqlen_lst, k_partitions=dp_size, equal_size=True
+                    )
+                    # Place smaller micro-batches at both ends to reduce the bubbles in pipeline parallel.
+                    for idx, partition in enumerate(global_partition_lst):
+                        partition.sort(key=lambda x: (global_seqlen_lst[x], x))
+                        ordered_partition = partition[::2] + partition[1::2][::-1]
+                        global_partition_lst[idx] = ordered_partition
+
+                    global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+
+                    data = tu.index_select_tensor_dict(data, global_idx)
+
+                # start profile in SPMD mode
+                if global_step == self.start_profile_step:
+                    self.training_client.start_profile()
 
                 # train for on batch
                 output = self.training_client.train_batch(data)
                 output = output.get()
+
+                if global_step == self.end_profile_step:
+                    self.training_client.stop_profile()
 
                 metrics = tu.get(output, "metrics")
 
@@ -324,10 +387,12 @@ def run_sft(config):
 
 @hydra.main(config_path="config", config_name="sft_trainer_engine", version_base=None)
 def main(config):
+    # Automatically set `config.trainer.device = npu` when running on Ascend NPU.
+    auto_set_device(config)
     run_sft(config)
 
 
-def create_sft_dataset(data_paths, data_config, tokenizer, max_samples=-1):
+def create_sft_dataset(data_paths, data_config, tokenizer, processor, max_samples=-1):
     """Create a dataset."""
     # build dataset
     # First check if a custom dataset class is specified
@@ -340,7 +405,9 @@ def create_sft_dataset(data_paths, data_config, tokenizer, max_samples=-1):
         dataset_cls = MultiTurnSFTDataset
 
     # Create datasets based on the selected class
-    dataset = dataset_cls(parquet_files=data_paths, tokenizer=tokenizer, config=data_config, max_samples=max_samples)
+    dataset = dataset_cls(
+        parquet_files=data_paths, tokenizer=tokenizer, config=data_config, processor=processor, max_samples=max_samples
+    )
     return dataset
 
 

@@ -44,6 +44,7 @@ from torch import nn
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.device import get_device_id, get_torch_device
+from verl.utils.import_utils import deprecated
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, RouterReplayCacheAction, RouterPredictiveAction
 from verl.utils.megatron.router_replay_saver import RouterReplayLogitsSaver
@@ -58,16 +59,17 @@ from verl.utils.megatron.router_replay_utils import (
     set_router_predictive_bias_data,
 )
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
-from verl.utils.megatron_utils import get_model_config, unwrap_model
+from verl.utils.megatron_utils import get_megatron_mtp_loss, get_model_config, unwrap_model
 from verl.utils.memory_utils import get_system_memory_info
 from verl.utils.profiler import GPUMemoryLogger
-from verl.utils.profiler.profile import Profiler
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import broadcast_dict_tensor
 from verl.workers.actor import BasePPOActor
+from verl.workers.config import MtpConfig
 
 __all__ = ["MegatronPPOActor"]
+
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -160,7 +162,7 @@ def _format_predictor_grad_stats(grad: torch.Tensor | None) -> str:
         f"grad_checksum={grad.sum().item():.6e}"
     )
 
-
+@deprecated("legacy worker implementation is deprecated and will be removed in v0.8.0")
 class MegatronPPOActor(BasePPOActor):
     def __init__(
         self,
@@ -170,6 +172,7 @@ class MegatronPPOActor(BasePPOActor):
         tf_config,
         actor_module: nn.ModuleList,
         actor_optimizer: DistributedOptimizer,
+        mtp_config: MtpConfig = None,
     ):
         """MeagtronPPOActor class. This class implements the simple PPO logics when the model is built with Megatron.
 
@@ -191,6 +194,7 @@ class MegatronPPOActor(BasePPOActor):
                 ``model_config.hidden_size``
             hf_config (PretrainedConfig): huggingface config
             tf_config (TransformerConfig): mcore transformer config
+            mtp_config (MtpConfig): mtp config, default None
             actor_module (nn.ModuleList): actor module is a ModuleList that contains a list of nn.Module in this
                 pp stage.
                 each nn.Module in this rank holds a vpp module chunk. See https://arxiv.org/pdf/2104.04473.pdf for
@@ -226,22 +230,40 @@ class MegatronPPOActor(BasePPOActor):
         self.model_config = model_config
         self.hf_config = hf_config
         self.tf_config = tf_config
+        self.mtp_config = mtp_config
         self.actor_module = actor_module
         self.actor_optimizer: DistributedOptimizer = actor_optimizer
-        self.use_torch_profiler = self.config.profiler.get("tool") == "torch"
-        if self.use_torch_profiler:
-            self.prof = Profiler(
-                self.config.profiler, tool_config=self.config.profiler.get("tool_config", {}).get("torch", {})
-            )
-        else:
-            self.prof = None
+
+        if self.mtp_config:
+            assert self.mtp_config.enable, "MTP requires mtp_config.enable to be True"
+
         self.use_fused_kernels = self.config.get("use_fused_kernels", False)
+        if getattr(self.mtp_config, "enable", False) and self.use_fused_kernels:
+            self.use_fused_kernels = False
+            logger.warning_once(
+                "MTP is not compatible with fused kernels for now. Automatically disable use_fused_kernels."
+            )
         if self.use_fused_kernels and not getattr(self.config, "overlap_moe_expert_parallel_comm", False):
             # do not patch if overlap_moe_expert_parallel_comm is enabled
+            logger.warning_once(
+                "Recommend to disable use_fused_kernels since the fused kernel's performance is broken for triton>=3.3"
+                "Unless you are using a very old version of triton < 3.3"
+            )
             from verl.models.mcore.model_forward_fused import patch_fused_forward
 
             for model in self.actor_module:
                 patch_fused_forward(model)
+        else:
+            from verl.models.mcore.mtp_patch import patch_postprocess
+
+            for model in self.actor_module:
+                if self.mtp_config:
+                    from verl.models.mcore.mtp_patch import patch_mtp_layer_get_embeddings
+
+                    patch_postprocess(model)
+
+                    if self.mtp_config.detach_encoder:
+                        patch_mtp_layer_get_embeddings(model)
 
         self.optimizer_step_args = OmegaConf.create(
             {
@@ -921,6 +943,9 @@ class MegatronPPOActor(BasePPOActor):
         Returns:
             DataProto: torch.Tensor: the log_prob tensor
         """
+        prev_modes = [m.training for m in self.actor_module]
+        for module in self.actor_module:
+            module.eval()
         use_dynamic_bsz = data.meta_info.get("use_dynamic_bsz", False)
         micro_batch_size = data.meta_info.get("micro_batch_size", None)
         max_token_len = data.meta_info.get("max_token_len", None)
@@ -1149,6 +1174,8 @@ class MegatronPPOActor(BasePPOActor):
         # add empty cache after each compute
         get_torch_device().empty_cache()
 
+        for module, mode in zip(self.actor_module, prev_modes, strict=False):
+            module.train(mode)
         return log_probs, entropys, layers_topk_idx, layers_predictive_states
 
     def make_minibatch_iterator(self, data: DataProto) -> Iterable[DataProto]:
@@ -1366,6 +1393,7 @@ class MegatronPPOActor(BasePPOActor):
                     f"observed={current_max_seq_len}"
                 )
                 effective_max_token_len = current_max_seq_len
+            dp_group = mpu.get_data_parallel_group()
             vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
             if vpp_size is not None and vpp_size > 1:
                 microbatch_group_size_per_vp_stage = self.tf_config.microbatch_group_size_per_vp_stage
@@ -1373,6 +1401,7 @@ class MegatronPPOActor(BasePPOActor):
                     batch=mini_batch.batch,
                     num_batches_divided_by=microbatch_group_size_per_vp_stage,
                     max_token_len=effective_max_token_len,
+                    dp_group=dp_group,
                 )
                 
                 # Wrap TensorDicts in DataProto
@@ -1389,7 +1418,7 @@ class MegatronPPOActor(BasePPOActor):
                 )
             else:
                 micro_batches_td, indices = rearrange_micro_batches(
-                    batch=mini_batch.batch, max_token_len=effective_max_token_len
+                    batch=mini_batch.batch, max_token_len=effective_max_token_len, dp_group=dp_group
                 )
                 
                 # Wrap TensorDicts in DataProto
@@ -1492,9 +1521,9 @@ class MegatronPPOActor(BasePPOActor):
                 )
                 stats.update(pg_metrics)
 
-                # Skip if using pure rollout correction mode (metrics already in pg_metrics)
+                # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
                 rollout_log_prob = data.get("rollout_log_probs", None)
-                if loss_mode != "rollout_correction" and rollout_log_prob is not None:
+                if loss_mode != "bypass_mode" and rollout_log_prob is not None:
                     # Compute metrics using CURRENT policy π_θ vs π_rollout
                     # Tracks evolving off-policy gap as π_θ updates during mini-batch training
                     from verl.trainer.ppo.rollout_corr_helper import compute_rollout_corr_metrics_from_logprobs
@@ -1781,6 +1810,7 @@ class MegatronPPOActor(BasePPOActor):
                     logits_processor=logits_processor,
                     logits_processor_args=logits_processor_args,
                     data_format="thd" if self.config.megatron.use_remove_padding else "bshd",
+                    mtp_config=None if forward_only else self.mtp_config,
                 )
 
             # logger.info(f"[Memory] [forward_step] After model forward: {get_system_memory_info()}")
@@ -1946,6 +1976,11 @@ class MegatronPPOActor(BasePPOActor):
             import gc
             gc.collect()
 
+        # Collect and pass MTP metrics to losses_reduced
+        if not forward_only and self.mtp_config and self.mtp_config.enable_train:
+            metrics = get_megatron_mtp_loss(n_micro_batch)
+            losses_reduced["mtp_losses"] = [metrics]
+
         return losses_reduced
 
     @GPUMemoryLogger(role="megatron actor", logger=logger)
@@ -1955,6 +1990,8 @@ class MegatronPPOActor(BasePPOActor):
         Args:
             dataloader (Iterable[DataProto]): an iterator over the DataProto that returns by ``make_minibatch_iterator``
                 The keys of each data batch is described in the make_minibatch_iterator.
+
+            enable_mtp (bool, optional): whether to enable MTP communication
 
         Returns:
             Dict: a dictionary containing the statistics. Note that the statistics are only valid in the last pp stage
@@ -1991,7 +2028,6 @@ class MegatronPPOActor(BasePPOActor):
                 RouterReplay.set_cache_action(RouterReplayCacheAction.TRAINING)
             else:
                 RouterReplay.clear_cache_action()
-
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
                 # Set predictive action based on ministep
@@ -2104,6 +2140,11 @@ class MegatronPPOActor(BasePPOActor):
             finally:
                 self._current_r3_trace_global_step = None
                 self._current_r3_trace_mini_step = None
+            mtp_losses = metric_micro_batch.get("mtp_losses", None)
+            if mtp_losses is not None:
+                # mtp_losses is now in format: [{"mtp_losses/mtp_1_loss": [value1], "mtp_losses/mtp_2_loss": [value2]}]
+                for mtp_metrics_dict in mtp_losses:
+                    append_to_dict(metrics, mtp_metrics_dict)
             metric_micro_batch = metric_micro_batch["output"]
             for metric in metric_micro_batch:
                 # Note that o[0] is metrics, o[1] is entropy, o[2] is response_mask
@@ -2177,8 +2218,6 @@ class MegatronPPOActor(BasePPOActor):
                 pass
             else:
                 raise NotImplementedError
-            if self.use_torch_profiler and self.prof and self.prof.enable:
-                self.prof.step()
 
             if self.config.router_replay.mode in ["R2", "R3"]:
                 # logger.info(f"[Memory] [update_policy] Before clear router replay: {get_system_memory_info()}")
@@ -2234,9 +2273,6 @@ class MegatronPPOActor(BasePPOActor):
                     metrics[f"router/{key}"] = value
                 logger.info(f"[Predictive Routing Replay] Predictive metrics: {predictive_metrics}")
 
-        # add empty cache after each compute
-        if self.use_torch_profiler and self.prof and self.prof.enable:
-            self.prof.stop_and_save()
-            self.prof.stop_trace()
+        self.actor_optimizer.zero_grad()
         get_torch_device().empty_cache()
         return metrics

@@ -3,7 +3,7 @@
 Using Checkpoints to Support Fault Tolerance Training
 =====================================================
 
-Last updated: 06/25/2025.
+Last updated: 03/22/2026.
 
 There could be training errors or machine failure during the whole RLHF training process, 
 so it is recommended to enable checkpoints to minimize your loss.
@@ -137,32 +137,37 @@ Current implementation use solution 2.
 HuggingFace to Megatron DistCheckpoint details
 ----------------------------------------------
 
-If your model is quite huge, we recommend you to use Megatron dist-checkpoint to load the model.
-Megatron dist-checkpoint supports loading with different kinds of model parallelism,
-and it is much faster than the original checkpoint loading.
+Through ``mbridge``, we can directly save the mcore model to huggingface format during training.
+No need to convert the model to Megatron dist-checkpoint format.
 
-To convert original HuggingFace model to Megatron dist-checkpoint,
-you can use the ``scripts/converter_hf_to_mcore.py`` script. Large MoE models are temporarily supported with CPU initialization,
-which is a little slower. While we are working on a better solution to support large models.
+.. note::
 
-Example command to convert the model is as follows:
+    Megatron provides multiple optimizer checkpoint formats controlled by:
 
-.. code:: bash
+    - ``dist_ckpt_optim_fully_reshardable``:
 
-    python scripts/converter_hf_to_mcore.py \
-        --hf_model_path Qwen/Qwen1.5-MoE-A2.7B-Chat \
-        --output_path /mnt/disk/Qwen/Qwen1.5-MoE-A2.7B-Chat \
-        --use_cpu_initialization    # Only work for MoE models
+      - ``False`` (default, dp-reshardable):
+        The optimizer checkpoint supports resuming with different data parallel sizes.
+        This format is faster and has lower memory overhead during checkpoint saving.
 
+      - ``True`` (fully-reshardable):
+        The optimizer checkpoint supports resuming with arbitrary parallelism configurations.
+        However, this format is slower and introduces additional memory overhead.
 
-Example command to distributed convert the huge model like deepseekv3 671B is as follows:
+    - ``distrib_optim_fully_reshardable_mem_efficient``:
 
-.. code:: bash
+      When using fully-reshardable format, enabling this option switches communication
+      from NCCL to Gloo to reduce CUDA memory usage, at the cost of performance.
 
-    torchrun --nproc_per_node 1 --nnodes 8 --node_rank ${RANK} scripts/converter_hf_to_mcore.py \
-        --hf_model_path deepseek-ai/DeepSeek-V3 \
-        --output_path /mnt/disk/deepseek-ai/DeepSeek-V3 \
-        --use_cpu_initialization    # Only work for MoE models
+.. warning::
+
+    When ``dist_ckpt_optim_fully_reshardable=True``, saving optimizer checkpoints requires
+    gathering optimizer states on data parallel rank 0. Although the final checkpoint is
+    sharded, this introduces a temporary aggregation step during saving.
+
+    This may increase CPU memory usage and lead to OOM issues for large models.
+    We recommend using the default dp-reshardable format in most cases.
+
 
 Original Checkpoint Utils
 -------------------------
