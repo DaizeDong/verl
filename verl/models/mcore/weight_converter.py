@@ -368,6 +368,7 @@ class McoreToHFWeightConverterDpskv3(McoreToHFWeightConverterBase):
                 "mlp.shared_experts.up_proj.weight",
             ],
             "pre_mlp_layernorm.weight": "post_attention_layernorm.weight",
+            "mlp.router.bias_predictor.weight": "mlp.bias_predictor.weight",
             "mlp.router.weight": "mlp.gate.weight",
             "mlp.router.expert_bias": "mlp.gate.e_score_correction_bias",
         }

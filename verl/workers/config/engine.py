@@ -54,11 +54,22 @@ class EngineRouterReplayConfig(BaseConfig):
             Required when mode is 'record', 'R2', or 'R3'.
         replay_file (Optional[str]): File path to load recorded routing decisions for replay.
             Required when mode is 'replay'.
+        enable_bias_predictor (bool): Whether a router bias predictor head is attached to
+            the MoE routers. Mirrors ``actor.router_replay.enable_bias_predictor`` so that
+            the engine knows to build the predictor submodule and reshape checkpoints that
+            contain its weights.
+        bias_predictor_loss_type (str): Loss type for training the bias predictor
+            (``l2`` / ``kl`` / ``kl-post``). Only effective when enable_bias_predictor=True.
+        bias_predictor_lr_mult (float): Learning-rate multiplier for bias predictor params.
+            Only effective when enable_bias_predictor=True.
     """
 
     mode: str = "disabled"
     record_file: Optional[str] = None
     replay_file: Optional[str] = None
+    enable_bias_predictor: bool = False
+    bias_predictor_loss_type: str = "kl"
+    bias_predictor_lr_mult: float = 1000.0
 
     def __post_init__(self):
         """Validate router replay configuration."""
@@ -161,7 +172,9 @@ class McoreEngineConfig(EngineConfig):
         max_seqlen_per_dp_cp_rank (Optional[int]): Maximum sequence length per DPxCP rank.
         sequence_parallel (bool): Whether to enable sequence parallelism.
         use_distributed_optimizer (bool): Whether to use distributed optimizer.
-        use_dist_checkpointing (bool): Whether to use distributed checkpointing.
+        use_dist_checkpointing (bool): Whether to use distributed checkpointing for training-period saves.
+        load_initial_dist_checkpointing (Optional[bool]): Whether to initialize from a distributed checkpoint.
+            Defaults to `use_dist_checkpointing` when unset.
         dist_checkpointing_path (Optional[str]): Path for distributed checkpointing.
         dist_ckpt_optim_fully_reshardable (bool): Use fully reshardable optimizer checkpoints.
         distrib_optim_fully_reshardable_mem_efficient (bool): Use memory-efficient fully reshardable format.
@@ -186,6 +199,7 @@ class McoreEngineConfig(EngineConfig):
     sequence_parallel: bool = True
     use_distributed_optimizer: bool = True
     use_dist_checkpointing: bool = False
+    load_initial_dist_checkpointing: Optional[bool] = None
     dist_checkpointing_path: Optional[str] = None
     dist_checkpointing_prefix: str = ""
     dist_ckpt_optim_fully_reshardable: bool = False

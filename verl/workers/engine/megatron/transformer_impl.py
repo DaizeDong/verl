@@ -112,8 +112,26 @@ class MegatronEngine(BaseEngine):
 
         # Router replay configuration for MoE models
         self.enable_routing_replay = self.engine_config.router_replay.mode != "disabled"
-        logger.info(f"enable_routing_replay in MegatronEngine: {self.enable_routing_replay}")
-        if self.enable_routing_replay:
+        self.enable_bias_predictor = bool(
+            getattr(self.engine_config.router_replay, "enable_bias_predictor", False)
+        )
+        logger.info(
+            "enable_routing_replay in MegatronEngine: %s  enable_bias_predictor: %s",
+            self.enable_routing_replay,
+            self.enable_bias_predictor,
+        )
+        if self.enable_bias_predictor and not self.engine_config.forward_only:
+            # The training-side logic for bias_predictor (separate LR group, SKIP/COMPUTE
+            # phase management, predictive-loss backward handling) only exists in the
+            # legacy worker implementation today. Surface a clear error instead of
+            # silently running with an untrainable bias_predictor.
+            raise NotImplementedError(
+                "enable_bias_predictor=True is not supported with the new Megatron worker "
+                "implementation for training (forward_only=False). Please set "
+                "`trainer.use_legacy_worker_impl=enable` when training router-bias-predictor "
+                "models. Inference/rollout (forward_only=True) is supported."
+            )
+        if self.enable_routing_replay or self.enable_bias_predictor:
             apply_router_replay_patch()
             self.mini_layer_topk_idx_list = []
         # Apply checkpoint patch for MoE models
@@ -229,6 +247,14 @@ class MegatronEngine(BaseEngine):
 
             if self.enable_routing_replay:
                 provider.enable_routing_replay = True
+            if self.enable_bias_predictor:
+                provider.enable_router_bias_predictor = True
+                provider.bias_predictor_loss_type = (
+                    self.engine_config.router_replay.bias_predictor_loss_type
+                )
+                provider.bias_predictor_lr_mult = float(
+                    self.engine_config.router_replay.bias_predictor_lr_mult
+                )
 
             provider.finalize()
             self.provider = provider
@@ -244,6 +270,14 @@ class MegatronEngine(BaseEngine):
         # that accepts this kwarg.
         if self.enable_routing_replay and tf_config is not None:
             tf_config.enable_routing_replay = True
+        if self.enable_bias_predictor and tf_config is not None:
+            tf_config.enable_router_bias_predictor = True
+            tf_config.bias_predictor_loss_type = (
+                self.engine_config.router_replay.bias_predictor_loss_type
+            )
+            tf_config.bias_predictor_lr_mult = float(
+                self.engine_config.router_replay.bias_predictor_lr_mult
+            )
 
         if torch.distributed.get_rank() == 0:
             if tf_config is not None:
@@ -288,20 +322,44 @@ class MegatronEngine(BaseEngine):
         self.tf_config = updated_tf_config
         print(f"module: {len(module)}")
 
-        if self.engine_config.use_dist_checkpointing:
-            load_mcore_dist_weights(
-                module, self.engine_config.dist_checkpointing_path, is_value_model=self.is_value_model
-            )
-        else:
+        allowed_mismatched_params = []
+        if self.is_value_model:
+            allowed_mismatched_params = ["output_layer.weight"]
+
+        def _load_hf_initial_weights():
             if self.vanilla_bridge:
                 self.bridge.load_weights(module, self.model_config.local_path)
             else:
-                allowed_mismatched_params = []
-                if self.is_value_model:
-                    allowed_mismatched_params = ["output_layer.weight"]
                 self.bridge.load_hf_weights(
                     module, self.model_config.local_path, allowed_mismatched_params=allowed_mismatched_params
                 )
+
+        load_initial_dist_checkpointing = self.engine_config.use_dist_checkpointing
+        if self.engine_config.load_initial_dist_checkpointing is not None:
+            load_initial_dist_checkpointing = self.engine_config.load_initial_dist_checkpointing
+
+        if load_initial_dist_checkpointing:
+            try:
+                load_mcore_dist_weights(
+                    module,
+                    self.engine_config.dist_checkpointing_path,
+                    is_value_model=self.is_value_model,
+                    prefix=self.engine_config.dist_checkpointing_prefix,
+                )
+            except Exception as e:
+                if self.bridge is None:
+                    raise
+                logger.warning(
+                    "Failed to load initial Megatron dist checkpoint from %s, "
+                    "falling back to HF weights at %s. Error: %s: %s",
+                    self.engine_config.dist_checkpointing_path,
+                    self.model_config.local_path,
+                    type(e).__name__,
+                    e,
+                )
+                _load_hf_initial_weights()
+        else:
+            _load_hf_initial_weights()
 
         if torch.distributed.get_rank() == 0:
             print_model_size(module[0])
@@ -561,13 +619,31 @@ class MegatronEngine(BaseEngine):
         """
         origin_module_device = get_megatron_module_device(self.module)
         if self._is_offload_param or origin_module_device == "cpu":
-            load_megatron_model_to_gpu(self.module, load_grad=True)
+            # Checkpoint state generation only needs parameter storage. Restoring
+            # DDP grad buffers here creates an avoidable peak-memory spike.
+            load_megatron_model_to_gpu(self.module, load_grad=False)
+        # If optimizer state will be saved, stage it back to GPU first. With
+        # optimizer_cpu_offload=True the on-device tensors have storage resized to 0,
+        # which would fail the shape assertion inside
+        # `distrib_optimizer.sharded_param_state_dp_reshardable`.
+        need_optimizer_on_gpu = (
+            self.optimizer is not None
+            and self._is_offload_optimizer
+            and (
+                self.checkpoint_mananager.should_save_optimizer
+                or self.checkpoint_mananager.checkpoint_config.async_save
+            )
+        )
+        if need_optimizer_on_gpu:
+            load_megatron_optimizer(self.optimizer)
         self.checkpoint_mananager.save_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.module)
+        if need_optimizer_on_gpu:
+            offload_megatron_optimizer(self.optimizer)
 
     def load_checkpoint(
         self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: bool = True, **kwargs

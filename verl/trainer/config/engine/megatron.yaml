@@ -37,6 +37,10 @@ use_distributed_optimizer: True
 # Whether to use distributed checkpointing
 use_dist_checkpointing: False
 
+# Whether to load the initial model weights from a distributed checkpoint.
+# Defaults to use_dist_checkpointing when left null.
+load_initial_dist_checkpointing: null
+
 # distributed checkpointing path
 dist_checkpointing_path: null
 
@@ -120,6 +124,18 @@ router_replay:
   # File path to load recorded routing decisions for replay
   # Required when mode is 'replay'
   replay_file: null
+
+  # Router bias predictor flag mirrored from actor.router_replay.enable_bias_predictor so that
+  # the engine knows to build and checkpoint-load the predictor submodule.
+  enable_bias_predictor: false
+
+  # Loss type for training the bias predictor. Options: 'l2', 'kl', 'kl-post'.
+  # Only effective when enable_bias_predictor=true.
+  bias_predictor_loss_type: kl
+
+  # Learning-rate multiplier for bias predictor parameters (lr = base_lr * lr_mult).
+  # Only effective when enable_bias_predictor=true.
+  bias_predictor_lr_mult: 1000.0
 
 # QAT (Quantization-Aware Training) configuration
 qat:

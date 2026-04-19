@@ -545,20 +545,60 @@ def pad_packed_inputs(unpad_tokens: torch.Tensor, cu_seqlens, max_seqlen_in_batc
     return unpad_tokens, cu_seqlens, max_seqlen_in_batch
 
 
-def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=False, prefix=""):
+def _is_router_bias_predictor_sharded_leaf(value) -> bool:
+    key = getattr(value, "key", None)
+    return isinstance(key, str) and ".bias_predictor." in key
+
+
+def _prune_router_bias_predictor_sharded_state(sharded_state_dict):
+    from megatron.core.dist_checkpointing.dict_utils import extract_matching_values, nested_values
+
+    removed_state, kept_state = extract_matching_values(sharded_state_dict, _is_router_bias_predictor_sharded_leaf)
+    removed_keys = sorted(
+        {
+            key
+            for key in (
+                getattr(value, "key", None)
+                for value in nested_values(removed_state)
+            )
+            if isinstance(key, str)
+        }
+    )
+    return kept_state, removed_keys
+
+
+def load_mcore_dist_weights(
+    parallel_model,
+    dist_weight_path,
+    is_value_model=False,
+    prefix="",
+    ignore_missing_bias_predictor=False,
+):
     from megatron.core import dist_checkpointing
-    from megatron.core.dist_checkpointing.serialization import StrictHandling
+    from megatron.core.dist_checkpointing.serialization import StrictHandling, load_sharded_metadata
 
     from verl.utils.megatron_utils import unwrap_model
 
     # strict = StrictHandling.IGNORE_ALL if is_value_model else StrictHandling.ASSUME_OK_UNEXPECTED
     strict = StrictHandling.ASSUME_OK_UNEXPECTED
+    checkpoint_has_bias_predictor = True
+    if ignore_missing_bias_predictor:
+        ckpt_sharded_metadata = load_sharded_metadata(dist_weight_path)
+        checkpoint_has_bias_predictor = any(".bias_predictor." in key for key in ckpt_sharded_metadata.keys())
     for model in parallel_model:
         ssd = unwrap_model(model).sharded_state_dict(prefix=prefix)
         if is_value_model:
             for k in list(ssd.keys()):
                 if "output_layer" in k:
                     ssd.pop(k)
+        if ignore_missing_bias_predictor and not checkpoint_has_bias_predictor:
+            ssd, removed_keys = _prune_router_bias_predictor_sharded_state(ssd)
+            if removed_keys:
+                warnings.warn(
+                    f"Checkpoint {dist_weight_path} has no router bias predictor tensors; ignoring "
+                    f"{len(removed_keys)} model tensors so they keep fresh initialization.",
+                    stacklevel=2,
+                )
         dist_checkpointing.load(ssd, dist_weight_path, strict=strict)
 
     return

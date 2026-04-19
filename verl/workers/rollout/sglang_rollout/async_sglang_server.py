@@ -14,6 +14,7 @@
 # limitations under the License.
 import asyncio
 import dataclasses
+import inspect
 import json
 import logging
 import os
@@ -34,13 +35,12 @@ from sglang.srt.entrypoints.http_server import (
     app,
     set_global_state,
 )
-from sglang.srt.managers.io_struct import (
-    ContinueGenerationReqInput,
-    GenerateReqInput,
-    PauseGenerationReqInput,
-    ReleaseMemoryOccupationReqInput,
-    ResumeMemoryOccupationReqInput,
-)
+from sglang.srt.managers.io_struct import GenerateReqInput, ReleaseMemoryOccupationReqInput, ResumeMemoryOccupationReqInput
+try:
+    from sglang.srt.managers.io_struct import ContinueGenerationReqInput, PauseGenerationReqInput
+except ImportError:
+    ContinueGenerationReqInput = None
+    PauseGenerationReqInput = None
 from sglang.srt.managers.tokenizer_manager import ServerStatus
 
 from verl.utils.config import omega_conf_to_dataclass
@@ -57,6 +57,62 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 visible_devices_keyword = get_visible_devices_keyword()
+
+
+def _bind_reserved_port(address: str, port: int) -> socket.socket | None:
+    family = socket.AF_INET6 if is_valid_ipv6_address(address) else socket.AF_INET
+    sock = socket.socket(family=family, type=socket.SOCK_STREAM)
+    try:
+        sock.bind((address, port))
+    except OSError:
+        sock.close()
+        return None
+    return sock
+
+
+def _reserve_job_scoped_port(
+    address: str,
+    *,
+    replica_rank: int,
+    node_rank: int,
+    base_gpu_id: int,
+    salt: str,
+) -> tuple[int, socket.socket | None]:
+    # Use a stable per-job seed so concurrent rollout replicas on the same host
+    # do not repeatedly race on the same ephemeral NCCL/TCPStore ports.
+    job_scope = "|".join(
+        filter(
+            None,
+            [
+                os.environ.get("SLURM_JOB_ID", ""),
+                os.environ.get("RAY_JOB_SUBMISSION_ID", ""),
+                os.environ.get("RAY_JOB_ID", ""),
+                ray.util.get_node_ip_address().strip("[]"),
+            ],
+        )
+    ) or "0"
+    low_port = 20000
+    high_port = 60000
+    span = high_port - low_port + 1
+    seed_payload = f"{job_scope}|{replica_rank}|{node_rank}|{base_gpu_id}|{salt}"
+    seed = zlib.crc32(seed_payload.encode("utf-8")) & 0xFFFFFFFF
+
+    for attempt in range(min(span, 4096)):
+        port = low_port + ((seed + attempt) % span)
+        sock = _bind_reserved_port(address, port)
+        if sock is not None:
+            return port, sock
+
+    logger.warning(
+        "Failed to reserve a stable rollout port after 4096 attempts for salt=%s; falling back to get_free_port().",
+        salt,
+    )
+    return get_free_port(address, with_alive_sock=True)
+
+
+# When enabled, router_inputs (hidden states) arrive as fp8/uint8 from SGLang and must be
+# dequantized to float16 before use.  Must match VERL_ROUTER_INPUTS_FP8 set in the SGLang env.
+_ROUTER_INPUTS_FP8 = os.environ.get("VERL_ROUTER_INPUTS_FP8", "0") == "1"
 
 
 def _rollout_router_replay_config(config):
@@ -304,18 +360,34 @@ def _decode_router_states_from_meta_info(meta_info: dict[str, Any], *, hf_config
     num_experts = hf_config.num_local_experts
 
     def _decode_payload(base64_value: str, feature_size: int, field_name: str):
-        raw = np.frombuffer(pybase64.b64decode(base64_value.encode("utf-8")), dtype=np.float16)
+        raw_bytes = pybase64.b64decode(base64_value.encode("utf-8"))
         expected_size = num_tokens * num_layers * feature_size
-        if raw.size != expected_size:
-            logger.warning(
-                "[SGLang] %s size mismatch for request_id=%s: expected=%s actual=%s. Dropping router states.",
-                field_name,
-                request_id,
-                expected_size,
-                raw.size,
-            )
-            return None
-        return raw.reshape(num_tokens, num_layers, feature_size)
+        if _ROUTER_INPUTS_FP8 and field_name == "router_inputs":
+            # SGLang encoded hidden states as float8_e4m3fn (1 byte/elem) stored as uint8 bytes.
+            raw = np.frombuffer(raw_bytes, dtype=np.uint8)
+            if raw.size != expected_size:
+                logger.warning(
+                    "[SGLang] %s (fp8) size mismatch for request_id=%s: expected=%s actual=%s. Dropping router states.",
+                    field_name,
+                    request_id,
+                    expected_size,
+                    raw.size,
+                )
+                return None
+            fp8_tensor = torch.from_numpy(np.ascontiguousarray(raw)).view(torch.float8_e4m3fn)
+            return fp8_tensor.to(torch.float16).numpy().reshape(num_tokens, num_layers, feature_size)
+        else:
+            raw = np.frombuffer(raw_bytes, dtype=np.float16)
+            if raw.size != expected_size:
+                logger.warning(
+                    "[SGLang] %s size mismatch for request_id=%s: expected=%s actual=%s. Dropping router states.",
+                    field_name,
+                    request_id,
+                    expected_size,
+                    raw.size,
+                )
+                return None
+            return raw.reshape(num_tokens, num_layers, feature_size)
 
     router_inputs = _decode_payload(router_inputs_base64, hidden_size, "router_inputs")
     router_logits = _decode_payload(router_logits_base64, num_experts, "router_logits")
@@ -395,19 +467,38 @@ class SGLangHttpServer:
                 profiler_config = None
         self.profiler_controller = DistProfiler(self.replica_rank, config=profiler_config, tool_config=tool_config)
 
-        # For multi-node, we need dist_init_addr so nodes can coordinate NCCL init.
-        # For single-node, let SGLang handle port selection internally via nccl_port,
-        # which also avoids port conflicts.
+        # SGLang's scheduler/model-runner init uses dist_init_addr/TCPStore even on
+        # single-node launch paths. Reserve both rendezvous ports here so parallel
+        # rollout replicas do not race on implicit ephemeral port selection.
         self._master_address = None
         self._master_port = None
         self._master_sock = None
-        if self.nnodes > 1 and self.node_rank == 0:
+        self._nccl_port, self._nccl_sock = _reserve_job_scoped_port(
+            self._server_address,
+            replica_rank=self.replica_rank,
+            node_rank=self.node_rank,
+            base_gpu_id=self.base_gpu_id,
+            salt="nccl",
+        )
+        if self.node_rank == 0:
             self._master_address = self._server_address
-            self._master_port, self._master_sock = get_free_port(self._server_address, with_alive_sock=True)
+            self._master_port, self._master_sock = _reserve_job_scoped_port(
+                self._server_address,
+                replica_rank=self.replica_rank,
+                node_rank=self.node_rank,
+                base_gpu_id=self.base_gpu_id,
+                salt="master",
+            )
             logger.info(
                 f"SGLangHttpServer, replica_rank: {self.replica_rank}, "
                 f"master address: {self._master_address}, port: {self._master_port}"
             )
+
+    @staticmethod
+    def _close_reserved_socket(sock: socket.socket | None) -> None:
+        if sock is None:
+            return
+        sock.close()
 
     def get_master_address(self):
         """Get master address and port for init NCCL process group."""
@@ -464,6 +555,7 @@ class SGLangHttpServer:
             "attention_backend": attention_backend if attention_backend is not None else "fa3",
             "skip_tokenizer_init": self.config.skip_tokenizer_init,
             "skip_server_warmup": True,
+            "nccl_port": self._nccl_port,
             "quantization": quantization,
             "json_model_override_args": json.dumps({"quantization_config": fp8_block_quant_kwargs})
             if quantization == "fp8"
@@ -480,9 +572,7 @@ class SGLangHttpServer:
                     "lora_target_modules": self.model_config.target_modules,
                 }
             )
-        # Only set dist_init_addr for multi-node; for single-node, let SGLang
-        # handle port selection internally via nccl_port to avoid conflicts.
-        if self.nnodes > 1:
+        if self._master_address is not None and self._master_port is not None:
             dist_init_addr = (
                 f"[{self._master_address}]:{self._master_port}"
                 if is_valid_ipv6_address(self._master_address)
@@ -517,22 +607,14 @@ class SGLangHttpServer:
 
                 router_replay_config = _rollout_router_replay_config(self.config)
                 if router_replay_config is not None:
-                    args["router_states_sample_rate"] = _router_replay_get(
-                        router_replay_config,
-                        "predictive_r3_downsample_keep_rate",
-                        args.get("router_states_sample_rate"),
-                    )
-                    args["router_states_max_seq_len"] = _router_replay_get(
-                        router_replay_config,
-                        "predictive_downsample_max_len_limit",
-                        args.get("router_states_max_seq_len"),
-                    )
+                    _tokens_per_seq = _router_replay_get(router_replay_config, "predictive_tokens_per_seq", None)
+                    if _tokens_per_seq is not None:
+                        args["router_states_tokens_per_seq"] = int(_tokens_per_seq)
 
                 logger.warning(
-                    "[SGLang] Enabled router states capture: bias_predictor=%s keep_rate=%s max_seq_len=%s",
+                    "[SGLang] Enabled router states capture: bias_predictor=%s tokens_per_seq=%s",
                     args["enable_router_bias_predictor"],
-                    args.get("router_states_sample_rate"),
-                    args.get("router_states_max_seq_len"),
+                    args.get("router_states_tokens_per_seq"),
                 )
 
         # mtp
@@ -553,18 +635,21 @@ class SGLangHttpServer:
         # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
+        self._close_reserved_socket(self._master_sock)
+        self._master_sock = None
+        self._close_reserved_socket(self._nccl_sock)
+        self._nccl_sock = None
         server_args = ServerArgs(**args)
-        if version.parse(sglang.__version__) >= version.parse("0.5.7"):
-            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
-                server_args=server_args,
+        launch_subprocess_kwargs = {"server_args": server_args}
+        if "init_tokenizer_manager_func" in inspect.signature(_launch_subprocesses).parameters:
+            launch_subprocess_kwargs.update(
                 init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
                 run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
                 run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
             )
-        else:
-            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
-                server_args=server_args
-            )
+        self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
+            **launch_subprocess_kwargs
+        )
 
         # In multi-node cases, non-zero rank nodes should not launch http server.
         if self.node_rank > 0:
@@ -778,6 +863,12 @@ class SGLangHttpServer:
                                 field_name="router_inputs",
                                 request_id=request_id,
                             )
+                            if _ROUTER_INPUTS_FP8 and router_inputs is not None:
+                                # SGLang sent hidden states as uint8 (fp8 wire format); dequantize to float16.
+                                import numpy as _np
+                                _flat = _np.ascontiguousarray(router_inputs.reshape(-1))
+                                _fp8 = torch.from_numpy(_flat).view(torch.float8_e4m3fn)
+                                router_inputs = _fp8.to(torch.float16).numpy().reshape(router_inputs.shape)
                             router_logits = _coerce_router_state_array(
                                 router_logits,
                                 expected_tokens=actual_tokens,
@@ -853,10 +944,16 @@ class SGLangHttpServer:
         self.global_steps = global_steps
 
     async def abort_all_requests(self):
-        await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
+        if PauseGenerationReqInput is None:
+            await self.tokenizer_manager.pause_generation()
+        else:
+            await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
 
     async def resume_generation(self):
-        await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
+        if ContinueGenerationReqInput is None:
+            await self.tokenizer_manager.continue_generation()
+        else:
+            await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
 
     async def start_profile(self, **kwargs):
         if (

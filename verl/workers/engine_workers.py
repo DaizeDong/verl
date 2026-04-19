@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
+import importlib
 import logging
 import os
 from contextlib import nullcontext
@@ -22,7 +23,7 @@ from typing import Optional
 
 import torch
 from codetiming import Timer
-from omegaconf import DictConfig, open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 from tensordict import NonTensorData, TensorDict
 from torch.distributed.device_mesh import init_device_mesh
 
@@ -54,6 +55,39 @@ from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _ensure_engine_backend_imported(backend: str) -> None:
+    module_by_backend = {
+        "automodel": "verl.workers.engine.automodel",
+        "fsdp": "verl.workers.engine.fsdp",
+        "fsdp2": "verl.workers.engine.fsdp",
+        "megatron": "verl.workers.engine.megatron",
+        "mindspeed": "verl.workers.engine.mindspeed",
+        "mindspeed_llm": "verl.workers.engine.mindspeed",
+        "torchtitan": "verl.workers.engine.torchtitan",
+        "veomni": "verl.workers.engine.veomni",
+    }
+    module_name = module_by_backend.get(backend)
+    if module_name is None:
+        return
+    importlib.import_module(module_name)
+
+
+def _get_actor_router_replay_mode(actor_config: DictConfig) -> str:
+    actor_router_replay = actor_config.get("router_replay", None)
+    if actor_router_replay is not None:
+        mode = actor_router_replay.get("mode", "disabled")
+        if mode != "disabled":
+            return mode
+
+    megatron_config = actor_config.get("megatron", None)
+    if megatron_config is not None:
+        engine_router_replay = megatron_config.get("router_replay", None)
+        if engine_router_replay is not None:
+            return engine_router_replay.get("mode", "disabled")
+
+    return "disabled"
 
 
 def _with_routing_replay_flag(enabled: bool):
@@ -128,6 +162,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         )
 
         self.model_config.model_type = self.config.model_type
+        _ensure_engine_backend_imported(self.engine_config.strategy)
         self.engine: BaseEngine = EngineRegistry.new(
             model_type=self.config.model_type,
             backend=self.engine_config.strategy,
@@ -473,7 +508,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             tool_config = None
 
         self.enable_routing_replay = (
-            self.config.actor.strategy == "megatron" and self.config.actor.megatron.router_replay.mode != "disabled"
+            self.config.actor.strategy == "megatron"
+            and _get_actor_router_replay_mode(self.config.actor) != "disabled"
         )
 
         DistProfilerExtension.__init__(
@@ -546,6 +582,44 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 optimizer_config=actor_config.optim,
                 checkpoint_config=actor_config.checkpoint,
             )
+
+            if actor_config.strategy == "megatron":
+                actor_router_replay = actor_config.router_replay
+                engine_router_replay = actor_training_config.engine_config.router_replay
+                engine_router_replay_is_default = (
+                    engine_router_replay.mode == "disabled"
+                    and engine_router_replay.record_file is None
+                    and engine_router_replay.replay_file is None
+                    and not getattr(engine_router_replay, "enable_bias_predictor", False)
+                )
+                actor_has_bias_predictor = bool(getattr(actor_router_replay, "enable_bias_predictor", False))
+                if (
+                    actor_router_replay.mode != "disabled" or actor_has_bias_predictor
+                ) and engine_router_replay_is_default:
+                    object.__setattr__(
+                        actor_training_config.engine_config,
+                        "router_replay",
+                        type(engine_router_replay)(
+                            mode=actor_router_replay.mode,
+                            record_file=actor_router_replay.record_file,
+                            replay_file=actor_router_replay.replay_file,
+                            enable_bias_predictor=actor_has_bias_predictor,
+                            bias_predictor_loss_type=getattr(
+                                actor_router_replay, "bias_predictor_loss_type", "kl"
+                            ),
+                            bias_predictor_lr_mult=float(
+                                getattr(actor_router_replay, "bias_predictor_lr_mult", 1000.0)
+                            ),
+                        ),
+                    )
+                    logger.info(
+                        "[RouterReplay] Synced actor.router_replay into actor.megatron.router_replay: "
+                        "mode=%s enable_bias_predictor=%s bias_predictor_loss_type=%s bias_predictor_lr_mult=%s",
+                        actor_router_replay.mode,
+                        actor_has_bias_predictor,
+                        getattr(actor_router_replay, "bias_predictor_loss_type", "kl"),
+                        getattr(actor_router_replay, "bias_predictor_lr_mult", 1000.0),
+                    )
 
             assert self.config.actor.use_dynamic_bsz == self.config.rollout.log_prob_use_dynamic_bsz
 

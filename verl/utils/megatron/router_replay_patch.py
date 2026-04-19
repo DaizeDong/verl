@@ -41,6 +41,8 @@ try:
 except ImportError:
     warnings.warn("NPU not support router replay for now.", stacklevel=2)
     MoEAlltoAllTokenDispatcher = None
+from megatron.core import parallel_state as mpu
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -77,6 +79,21 @@ def _r3_predictive_diag_enabled() -> bool:
     return os.getenv("VERL_DEBUG_R3_PREDICTIVE_DIAG", "").lower() in {"1", "true", "yes", "on"}
 
 
+def _predictive_sync_tokens() -> int:
+    value = os.getenv("VERL_PREDICTIVE_SYNC_TOKENS", "").strip()
+    if not value or value.lower() in {"null", "none"}:
+        return 512
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning(
+            "[Predictive Routing Replay] Invalid VERL_PREDICTIVE_SYNC_TOKENS=%r; fallback to 512",
+            value,
+        )
+        return 512
+    return max(1, parsed)
+
+
 def _relative_l2(lhs: torch.Tensor, rhs: torch.Tensor) -> float:
     lhs_f = lhs.detach().float()
     rhs_f = rhs.detach().float()
@@ -111,6 +128,13 @@ class RouterReplay:
 
     # Current token indices for alignment
     current_token_indices = None
+
+    # Logits save-time sampling state
+    # When < 1.0, compute_log_prob subsamples tokens and training phases filter to the same set via global_token_ids.
+    # Cleared in get_and_clear_logits_cache() (on save) so each save cycle re-samples independently.
+    logits_save_sample_rate = 1.0  # 1.0 = no sampling
+    sampled_log_prob_token_ids = None  # set of int token IDs sampled during compute_log_prob
+    current_sample_indices = None  # per-micro-batch indices to subsample logits in record_logits
 
     # Predictive loss tracking for wandb logging
     replay_topk_accuracy_tracker = []  # List of (layer_idx, accuracy_value)
@@ -182,6 +206,11 @@ class RouterReplay:
     @staticmethod
     def set_cache_action(cache_action: RouterReplayCacheAction):
         """Set the current cache action phase."""
+        # Reset sampled_log_prob_token_ids at the start of each new compute_log_prob cycle
+        # (so next step's sampling is independent). Training phases inherit the set from
+        # the preceding compute_log_prob so they can filter to the same tokens.
+        if cache_action == RouterReplayCacheAction.COMPUTE_LOG_PROB:
+            RouterReplay.sampled_log_prob_token_ids = None
         RouterReplay.current_cache_action = cache_action
         RouterReplay.enable_logits_recording = True
 
@@ -199,25 +228,64 @@ class RouterReplay:
         """
         cache = RouterReplay.logits_cache
         RouterReplay.logits_cache = {"compute_log_prob": [], "training": [], "router_weights": {}, "global_token_ids": [], "predictive_bias": []}
+        # Note: do NOT clear sampled_log_prob_token_ids here — it needs to persist from
+        # compute_log_prob save through all training mini-step saves so training phases
+        # can filter to the same token set. Cleared at start of next compute_log_prob (set_cache_action).
+        RouterReplay.current_sample_indices = None
         return cache
 
     @staticmethod
     @no_grad()
     def record_global_token_ids(global_token_ids: torch.Tensor):
         """
-        Record valid token IDs for the current micro-batch.
+        Record valid token IDs for the current micro-batch, applying save-time sampling.
+
+        During compute_log_prob: uniformly subsample tokens at logits_save_sample_rate and
+        accumulate their IDs into sampled_log_prob_token_ids. During training: filter tokens
+        to only those whose IDs are in the sampled set. The resulting current_sample_indices
+        is used by record_logits / record_predictive_bias to subsample the saved tensors.
+
+        Must be called BEFORE record_logits within a micro-batch so indices are available.
 
         Args:
-            token_ids: Tensor of valid token IDs (CPU, shape [num_tokens])
+            global_token_ids: Tensor of valid token IDs (shape [num_tokens]).
         """
-        # Record global token IDs for the current micro-batch.
+        # Default: no sampling indices; record_logits will save everything.
+        RouterReplay.current_sample_indices = None
+
         if not RouterReplay.enable_logits_recording or RouterReplay.current_cache_action is None:
             logger.info(f"[record_global_token_ids] Skipping - enable_recording={RouterReplay.enable_logits_recording}, ")
             return
 
         ids_cpu = global_token_ids.detach().cpu().contiguous()
+        sample_rate = RouterReplay.logits_save_sample_rate
+
+        if RouterReplay.current_cache_action == RouterReplayCacheAction.COMPUTE_LOG_PROB:
+            # Subsample uniformly by linspace indices; accumulate IDs across micro-batches.
+            n = ids_cpu.shape[0]
+            if sample_rate is not None and 0.0 < sample_rate < 1.0 and n > 0:
+                num_sample = max(1, int(round(n * sample_rate)))
+                if num_sample < n:
+                    indices = torch.round(torch.linspace(0, n - 1, num_sample)).long().clamp(0, n - 1)
+                    RouterReplay.current_sample_indices = indices
+                    ids_cpu = ids_cpu[indices]
+
+            if RouterReplay.sampled_log_prob_token_ids is None:
+                RouterReplay.sampled_log_prob_token_ids = set()
+            RouterReplay.sampled_log_prob_token_ids.update(ids_cpu.tolist())
+
+        elif RouterReplay.current_cache_action == RouterReplayCacheAction.TRAINING:
+            # Keep only training tokens whose IDs were sampled in compute_log_prob.
+            sampled_set = RouterReplay.sampled_log_prob_token_ids
+            if sampled_set is not None and len(sampled_set) > 0 and sample_rate is not None and sample_rate < 1.0:
+                ids_list = ids_cpu.tolist()
+                mask = torch.tensor([tid in sampled_set for tid in ids_list], dtype=torch.bool)
+                indices = mask.nonzero(as_tuple=False).squeeze(-1)
+                RouterReplay.current_sample_indices = indices
+                ids_cpu = ids_cpu[indices]
+
         RouterReplay.logits_cache["global_token_ids"].append(ids_cpu)
-        logger.info(f"[record_global_token_ids] Recorded global token IDs of shape {ids_cpu.shape}. ")
+        logger.info(f"[record_global_token_ids] Recorded global token IDs of shape {ids_cpu.shape} (sample_rate={sample_rate}).")
 
     @staticmethod
     @no_grad()
@@ -241,6 +309,13 @@ class RouterReplay:
                 logger.info(f"[record_logits] Skipping - enable_recording={RouterReplay.enable_logits_recording}, "
                             f"cache_action={RouterReplay.current_cache_action}")
             return
+
+        # Apply save-time sampling if indices were set by record_global_token_ids.
+        indices = RouterReplay.current_sample_indices
+        if indices is not None:
+            if indices.device != logits.device:
+                indices = indices.to(logits.device)
+            logits = logits[indices]
 
         # Move to CPU to avoid GPU memory pressure
         # Make a contiguous copy to ensure clean memory layout
@@ -279,6 +354,13 @@ class RouterReplay:
         # Normalize the saved artifact to the R2 shape so downstream comparisons stay consistent.
         if delta_logits.ndim == 2:
             delta_logits = delta_logits.unsqueeze(1)
+
+        # Apply save-time sampling along token dim (dim 0) if indices were set.
+        indices = RouterReplay.current_sample_indices
+        if indices is not None:
+            if indices.device != delta_logits.device:
+                indices = indices.to(delta_logits.device)
+            delta_logits = delta_logits[indices]
 
         # Move to CPU to avoid GPU memory pressure
         delta_logits_cpu = delta_logits.detach().cpu().contiguous()
@@ -402,9 +484,19 @@ class RouterReplay:
         RouterReplay.predictive_topk_accuracy_tracker.append((layer_idx, accuracy_value))
 
     @staticmethod
+    def record_replay_topk_accuracy(layer_idx: int, accuracy_value: float):
+        """Record replay top-k agreement for compatibility with the legacy replay path."""
+        RouterReplay.replay_topk_accuracy_tracker.append((layer_idx, accuracy_value))
+
+    @staticmethod
     def get_and_clear_predictive_metrics():
         """Get aggregated predictive metrics and clear trackers."""
         metrics = {}
+
+        if RouterReplay.replay_topk_accuracy_tracker:
+            avg_accuracy = sum(acc for _, acc in RouterReplay.replay_topk_accuracy_tracker) / len(RouterReplay.replay_topk_accuracy_tracker)
+            metrics['replay_topk_accuracy'] = avg_accuracy
+            RouterReplay.replay_topk_accuracy_tracker.clear()
 
         if RouterReplay.predictive_loss_tracker:
             avg_loss = sum(loss for _, loss in RouterReplay.predictive_loss_tracker) / len(RouterReplay.predictive_loss_tracker)
@@ -837,18 +929,39 @@ def patched_forward(self, input: torch.Tensor):
                     # gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3)
                     # logger.info(f"[Predictive Routing Replay] [Memory] (layer {self.layer_number}) Total GPU memory allocated after loading predictive data: {gpu_mem:.2f} GB, {get_system_memory_info()}")
 
+                    # When sequence_parallel is enabled the router receives only the local
+                    # SP shard of the current tokens (shape [total_tokens/tp, hidden]).
+                    # The valid_mask and old_inputs/old_logits are stored in full (not split),
+                    # so we must gather the current input/logits back to the full sequence
+                    # before applying the mask.  Each rank computes the same full loss;
+                    # this is redundant but correct, and avoids complex shard-level alignment.
+                    current_input_full = input
+                    current_logits_full = logits
+                    if getattr(self.config, "sequence_parallel", False):
+                        tp_size = mpu.get_tensor_model_parallel_world_size()
+                        if tp_size > 1 and input.shape[0] < valid_mask.shape[0]:
+                            # Input is SP-split (local shard is smaller than the full sequence).
+                            # Gather all shards to recover the full-sequence tensor so that
+                            # valid_mask (which is full-sequence sized) can be applied correctly.
+                            current_input_full = gather_from_sequence_parallel_region(
+                                input, tensor_parallel_output_grad=True
+                            )
+                            current_logits_full = gather_from_sequence_parallel_region(
+                                logits, tensor_parallel_output_grad=False
+                            )
+
                     # Debug asserts: check shape matching
-                    assert old_inputs.shape[-1] == input.shape[-1], f"hidden_size mismatch: old={old_inputs.shape[-1]}, current={input.shape[-1]}"
-                    assert old_logits.shape[-1] == logits.shape[-1], f"num_experts mismatch: old={old_logits.shape[-1]}, current={logits.shape[-1]}"
+                    assert old_inputs.shape[-1] == current_input_full.shape[-1], f"hidden_size mismatch: old={old_inputs.shape[-1]}, current={current_input_full.shape[-1]}"
+                    assert old_logits.shape[-1] == current_logits_full.shape[-1], f"num_experts mismatch: old={old_logits.shape[-1]}, current={current_logits_full.shape[-1]}"
 
                     # Apply token-level mask if provided (for downsampled data)
-                    # valid_mask is at token level, matching the unpacked input/logits shape
-                    current_input = input # TODO: this is not used, it is preserved for future algorithm enhancement
-                    current_logits = logits
+                    # valid_mask is at token level, matching the unpacked (full) input/logits shape
+                    current_input = current_input_full  # TODO: not used, preserved for future enhancement
+                    current_logits = current_logits_full
                     if valid_mask is not None:
                         # Filter current input and logits at token level to match old_inputs/old_logits
-                        current_input = input[valid_mask]
-                        current_logits = logits[valid_mask]
+                        current_input = current_input_full[valid_mask]
+                        current_logits = current_logits_full[valid_mask]
                         # logger.info(f"[Predictive Routing Replay] Applied token-level mask: {valid_mask.sum().item()}/{valid_mask.size(0)} valid tokens")
                         assert current_input.shape[0] == old_inputs.shape[0], f"Token count mismatch after masking: old={old_inputs.shape[0]}, current={current_input.shape[0]}"
                         assert current_logits.shape[0] == old_logits.shape[0], f"Token count mismatch after masking: old={old_logits.shape[0]}, current={current_logits.shape[0]}"
@@ -902,9 +1015,6 @@ def patched_forward(self, input: torch.Tensor):
                             target_probs.detach(),
                             reduction='batchmean'
                         )
-                        # pred_log = torch.log_softmax(old_logits + delta_logits, dim=-1)
-                        # target_log = torch.log_softmax(current_logits, dim=-1)
-                        # predictive_loss = torch.sum(torch.exp(pred_log) * (pred_log - target_log.detach()), dim=-1).mean()
 
                     else:
                         raise ValueError(f"Invalid loss type: {self.config.bias_predictor_loss_type}")
@@ -978,7 +1088,17 @@ def patched_forward(self, input: torch.Tensor):
                     # bias_predictor graph. A bare `param * 0` dummy loss skips that graph
                     # entirely, which can desynchronize long-running router/update regions at
                     # scale when other ranks execute a real predictor forward/backward.
-                    synthetic_inputs = input.detach()
+                    #
+                    # However, re-running the predictor on the full local token set here makes
+                    # "all_none" ranks vastly slower than ranks that only replay the downsampled
+                    # predictive tokens, which can trip NCCL watchdog timeouts at scale. Keep the
+                    # graph alive with a bounded detached slice so every rank still exercises a
+                    # similar predictor graph without replaying arbitrarily many tokens.
+                    sync_tokens = min(int(input.shape[0]), _predictive_sync_tokens())
+                    synthetic_inputs = input.detach()[:sync_tokens]
+                    if synthetic_inputs.numel() == 0:
+                        synthetic_shape = (1, *input.shape[1:])
+                        synthetic_inputs = input.detach().new_zeros(synthetic_shape)
                     synthetic_delta_logits = self.bias_predictor(synthetic_inputs)
                     predictive_loss = (synthetic_delta_logits * 0.0).sum()
 
@@ -998,6 +1118,34 @@ def patched_forward(self, input: torch.Tensor):
             # CRITICAL: All processes execute backward, including those with dummy loss
             # This ensures synchronization across all processes
             predictive_loss.backward()
+
+            # [BPDiag] Immediately after inner backward: check that gradient reached main_grad.
+            # DDP hook fires DURING backward and moves param.grad -> param.main_grad, then sets
+            # param.grad=None.  So if main_grad is still zero here the hook never fired for bp.
+            import os as _os
+            if int(_os.environ.get('VERL_DEBUG_PREDICTOR_SYNC', '0')) >= 1:
+                _loss_val = predictive_loss.item()
+                # Print for every layer on every rank — but only for non-trivial cases to limit noise.
+                # "all_none" path produces loss=0 and zero gradient intentionally; those are filtered.
+                # For the "has_valid_data" path we always want to see whether main_grad was populated.
+                _layer_idx = self.router_replay.layer_idx if self.router_replay else -1
+                import torch.distributed as _dist
+                _rank = _dist.get_rank() if _dist.is_initialized() else 0
+                for _bp_name, _bp_param in self.bias_predictor.named_parameters():
+                    _grad = _bp_param.grad
+                    _main_grad = getattr(_bp_param, 'main_grad', None)
+                    _grad_norm = _grad.detach().float().norm().item() if _grad is not None else float('nan')
+                    _main_grad_norm = _main_grad.detach().float().norm().item() if _main_grad is not None else float('nan')
+                    _has_main_grad_attr = _main_grad is not None
+                    print(
+                        f"[BPDiag][inner_bwd] rank={_rank} layer={_layer_idx} bp_param={_bp_name} "
+                        f"shape={tuple(_bp_param.shape)} "
+                        f"grad={'None' if _grad is None else f'{_grad_norm:.6e}'} "
+                        f"main_grad={'None(no_attr)' if not _has_main_grad_attr else f'{_main_grad_norm:.6e}'} "
+                        f"loss={_loss_val:.6e}",
+                        flush=True,
+                    )
+
             self.router_replay.clear_predictive_data()
             del old_inputs, old_logits, valid_mask
 

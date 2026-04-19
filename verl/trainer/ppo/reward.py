@@ -67,8 +67,15 @@ def get_custom_reward_fn(config: DictConfig) -> Optional[RawRewardFn]:
         AttributeError: If the specified function name isn't found in the module.
     """
 
-    reward_fn_config = config.reward.get("custom_reward_function") or {}
+    reward_cfg = config.get("reward")
+    reward_fn_config = reward_cfg.get("custom_reward_function") if reward_cfg is not None else None
+    reward_fn_config = reward_fn_config or {}
     module_path = reward_fn_config.get("path")
+    if not module_path:
+        # Backward compatibility for older eval/train scripts that still pass
+        # top-level custom_reward_function.* hydra overrides.
+        reward_fn_config = config.get("custom_reward_function") or {}
+        module_path = reward_fn_config.get("path")
     if not module_path:
         return None
 

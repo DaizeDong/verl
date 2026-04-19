@@ -43,6 +43,53 @@ from verl.utils.megatron_utils import (
 
 from .checkpoint_manager import BaseCheckpointManager
 
+
+def _bias_predictor_debug_enabled() -> bool:
+    return os.getenv("VERL_DEBUG_BIAS_PREDICTOR_CKPT", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _collect_bias_predictor_stats_from_model(models) -> str:
+    stats = []
+    for vpp_idx, model in enumerate(models):
+        m = model.module if hasattr(model, "module") else model
+        while hasattr(m, "module"):
+            m = m.module
+        for name, param in m.named_parameters():
+            if ".bias_predictor." not in name:
+                continue
+            t = param.detach().float()
+            stats.append(
+                f"    vpp={vpp_idx} {name} shape={tuple(t.shape)} dtype={param.dtype} "
+                f"l2={t.norm().item():.6e} mean_abs={t.abs().mean().item():.6e} "
+                f"max_abs={t.abs().max().item():.6e}"
+            )
+    if not stats:
+        return "    <no bias_predictor params found>"
+    return "\n".join(stats)
+
+
+def _collect_bias_predictor_stats_from_state_dict(state_dict) -> str:
+    stats = []
+
+    def walk(obj, path=""):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                walk(v, f"{path}.{k}" if path else str(k))
+        elif isinstance(obj, torch.Tensor):
+            if "bias_predictor" in path:
+                t = obj.detach().float()
+                stats.append(
+                    f"    {path} shape={tuple(t.shape)} dtype={obj.dtype} "
+                    f"l2={t.norm().item():.6e} mean_abs={t.abs().mean().item():.6e} "
+                    f"max_abs={t.abs().max().item():.6e}"
+                )
+
+    walk(state_dict)
+    if not stats:
+        return "    <no bias_predictor tensors found in loaded state_dict>"
+    return "\n".join(stats)
+
+
 # Setup logging
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -435,9 +482,42 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
         # Get State Dict for loading
         should_load_dist_model = self.should_load_model and (self.use_dist_checkpointing or self.peft_cls is not None)
+
+        # If the checkpoint on disk does not contain optimizer tensors (e.g. saved with
+        # save_contents=['model','extra']), requesting them here would fail the sharded
+        # load with missing-key errors. Detect this up-front and downgrade to
+        # model-only loading so resume from old checkpoints keeps working while still
+        # allowing optimizer save/load for fresh checkpoints.
+        effective_should_load_optimizer = self.should_load_optimizer
+        if effective_should_load_optimizer:
+            try:
+                from megatron.core.dist_checkpointing.serialization import load_sharded_metadata
+
+                ckpt_keys = set(load_sharded_metadata(dist_checkpoint_path).keys())
+                ckpt_has_optimizer = any(
+                    "optimizer." in k or k.startswith("optimizer/") or k.startswith("optimizer.")
+                    for k in ckpt_keys
+                )
+                if not ckpt_has_optimizer:
+                    log_with_rank(
+                        f"Optimizer tensors not found in checkpoint {dist_checkpoint_path}; "
+                        f"skipping optimizer load. Freshly initialized optimizer state will be used.",
+                        rank=self.rank,
+                        logger=logger,
+                    )
+                    effective_should_load_optimizer = False
+            except Exception as e:
+                log_with_rank(
+                    f"Could not inspect dist checkpoint metadata for optimizer presence "
+                    f"({type(e).__name__}: {e}); proceeding with requested should_load_optimizer="
+                    f"{self.should_load_optimizer}.",
+                    rank=self.rank,
+                    logger=logger,
+                )
+
         sharded_state_dict = self.generate_state_dict(
             should_load_dist_model,
-            self.should_load_optimizer,
+            effective_should_load_optimizer,
             self.should_load_extra,
             is_loading=True,
             metadata=sharded_sd_metadata,
@@ -445,11 +525,50 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         sharded_state_dict = self._maybe_filter_peft_state_dict(sharded_state_dict)
         log_with_rank(f"Generated state dict for loading: {sharded_state_dict.keys()}", rank=self.rank, logger=logger)
 
+        if _bias_predictor_debug_enabled() and self.rank == 0:
+            log_with_rank(
+                "[BiasPredictorDebug] BEFORE load_dist_checkpointing, model params:\n"
+                + _collect_bias_predictor_stats_from_model(self.model),
+                rank=self.rank,
+                logger=logger,
+            )
+            # Dump sharded_state_dict bias_predictor keys
+            bp_keys = []
+
+            def _collect_bp_keys(obj, path=""):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        _collect_bp_keys(v, f"{path}.{k}" if path else str(k))
+                elif "bias_predictor" in path:
+                    bp_keys.append(f"    {path} -> {type(obj).__name__}")
+
+            _collect_bp_keys(sharded_state_dict)
+            log_with_rank(
+                "[BiasPredictorDebug] sharded_state_dict bias_predictor entries:\n"
+                + ("\n".join(bp_keys) if bp_keys else "    <none>"),
+                rank=self.rank,
+                logger=logger,
+            )
+
         # Load Dist Checkpointing
         state_dict = load_dist_checkpointing(
             sharded_state_dict=sharded_state_dict,
             ckpt_dir=dist_checkpoint_path,
         )
+
+        if _bias_predictor_debug_enabled() and self.rank == 0:
+            log_with_rank(
+                "[BiasPredictorDebug] AFTER load_dist_checkpointing, loaded tensors:\n"
+                + _collect_bias_predictor_stats_from_state_dict(state_dict),
+                rank=self.rank,
+                logger=logger,
+            )
+            log_with_rank(
+                "[BiasPredictorDebug] AFTER load_dist_checkpointing (before load_state_dict), model params:\n"
+                + _collect_bias_predictor_stats_from_model(self.model),
+                rank=self.rank,
+                logger=logger,
+            )
 
         if should_load_dist_model:
             assert "model" in state_dict or any(
@@ -463,6 +582,14 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     model_state_dict = state_dict[f"model{vpp_rank}"]
                 mpu.set_virtual_pipeline_model_parallel_rank(vpp_rank)
                 self.model[vpp_rank].load_state_dict(model_state_dict, strict=self.peft_cls is None)
+
+            if _bias_predictor_debug_enabled() and self.rank == 0:
+                log_with_rank(
+                    "[BiasPredictorDebug] AFTER model.load_state_dict, model params:\n"
+                    + _collect_bias_predictor_stats_from_model(self.model),
+                    rank=self.rank,
+                    logger=logger,
+                )
             if self.peft_cls is not None:
                 log_with_rank(
                     f"Loaded PEFT adapter checkpoint from {dist_checkpoint_path}", rank=self.rank, logger=logger
@@ -480,21 +607,41 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             log_with_rank(f"Loaded HF model checkpoint from {hf_model_path} with bridge", rank=self.rank, logger=logger)
 
         if self.should_load_optimizer:
-            assert "optimizer" in state_dict, (
-                f"Optimizer state dict not found in {state_dict.keys()}. Please check the checkpoint file {local_path}."
-            )
-            optimizer_state_dict = state_dict["optimizer"]
-            self.optimizer.load_state_dict(optimizer_state_dict)
-            log_with_rank(f"Loaded optimizer checkpoint from {local_path}", rank=self.rank, logger=logger)
-            if self.use_checkpoint_opt_param_scheduler:
-                assert "lr_scheduler" in state_dict, (
-                    f"LR scheduler state dict not found in {state_dict.keys()}. Please check the checkpoint file "
-                    f"{local_path}."
+            # Gracefully handle missing optimizer state. This lets us resume from an older
+            # checkpoint that was saved with save_contents=['model','extra'] (no optimizer)
+            # even after we flip save_contents default to include 'optimizer'. The
+            # optimizer will be re-initialized in that case, equivalent to the old
+            # behavior.
+            if "optimizer" not in state_dict:
+                log_with_rank(
+                    f"Optimizer state dict not found in checkpoint {local_path} "
+                    f"(state_dict keys={list(state_dict.keys())}). Keeping freshly "
+                    f"initialized optimizer state. This is expected when resuming from "
+                    f"a checkpoint saved with save_contents that omitted 'optimizer'.",
+                    rank=self.rank,
+                    logger=logger,
                 )
-                lr_scheduler_state_dict = state_dict["lr_scheduler"]
-                if self.lr_scheduler is not None:
-                    self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
-                    log_with_rank(f"Loaded LR scheduler checkpoint from {local_path}", rank=self.rank, logger=logger)
+            else:
+                optimizer_state_dict = state_dict["optimizer"]
+                self.optimizer.load_state_dict(optimizer_state_dict)
+                log_with_rank(f"Loaded optimizer checkpoint from {local_path}", rank=self.rank, logger=logger)
+                if self.use_checkpoint_opt_param_scheduler:
+                    if "lr_scheduler" not in state_dict:
+                        log_with_rank(
+                            f"LR scheduler state dict not found in {local_path}; keeping "
+                            f"freshly initialized scheduler state.",
+                            rank=self.rank,
+                            logger=logger,
+                        )
+                    else:
+                        lr_scheduler_state_dict = state_dict["lr_scheduler"]
+                        if self.lr_scheduler is not None:
+                            self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
+                            log_with_rank(
+                                f"Loaded LR scheduler checkpoint from {local_path}",
+                                rank=self.rank,
+                                logger=logger,
+                            )
 
         if self.should_load_extra:
             assert "rng_state" in state_dict, (

@@ -76,16 +76,20 @@ class RouterReplayConfig(BaseConfig):
             Data is stored in non_tensor_batch as compact tensors (None for non-sampled samples).
             Set to None to disable downsampling and keep all sequences.
             Example: batch_size=8, downsample_batch_size=1 saves ~87.5% memory.
-        predictive_downsample_max_len_limit (int): Maximum sequence length threshold for downsampling.
-            Sequences longer than this threshold will be filtered out during sampling to reduce memory usage.
-            If valid sequences are insufficient, the shortest sequences from all samples will be selected.
-            Set to None to disable length-based filtering. Default is None.
-        predictive_storage_dtype (str): Data type for storing predictive data (old_inputs/old_logits).
-            Options: 'fp32', 'bf16', 'fp16'. Lower precision saves memory with minimal impact on accuracy.
-            Default is 'bf16' (saves 50% memory compared to fp32).
-        predictive_max_total_tokens (int): Hard cap on total predictive tokens replayed in one mini-batch.
-            When set, old_inputs/old_logits (and token positions if available) are proportionally subsampled
-            before valid_mask construction to bound predictive replay memory. Set to None to disable.
+        predictive_inputs_storage_dtype (str): Storage dtype for hidden states (old_inputs).
+            Options: 'fp32', 'bf16', 'fp16', 'fp8'. Lower precision saves memory. Default 'bf16'.
+        predictive_logits_storage_dtype (str): Storage dtype for router logits (old_logits).
+            Options: 'fp32', 'bf16', 'fp16', 'fp8'. Default 'fp32' (logits are small, keep full precision).
+        predictive_tokens_per_seq (int): Number of tokens to uniformly subsample from each sequence.
+            Uses evenly-spaced linspace indices, retaining absolute token positions for training alignment.
+            - R3 mode: subsampling happens in sglang before transmission, reducing communication overhead.
+            - R2 mode: subsampling happens in verl's merge_router_predictive_data after log_prob capture.
+            Set to None to disable (keep all tokens, backward compatible). Recommended: 64–256.
+        logits_save_sample_rate (float): Sampling rate for saved router logits.
+            During compute_log_prob phase, uniformly sample this fraction of tokens; their global_token_ids
+            are recorded. During training phases (any number of mini-steps), only tokens whose IDs match the
+            sampled log_prob set are saved. This preserves alignment via global_token_ids while reducing
+            disk usage. Default 1.0 (save all). Example: 0.1 keeps 1/10 tokens.
     """
 
     mode: str = "disabled"
@@ -96,24 +100,26 @@ class RouterReplayConfig(BaseConfig):
     bias_predictor_loss_type: str = "kl"
     bias_predictor_lr_mult: float = 1000.0
     predictive_downsample_batch_size: int = None
-    predictive_downsample_max_len_limit: int = None
-    predictive_r3_downsample_keep_rate: float = 1.0
-    predictive_storage_dtype: str = "bf16"
-    predictive_max_total_tokens: int = None
+    predictive_inputs_storage_dtype: str = "bf16"
+    predictive_logits_storage_dtype: str = "fp32"
+    predictive_tokens_per_seq: int = None
+    logits_save_sample_rate: float = 1.0
 
     def __post_init__(self):
         """Validate router replay configuration."""
         valid_modes = ["disabled", "R2", "R3"]
         if self.mode not in valid_modes:
             raise ValueError(f"Invalid router_replay mode: {self.mode}. Must be one of {valid_modes}")
-        
+
         valid_loss_types = ["l2", "kl", "kl-post"]
         if self.bias_predictor_loss_type not in valid_loss_types:
             raise ValueError(f"Invalid bias_predictor_loss_type: {self.bias_predictor_loss_type}. Must be one of {valid_loss_types}")
-        
-        valid_dtypes = ["fp32", "bf16", "fp16"]
-        if self.predictive_storage_dtype not in valid_dtypes:
-            raise ValueError(f"Invalid predictive_storage_dtype: {self.predictive_storage_dtype}. Must be one of {valid_dtypes}")
+
+        valid_dtypes = ["fp32", "bf16", "fp16", "fp8"]
+        if self.predictive_inputs_storage_dtype not in valid_dtypes:
+            raise ValueError(f"Invalid predictive_inputs_storage_dtype: {self.predictive_inputs_storage_dtype}. Must be one of {valid_dtypes}")
+        if self.predictive_logits_storage_dtype not in valid_dtypes:
+            raise ValueError(f"Invalid predictive_logits_storage_dtype: {self.predictive_logits_storage_dtype}. Must be one of {valid_dtypes}")
 
 
 @dataclass

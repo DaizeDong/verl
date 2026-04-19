@@ -384,6 +384,35 @@ def apply_patch_mbridge():
 
         megatron.core.utils.get_tensor_model_parallel_group_if_none = get_tensor_model_parallel_group_if_none
 
+    try:
+        from mbridge.models.deepseek_v3 import DeepseekV3Bridge
+    except ImportError:
+        return
+
+    if "mlp.router.bias_predictor.weight" not in DeepseekV3Bridge._MLP_MAPPING:
+        DeepseekV3Bridge._MLP_MAPPING = dict(DeepseekV3Bridge._MLP_MAPPING)
+        DeepseekV3Bridge._MLP_MAPPING["mlp.router.bias_predictor.weight"] = [
+            "model.layers.{layer_number}.mlp.bias_predictor.weight"
+        ]
+
+    # Patch Qwen2MoE bridge to handle bias_predictor params (training-only, not in HF weights)
+    try:
+        from mbridge.models.qwen2moe import Qwen2MoEBridge
+    except ImportError:
+        return
+
+    if not getattr(Qwen2MoEBridge, "_bias_predictor_patched", False):
+        _orig_qwen2moe_mlp_mapping = Qwen2MoEBridge._weight_name_mapping_mlp
+
+        def _patched_qwen2moe_mlp_mapping(self, name):
+            if "mlp.router.bias_predictor.weight" in name:
+                layer_number = name.split(".")[2]
+                return [f"model.layers.{layer_number}.mlp.bias_predictor.weight"]
+            return _orig_qwen2moe_mlp_mapping(self, name)
+
+        Qwen2MoEBridge._weight_name_mapping_mlp = _patched_qwen2moe_mlp_mapping
+        Qwen2MoEBridge._bias_predictor_patched = True
+
 
 def apply_patch_megatron_v012_with_torch_v28():
     # Error due to missing serialization_format in _write_item of megatron v012;

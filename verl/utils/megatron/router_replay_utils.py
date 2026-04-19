@@ -513,17 +513,21 @@ def merge_router_predictive_data(
     vp_rank=None,
     packed_seq_params=None,
     downsample_batch_size=None,
-    max_len_limit=None,
-    storage_dtype='bf16',
+    predictive_tokens_per_seq=None,
+    inputs_storage_dtype='bf16',
+    logits_storage_dtype='fp32',
 ):
     # TODO: check implementation correctness
     """
     Args:
         downsample_batch_size: Number of sequences to keep per micro-batch. Keeps the first N sequences.
             Set to None to keep all sequences (no downsampling).
-        storage_dtype: Data type for storage ('fp32', 'bf16', 'fp16'). Lower precision saves memory.
-        max_len_limit: Maximum sequence length threshold for filtering. Sequences longer than this will be filtered out.
-            Set to None to disable length-based filtering.
+        inputs_storage_dtype: Storage dtype for hidden states (old_inputs): 'fp32', 'bf16', 'fp16', 'fp8'.
+            'fp8' uses torch.float8_e4m3fn (1 byte/element, 4x smaller than fp32). Tensors are
+            automatically upcasted to the model's compute dtype in set_router_predictive_data.
+        logits_storage_dtype: Storage dtype for router logits (old_logits): 'fp32', 'bf16', 'fp16', 'fp8'.
+        predictive_tokens_per_seq: Number of tokens to uniformly subsample from each sequence.
+            Uses evenly-spaced linspace indices. Set to None to keep all tokens.
     
     Returns:
         sampled_indices: Tensor of sampled batch indices (0 to downsample_batch_size-1, or 0 to batch_size-1 if no downsampling).
@@ -536,7 +540,7 @@ def merge_router_predictive_data(
     # print(f"[Predictive Routing Replay] [Debug] GPU Memory before merge: {gpu_allocated_before:.2f}GB")
     
     print(f"Merging router predictive data...")
-    print(f"Packing router old_inputs & old_logits for vp_rank={vp_rank}, downsample_batch_size={downsample_batch_size}, storage_dtype={storage_dtype}")
+    print(f"Packing router old_inputs & old_logits for vp_rank={vp_rank}, downsample_batch_size={downsample_batch_size}, inputs_storage_dtype={inputs_storage_dtype}, logits_storage_dtype={logits_storage_dtype}")
     router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
     layers_old_inputs = []
     layers_old_logits = []
@@ -623,7 +627,17 @@ def merge_router_predictive_data(
         layers_old_inputs_list.append(sample_inputs)
         layers_old_logits_list.append(sample_logits)
         total_tokens_before_split += num_tokens
-    
+
+    # Uniform token subsampling per sequence (R2 path — mirrors R3 sglang-side subsampling)
+    if predictive_tokens_per_seq is not None:
+        for i in range(len(layers_old_inputs_list)):
+            n_tokens = layers_old_inputs_list[i].shape[0]
+            if n_tokens > predictive_tokens_per_seq:
+                idx = torch.round(torch.linspace(0, n_tokens - 1, predictive_tokens_per_seq)).long()
+                idx = idx.clamp(0, n_tokens - 1)
+                layers_old_inputs_list[i] = layers_old_inputs_list[i][idx]
+                layers_old_logits_list[i] = layers_old_logits_list[i][idx]
+
     # print(f"[Predictive Routing Replay] [Debug] Split into {len(layers_old_inputs_list)} samples without padding")
     # print(f"[Predictive Routing Replay] [Debug] Sample shapes: first={layers_old_inputs_list[0].shape}")
     # print(f"[Predictive Routing Replay] [Debug] Total tokens: {total_tokens_before_split}")
@@ -650,11 +664,7 @@ def merge_router_predictive_data(
         # Calculate sequence lengths (num_tokens per sample)
         seq_lengths = torch.tensor([t.shape[0] for t in layers_old_inputs_list], dtype=torch.long)
         
-        # Use max_len_limit parameter (default to no limit if None)
-        if max_len_limit is not None:
-            max_seq_len_threshold = max_len_limit
-        else:
-            max_seq_len_threshold = float('inf')  # No filtering
+        max_seq_len_threshold = float('inf')
         
         # Filter sequences by length threshold
         valid_indices = (seq_lengths <= max_seq_len_threshold).nonzero(as_tuple=True)[0].tolist()
@@ -683,16 +693,21 @@ def merge_router_predictive_data(
         # print(f"[Predictive Routing Replay] [Memory] AFTER downsample - inputs: {inputs_size_mb_after:.2f} MB (saved {inputs_size_mb - inputs_size_mb_after:.2f} MB), logits: {logits_size_mb_after:.2f} MB, {_get_system_memory_info()}")
 
     # Lower precision storage to save memory (convert dtype per sample)
-    dtype_map = {'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}
-    target_dtype = dtype_map.get(storage_dtype, torch.bfloat16)
+    dtype_map = {
+        'fp32': torch.float32,
+        'bf16': torch.bfloat16,
+        'fp16': torch.float16,
+        'fp8': torch.float8_e4m3fn,  # 1 byte/element; upcasted to compute dtype in set_router_predictive_data
+    }
+    inputs_target_dtype = dtype_map.get(inputs_storage_dtype, torch.bfloat16)
+    logits_target_dtype = dtype_map.get(logits_storage_dtype, torch.float32)
 
-    if len(layers_old_inputs_sampled) > 0 and target_dtype != layers_old_inputs_sampled[0].dtype:
-        # total_size_before = sum(t.numel() * t.element_size() for t in layers_old_inputs_sampled) / 1024 / 1024
-        # total_size_before += sum(t.numel() * t.element_size() for t in layers_old_logits_sampled) / 1024 / 1024
-        
+    if len(layers_old_inputs_sampled) > 0:
         for i in range(len(layers_old_inputs_sampled)):
-            layers_old_inputs_sampled[i] = layers_old_inputs_sampled[i].to(target_dtype)
-            layers_old_logits_sampled[i] = layers_old_logits_sampled[i].to(target_dtype)
+            if inputs_target_dtype != layers_old_inputs_sampled[i].dtype:
+                layers_old_inputs_sampled[i] = layers_old_inputs_sampled[i].to(inputs_target_dtype)
+            if logits_target_dtype != layers_old_logits_sampled[i].dtype:
+                layers_old_logits_sampled[i] = layers_old_logits_sampled[i].to(logits_target_dtype)
         
         # total_size_after = sum(t.numel() * t.element_size() for t in layers_old_inputs_sampled) / 1024 / 1024
         # total_size_after += sum(t.numel() * t.element_size() for t in layers_old_logits_sampled) / 1024 / 1024
@@ -742,7 +757,6 @@ def set_router_predictive_data(
     router_request_ids=None,
     global_step=None,
     mini_step=None,
-    max_total_tokens=None,
 ):
     """
     NEW: Simplified version that works with unpacked data (list of variable-shape tensors).
@@ -945,101 +959,8 @@ def set_router_predictive_data(
                 valid_router_request_ids.append(None)
     del old_inputs_list, old_logits_list, old_token_positions_list  # Free memory
 
-    def _allocate_balanced_keep_counts(lengths, max_tokens):
-        total_tokens = sum(lengths)
-        if max_tokens is None or max_tokens <= 0 or total_tokens <= max_tokens:
-            return list(lengths)
-
-        keep_counts = [0 for _ in lengths]
-        remaining_lengths = list(lengths)
-        remaining_tokens = int(max_tokens)
-        active_indices = [idx for idx, length in enumerate(remaining_lengths) if length > 0]
-
-        while remaining_tokens > 0 and active_indices:
-            per_sample_share = max(1, remaining_tokens // len(active_indices))
-            next_active_indices = []
-            for idx in active_indices:
-                if remaining_tokens <= 0:
-                    break
-                take = min(remaining_lengths[idx], per_sample_share, remaining_tokens)
-                if take > 0:
-                    keep_counts[idx] += take
-                    remaining_lengths[idx] -= take
-                    remaining_tokens -= take
-                if remaining_lengths[idx] > 0:
-                    next_active_indices.append(idx)
-            active_indices = next_active_indices
-
-        return keep_counts
-
     if len(valid_old_inputs) > 0:
-        original_total_tokens = sum(int(t.shape[0]) for t in valid_old_inputs)
         predictive_loss_scale = 1.0
-        if max_total_tokens is not None:
-            max_total_tokens = int(max_total_tokens)
-            if max_total_tokens > 0:
-                total_tokens_before_cap = sum(int(t.shape[0]) for t in valid_old_inputs)
-                if total_tokens_before_cap > max_total_tokens:
-                    lengths = [int(t.shape[0]) for t in valid_old_inputs]
-                    keep_counts = _allocate_balanced_keep_counts(lengths, max_total_tokens)
-
-                    has_positions = len(valid_old_token_positions) == len(valid_old_inputs)
-                    capped_valid_indices = []
-                    capped_valid_old_inputs = []
-                    capped_valid_old_logits = []
-                    capped_valid_old_token_positions = []
-                    capped_valid_router_request_ids = []
-
-                    for sample_idx, keep_count in enumerate(keep_counts):
-                        if keep_count <= 0:
-                            continue
-
-                        old_input = valid_old_inputs[sample_idx]
-                        old_logit = valid_old_logits[sample_idx]
-                        old_positions = valid_old_token_positions[sample_idx] if has_positions else None
-                        old_length = lengths[sample_idx]
-
-                        if keep_count < old_length:
-                            if has_positions:
-                                select_idx = torch.div(
-                                    torch.arange(keep_count, dtype=torch.long) * old_length,
-                                    keep_count,
-                                    rounding_mode="floor",
-                                )
-                            else:
-                                # Without explicit positions, keep a prefix to preserve implicit alignment.
-                                select_idx = torch.arange(keep_count, dtype=torch.long)
-                            old_input = old_input.index_select(0, select_idx)
-                            old_logit = old_logit.index_select(0, select_idx)
-                            if has_positions:
-                                old_positions = old_positions.index_select(0, select_idx)
-
-                        capped_valid_indices.append(valid_indices[sample_idx])
-                        capped_valid_old_inputs.append(old_input)
-                        capped_valid_old_logits.append(old_logit)
-                        if has_positions:
-                            capped_valid_old_token_positions.append(old_positions)
-                        capped_valid_router_request_ids.append(valid_router_request_ids[sample_idx])
-
-                    logger.warning(
-                        "[Predictive Routing Replay] Capped predictive tokens from %s to %s across %s samples "
-                        "(keep_counts_head=%s using_positions=%s cap_strategy=balanced)",
-                        total_tokens_before_cap,
-                        sum(int(t.shape[0]) for t in capped_valid_old_inputs),
-                        len(capped_valid_old_inputs),
-                        keep_counts[:8],
-                        has_positions,
-                    )
-
-                    valid_indices = capped_valid_indices
-                    valid_old_inputs = capped_valid_old_inputs
-                    valid_old_logits = capped_valid_old_logits
-                    valid_old_token_positions = capped_valid_old_token_positions if has_positions else []
-                    valid_router_request_ids = capped_valid_router_request_ids
-
-        selected_total_tokens = sum(int(t.shape[0]) for t in valid_old_inputs)
-        if original_total_tokens > 0:
-            predictive_loss_scale = min(1.0, float(selected_total_tokens) / float(original_total_tokens))
 
         logger.info(f"[Predictive Routing Replay] Loaded {len(valid_old_inputs)} valid samples (shapes: {[t.shape for t in valid_old_inputs[:3]]}...)")
 
@@ -1092,57 +1013,32 @@ def set_router_predictive_data(
         # Set to each router layer with valid_mask (created externally)
         local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
         offset = local_rank_info["start"]
-        if not tf_config.sequence_parallel:
-            # Fast path for current experiments (TP=1 / no sequence parallel): avoid staging the
-            # full [tokens, layers, hidden] tensor on GPU just to split it back per router layer.
-            for i, router in enumerate(router_instances_list):
-                layer_inputs_concat = torch.cat(
-                    [t[:, i + offset, :].to(dtype=compute_dtype, copy=False) for t in valid_old_inputs],
-                    dim=0,
-                ).unsqueeze(1).contiguous()
-                layer_logits_concat = torch.cat(
-                    [t[:, i + offset, :].to(dtype=compute_dtype, copy=False) for t in valid_old_logits],
-                    dim=0,
-                ).unsqueeze(1).contiguous()
-                router.set_predictive_data(
-                    inputs=layer_inputs_concat,
-                    logits=layer_logits_concat,
-                    valid_mask=valid_mask,
-                    loss_scale=predictive_loss_scale,
-                )
-                logger.info(
-                    f"[Predictive Routing Replay] Set layer {i} predictive data with layer_inputs shape "
-                    f"{router.recorded_old_inputs.shape}, layer_logits shape {router.recorded_old_logits.shape}"
-                )
-                del layer_inputs_concat, layer_logits_concat
-        else:
-            # Sequence-parallel path still needs GPU scatter before per-layer slicing.
-            layers_old_inputs_concat = torch.cat(
-                [t.to(compute_dtype).to(device_name) for t in valid_old_inputs], dim=0
+        # NOTE: We always use the per-layer CPU path regardless of sequence_parallel setting.
+        # The scatter-based SP path requires old_inputs and valid_mask to be split consistently
+        # with the SP-scattered current input, which is non-trivial to guarantee given that
+        # old_inputs are packed from a different iteration's batch layout.  The per-layer path
+        # is always correct because it stores the full token tensors on CPU and the loss
+        # computation uses valid_mask to align old vs current tokens without any scatter.
+        for i, router in enumerate(router_instances_list):
+            layer_inputs_concat = torch.cat(
+                [t[:, i + offset, :].to(dtype=compute_dtype, copy=False) for t in valid_old_inputs],
+                dim=0,
+            ).unsqueeze(1).contiguous()
+            layer_logits_concat = torch.cat(
+                [t[:, i + offset, :].to(dtype=compute_dtype, copy=False) for t in valid_old_logits],
+                dim=0,
+            ).unsqueeze(1).contiguous()
+            router.set_predictive_data(
+                inputs=layer_inputs_concat,
+                logits=layer_logits_concat,
+                valid_mask=valid_mask,
+                loss_scale=predictive_loss_scale,
             )
-            layers_old_logits_concat = torch.cat(
-                [t.to(compute_dtype).to(device_name) for t in valid_old_logits], dim=0
+            logger.info(
+                f"[Predictive Routing Replay] Set layer {i} predictive data with layer_inputs shape "
+                f"{router.recorded_old_inputs.shape}, layer_logits shape {router.recorded_old_logits.shape}"
             )
-
-            layers_old_inputs_concat = scatter_to_sequence_parallel_region(layers_old_inputs_concat)
-            layers_old_logits_concat = scatter_to_sequence_parallel_region(layers_old_logits_concat)
-
-            layers_old_inputs_concat = layers_old_inputs_concat.cpu()
-            layers_old_logits_concat = layers_old_logits_concat.cpu()
-
-            for i, router in enumerate(router_instances_list):
-                router.set_predictive_data(
-                    inputs=layers_old_inputs_concat[:, i + offset, :].unsqueeze(1).contiguous(),
-                    logits=layers_old_logits_concat[:, i + offset, :].unsqueeze(1).contiguous(),
-                    valid_mask=valid_mask,
-                    loss_scale=predictive_loss_scale,
-                )
-                logger.info(
-                    f"[Predictive Routing Replay] Set layer {i} predictive data with layers_old_inputs_concat shape "
-                    f"{router.recorded_old_inputs.shape}, layers_old_logits_concat shape {router.recorded_old_logits.shape}"
-                )
-
-            del layers_old_inputs_concat, layers_old_logits_concat
+            del layer_inputs_concat, layer_logits_concat
 
         del valid_old_inputs, valid_old_logits, valid_old_token_positions
         import gc
@@ -1220,12 +1116,13 @@ def set_router_predictive_bias_data(
         compute_dtype = tf_config.params_dtype
 
     # Concatenate all valid samples: [total_valid_tokens, num_layers, num_experts]
-    bias_concat = torch.cat([t.to(compute_dtype).to(device_name) for t in valid_old_bias], dim=0)
+    # NOTE: We intentionally skip the scatter_to_sequence_parallel_region here.
+    # Scattering old_bias along the token dimension would split it inconsistently with how
+    # the corresponding current tokens are distributed in the forward pass, leading to
+    # shape mismatches in the loss computation.  Keeping the full tensor on all ranks and
+    # indexing per layer on CPU is always correct.
+    bias_concat = torch.cat([t.to(compute_dtype) for t in valid_old_bias], dim=0)
     del valid_old_bias
-
-    # Scatter to sequence parallel if needed
-    if tf_config.sequence_parallel:
-        bias_concat = scatter_to_sequence_parallel_region(bias_concat)
 
     bias_concat = bias_concat.cpu()
 

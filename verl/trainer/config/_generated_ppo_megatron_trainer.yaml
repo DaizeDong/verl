@@ -40,6 +40,7 @@ actor_rollout_ref:
       sequence_parallel: true
       use_distributed_optimizer: true
       use_dist_checkpointing: false
+      load_initial_dist_checkpointing: null
       dist_checkpointing_path: null
       dynamic_context_parallel: false
       max_seqlen_per_dp_cp_rank: null
@@ -66,6 +67,9 @@ actor_rollout_ref:
         mode: disabled
         record_file: null
         replay_file: null
+        enable_bias_predictor: false
+        bias_predictor_loss_type: kl
+        bias_predictor_lr_mult: 1000.0
       qat:
         _target_: verl.workers.config.QATEngineConfig
         enable: false
@@ -156,10 +160,10 @@ actor_rollout_ref:
       bias_predictor_loss_type: kl
       bias_predictor_lr_mult: 1000.0
       predictive_downsample_batch_size: null
-      predictive_downsample_max_len_limit: null
-      predictive_r3_downsample_keep_rate: 1.0
-      predictive_storage_dtype: bf16
-      predictive_max_total_tokens: null
+      predictive_inputs_storage_dtype: bf16
+      predictive_logits_storage_dtype: fp32
+      predictive_tokens_per_seq: null
+      logits_save_sample_rate: 1.0
     qat:
       enable: false
       mode: w4a16
@@ -215,8 +219,8 @@ actor_rollout_ref:
       bias_predictor_loss_type: kl
       bias_predictor_lr_mult: 1000.0
       predictive_downsample_batch_size: null
-      predictive_downsample_max_len_limit: null
-      predictive_storage_dtype: bf16
+      predictive_inputs_storage_dtype: bf16
+      predictive_logits_storage_dtype: fp32
     megatron:
       _target_: verl.workers.config.McoreEngineConfig
       param_offload: ${oc.select:actor_rollout_ref.actor.megatron.param_offload,False}
@@ -231,6 +235,7 @@ actor_rollout_ref:
       sequence_parallel: true
       use_distributed_optimizer: true
       use_dist_checkpointing: false
+      load_initial_dist_checkpointing: null
       dist_checkpointing_path: null
       dynamic_context_parallel: false
       max_seqlen_per_dp_cp_rank: null
@@ -251,6 +256,9 @@ actor_rollout_ref:
         mode: disabled
         record_file: null
         replay_file: null
+        enable_bias_predictor: false
+        bias_predictor_loss_type: kl
+        bias_predictor_lr_mult: 1000.0
       qat:
         _target_: verl.workers.config.QATEngineConfig
         enable: false
@@ -522,6 +530,7 @@ critic:
     sequence_parallel: true
     use_distributed_optimizer: true
     use_dist_checkpointing: false
+    load_initial_dist_checkpointing: null
     dist_checkpointing_path: null
     dynamic_context_parallel: false
     max_seqlen_per_dp_cp_rank: null
@@ -548,6 +557,9 @@ critic:
       mode: disabled
       record_file: null
       replay_file: null
+      enable_bias_predictor: false
+      bias_predictor_loss_type: kl
+      bias_predictor_lr_mult: 1000.0
     qat:
       _target_: verl.workers.config.QATEngineConfig
       enable: false

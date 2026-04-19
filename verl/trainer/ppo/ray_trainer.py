@@ -1672,6 +1672,11 @@ class RayPPOTrainer:
                         torch.cuda.empty_cache()
                     
                     print(f"[Memory] Pre-checkpoint cleanup completed, proceeding with checkpoint save...")
+
+                    # update_weights() wakes rollout weights/kv cache back onto the shared GPUs.
+                    # Sleep replicas again before checkpoint save so Megatron can restore actor
+                    # parameters without competing with the rollout engine for memory.
+                    self.checkpoint_manager.sleep_replicas()
                     
                     with marked_timer("save_checkpoint", timing_raw, color="green"):
                         self._save_checkpoint()
@@ -1682,6 +1687,12 @@ class RayPPOTrainer:
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                         print(f"[Memory] After checkpoint save and cleanup: CPU memory usage may have temporarily increased")
+
+                    # HYBRID rollout has no direct wake_up path; re-run update_weights to
+                    # restore rollout memory for the next generation step after checkpointing.
+                    if not is_last_step:
+                        with marked_timer("post_ckpt_update_weights", timing_raw, color="green"):
+                            self.checkpoint_manager.update_weights(self.global_steps)
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (
                         self.global_steps + 1 in self.config.global_profiler.steps

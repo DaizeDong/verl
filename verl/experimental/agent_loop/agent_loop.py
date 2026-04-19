@@ -99,7 +99,7 @@ class GlobalRequestLoadBalancer:
 def _get_rollout_and_model_config(config: DictConfig) -> tuple[DictConfig, DictConfig]:
     # TODO: backward compatibility, remove this once we switch to new trainer.
     if config.get("actor_rollout_ref"):
-        return config.actor_rollout_ref.rollout, config.actor_rollout_ref.model
+        return _build_rollout_replica_config(config), config.actor_rollout_ref.model
     else:
         return config.rollout, config.model
 

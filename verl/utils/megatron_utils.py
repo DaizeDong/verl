@@ -1100,17 +1100,6 @@ def per_tensor_generator(
         while cur_name.startswith("module."):
             cur_name = cur_name[len("module.") :]
 
-        # Convert bias_predictor parameter names from Megatron to SGLang format
-        # Megatron: decoder.layers.{i}.mlp.router.bias_predictor.weight
-        # SGLang:   model.layers.{i}.mlp.bias_predictor.weight
-        if cur_name and "bias_predictor.weight" in cur_name:
-            import logging
-            logger = logging.getLogger(__name__)
-            original_name = cur_name
-            cur_name = cur_name.replace("decoder.", "model.")
-            cur_name = cur_name.replace(".router.bias_predictor", ".bias_predictor")
-            logger.debug(f"[BiasPredictor] Converted parameter name: {original_name} -> {cur_name}")
-
         # EP
         if ".mlp.experts.linear_fc" in cur_name and ep_size > 1:
             num_experts = weight_converter.mcore_config.num_moe_experts

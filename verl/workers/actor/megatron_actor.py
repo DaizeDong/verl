@@ -233,6 +233,11 @@ class MegatronPPOActor(BasePPOActor):
         self.mtp_config = mtp_config
         self.actor_module = actor_module
         self.actor_optimizer: DistributedOptimizer = actor_optimizer
+        # Legacy actor update code still checks these attributes even though the
+        # worker now uses DistProfiler/DistProfilerExtension. Keep safe defaults
+        # so the default "profiler disabled" path cannot crash.
+        self.use_torch_profiler = False
+        self.prof = None
 
         if self.mtp_config:
             assert self.mtp_config.enable, "MTP requires mtp_config.enable to be True"
@@ -296,7 +301,9 @@ class MegatronPPOActor(BasePPOActor):
             self.enable_logits_saving = True
             self.training_step = 0  # Track training steps for file naming
             self.save_frequency = self.router_replay.save_frequency
-            logger.info(f"[Routing Replay] Router logits saving enabled. Save directory: {self.router_replay.record_file}, frequency: every {self.save_frequency} step(s)")
+            # Propagate save-time sampling rate to RouterReplay static state.
+            RouterReplay.logits_save_sample_rate = float(getattr(self.router_replay, "logits_save_sample_rate", 1.0))
+            logger.info(f"[Routing Replay] Router logits saving enabled. Save directory: {self.router_replay.record_file}, frequency: every {self.save_frequency} step(s), sample_rate: {RouterReplay.logits_save_sample_rate}")
         else:
             self.logits_saver = None
             self.enable_logits_saving = False
@@ -476,7 +483,14 @@ class MegatronPPOActor(BasePPOActor):
         matched_groups = []
         for group in param_groups:
             params = group.get("params", [])
-            if any(id(param) in predictor_param_ids for param in params):
+            # Also match via _is_bp_shard: with use_precision_aware_optimizer=True the
+            # HDO outer param_groups hold GPU bf16 shards (not model/main params), so
+            # id-based lookup fails.  The distrib_optimizer stamps _is_bp_shard=True on
+            # those shards, making this check reliable regardless of current LR value.
+            if any(
+                id(param) in predictor_param_ids or getattr(param, "_is_bp_shard", False)
+                for param in params
+            ):
                 matched_groups.append(group)
 
         if matched_groups:
@@ -514,8 +528,16 @@ class MegatronPPOActor(BasePPOActor):
                     group["lr"] = group.pop("_predictor_saved_lr")
                     changed_groups += 1
             else:
-                if "_predictor_saved_lr" not in group:
-                    group["_predictor_saved_lr"] = group.get("lr", 0.0)
+                current_lr = group.get("lr", 0.0)
+                # Always update saved LR when the scheduler has bumped it beyond the stale
+                # saved value.  Without this, mini_step=2's disable saves the just-restored
+                # warmup LR (=0 at step 1), and that stale zero persists through
+                # scheduler.step() into every subsequent outer step — causing the enable at
+                # mini_step=1 to always restore LR=0 and producing no optimizer update.
+                # Double-disable within the same outer step is still idempotent: if lr was
+                # already zeroed, current_lr=0 will not exceed any saved positive value.
+                if "_predictor_saved_lr" not in group or current_lr > group["_predictor_saved_lr"]:
+                    group["_predictor_saved_lr"] = current_lr
                 group["lr"] = 0.0
                 changed_groups += 1
 
@@ -1132,8 +1154,8 @@ class MegatronPPOActor(BasePPOActor):
 
                     # Convert to numpy for Ray efficiency
                     # Each tensor is already on CPU and has shape [num_tokens_i, layers, hidden]
-                    layers_old_inputs_list_np = [t.contiguous().numpy() for t in layers_old_inputs_list]
-                    layers_old_logits_list_np = [t.contiguous().numpy() for t in layers_old_logits_list]
+                    layers_old_inputs_list_np = [t.contiguous().float().numpy() for t in layers_old_inputs_list]
+                    layers_old_logits_list_np = [t.contiguous().float().numpy() for t in layers_old_logits_list]
 
                     # Delete the torch tensors
                     del layers_old_inputs_list, layers_old_logits_list
@@ -1615,6 +1637,20 @@ class MegatronPPOActor(BasePPOActor):
             label_mask[:, -1] = False
             # logger.info(f"[Memory] [forward_step] After data generation (batch): {get_system_memory_info()}")
 
+            # Record global_token_ids BEFORE the forward pass so record_logits (called inside each MoE
+            # layer during forward) can access sampling indices set by record_global_token_ids.
+            if self.enable_logits_saving and RouterReplay.current_cache_action is not None:
+                if "global_token_ids" in batch.batch:
+                    _gtids = batch.batch["global_token_ids"]
+                    _valid_ids = torch.masked_select(_gtids.to(attention_mask.device), attention_mask)
+                    logger.info(f"[Routing Replay] [forward_step] Recording {len(_valid_ids)} valid global_token_ids (shape before mask: {_gtids.shape})")
+                    RouterReplay.record_global_token_ids(_valid_ids)
+                else:
+                    RouterReplay.current_sample_indices = None
+                    logger.info(f"[Routing Replay] [forward_step] WARNING: global_token_ids not in batch, cannot record!")
+            else:
+                RouterReplay.current_sample_indices = None
+
             if RouterReplayHelper.is_replay_backward_action(self.tf_config, vp_rank):
                 router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
                 for router in router_instance_list:
@@ -1659,9 +1695,7 @@ class MegatronPPOActor(BasePPOActor):
                             routed_experts=replay_layers_topk_idx,
                             old_logits_list=old_logits_list,
                             old_bias_list=old_bias_list,
-                            old_token_positions_list=(
-                                old_token_positions_list if self.config.router_replay.mode == "R3" else None
-                            ),
+                            old_token_positions_list=old_token_positions_list,
                         )
                         self._log_r3_predictive_trace(
                             non_tensor_batch=batch.non_tensor_batch,
@@ -1674,17 +1708,10 @@ class MegatronPPOActor(BasePPOActor):
                             attention_mask,
                             self.tf_config,
                             vp_rank,
-                            old_token_positions_list=(
-                                old_token_positions_list if self.config.router_replay.mode == "R3" else None
-                            ),
+                            old_token_positions_list=old_token_positions_list,
                             router_request_ids=router_request_id_list,
                             global_step=self._current_r3_trace_global_step,
                             mini_step=self._current_r3_trace_mini_step,
-                            max_total_tokens=getattr(
-                                self.config.router_replay,
-                                "predictive_max_total_tokens",
-                                None,
-                            ),
                         )
                         if self.config.router_replay.mode == "R3":
                             logger.info(
@@ -1843,21 +1870,11 @@ class MegatronPPOActor(BasePPOActor):
                         vp_rank,
                         packed_seq_params=packed_seq_params,
                         downsample_batch_size=self.config.router_replay.predictive_downsample_batch_size,
-                        storage_dtype=self.config.router_replay.predictive_storage_dtype,
-                        max_len_limit=self.config.router_replay.predictive_downsample_max_len_limit,
+                        inputs_storage_dtype=self.config.router_replay.predictive_inputs_storage_dtype,
+                        logits_storage_dtype=self.config.router_replay.predictive_logits_storage_dtype,
+                        predictive_tokens_per_seq=self.config.router_replay.predictive_tokens_per_seq,
                     )
                     # logger.info(f"[Memory] [forward_step] After merging predictive routing replay data: {get_system_memory_info()}")
-
-            # Record token_ids if present and logits saving is enabled
-            if self.enable_logits_saving and RouterReplay.current_cache_action is not None:
-                if "global_token_ids" in batch.batch:
-                    global_token_ids = batch.batch["global_token_ids"]
-                    # Only record valid tokens (remove padding)
-                    valid_ids = torch.masked_select(global_token_ids.to(attention_mask.device), attention_mask)
-                    logger.info(f"[Routing Replay] [forward_step] Recording {len(valid_ids)} valid global_token_ids (shape before mask: {global_token_ids.shape})")
-                    RouterReplay.record_global_token_ids(valid_ids)
-                else:
-                    logger.info(f"[Routing Replay] [forward_step] WARNING: global_token_ids not in batch, cannot record!")
 
             if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
                 router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
@@ -2001,7 +2018,11 @@ class MegatronPPOActor(BasePPOActor):
         metrics = {}
         # step used for frequency and naming; prefer external global_step if provided
         step_for_save = self.training_step if global_step is None else global_step
-        if self.use_torch_profiler and self.prof and self.prof.enable:
+        if (
+            getattr(self, "use_torch_profiler", False)
+            and getattr(self, "prof", None) is not None
+            and getattr(self.prof, "enable", False)
+        ):
             self.prof.start()
         for mini_step, data in enumerate(dataloader):
             # logger.info(f"[Memory] [update_policy] Mini step {mini_step} START (after dataloader.next()): {get_system_memory_info()}")
@@ -2114,10 +2135,17 @@ class MegatronPPOActor(BasePPOActor):
             for chunk in self.actor_module:
                 # if use distributed optimizer, zero grad buffer will be handled by optimizer
                 chunk.zero_grad_buffer()
-            if self.config.router_replay.enable_bias_predictor:
+            manage_predictor_optimizer_lr = self.config.router_replay.enable_bias_predictor
+            if manage_predictor_optimizer_lr:
                 # Predictive loss performs its own backward() inside the router patch. Clear the
                 # predictor grad state explicitly so stale main_grad buffers from the previous
                 # mini-step/global-step cannot be consumed by this optimizer.step().
+                #
+                # R2 also requires this. Its mini-step 0 runs SKIP_PREDICTIVE, but the actor
+                # optimizer still steps once per mini-step. Without clearing the predictor state
+                # here and disabling its param groups on skip steps, stale grads / optimizer
+                # moments from the previous predictive mini-step can leak into the next global
+                # step and corrupt the predictor before the new paired targets are consumed.
                 self._clear_bias_predictor_grad_state(reason=f"mini_step_{mini_step}_pre_forward")
 
             calculate_entropy = self.config.entropy_coeff != 0
@@ -2151,10 +2179,16 @@ class MegatronPPOActor(BasePPOActor):
                 append_to_dict(metrics, metric[0])  # append the metric from this micro-batch to global metrics.
 
             predictor_optimizer_should_step = (
-                self.config.router_replay.enable_bias_predictor
-                and predictive_pair_status in {"valid", "all_none"}
+                manage_predictor_optimizer_lr and predictive_pair_status in {"valid", "all_none", "partial"}
+                # "partial": 1+ samples have valid predictive data → real non-zero gradient WAS
+                # computed by the inner backward. Must NOT zero the LR here.
+                # "all_none": all samples hit the synthetic-zero-loss path → zero gradient, but
+                # the optimizer step is still enabled (no-op update, keeps Adam moments consistent).
+                # "valid": all samples have valid predictive data → non-zero gradient.
+                # All other statuses (skip_predictive, missing, missing_positions,
+                # skip_predictive_r3_extra_ministep): no valid gradient → LR=0 to suppress update.
             )
-            if self.config.router_replay.enable_bias_predictor:
+            if manage_predictor_optimizer_lr:
                 # Skip mini-steps must not update predictor weights, even if Adam moments from a
                 # previous predictive step are still present. Temporarily zero the predictor
                 # param-group lr on those steps and restore it on the actual predictive step.
@@ -2163,19 +2197,26 @@ class MegatronPPOActor(BasePPOActor):
                     reason=f"mini_step_{mini_step}_action_{predictive_pair_status}",
                 )
 
-            if mini_step > 0 and self.config.router_replay.enable_bias_predictor:
+            if mini_step > 0 and manage_predictor_optimizer_lr:
                 self._log_actor_predictor_state("actor-live-before-step")
 
-            if self.config.router_replay.enable_bias_predictor and predictive_pair_status in {
+            if manage_predictor_optimizer_lr and predictive_pair_status in {
                 "skip_predictive",
                 "skip_predictive_r3_extra_ministep",
                 "missing",
                 "missing_positions",
-                "partial",
+                # NOTE: "partial" is intentionally NOT cleared here.
+                # With "partial" status, has_valid_data=True in the router and a real non-zero
+                # KL-post gradient is computed by the inner backward inside compute_topk.
+                # Clearing it would zero all training signal for the bias_predictor when
+                # the batch contains even one sample without a predictive pair — which is the
+                # typical case in practice, meaning bias_predictor would never update.
+                # "missing" and "missing_positions" are cleared because NO valid gradient was
+                # computed (either no data at all, or position-matching failed).
             }:
-                # When predictive loss is skipped, the predictor should not move at all.
-                # Explicitly scrub any stale gradients that survived outside the normal PPO
-                # backward path before optimizer.step().
+                # When predictive loss is skipped or data is entirely invalid, the predictor
+                # should not move. Explicitly scrub any stale gradients that survived outside
+                # the normal PPO backward path before optimizer.step().
                 self._clear_bias_predictor_grad_state(
                     reason=f"mini_step_{mini_step}_pre_step_action_{predictive_pair_status}"
                 )
@@ -2188,7 +2229,7 @@ class MegatronPPOActor(BasePPOActor):
             
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
 
-            if mini_step > 0 and self.config.router_replay.enable_bias_predictor:
+            if mini_step > 0 and manage_predictor_optimizer_lr:
                 self._log_actor_predictor_state("actor-live-after-step")
             
             # logger.info(f"[Memory] [update_policy] After optimizer.step(): {get_system_memory_info()}, grad_norm={grad_norm}")

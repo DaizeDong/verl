@@ -126,6 +126,7 @@ router_replay:
   bias_predictor_loss_type: kl
   bias_predictor_lr_mult: 1000.0
   predictive_downsample_batch_size: null
-  predictive_downsample_max_len_limit: null
-  predictive_storage_dtype: bf16
-  predictive_r3_downsample_keep_rate: 1.0
+  predictive_inputs_storage_dtype: bf16
+  predictive_logits_storage_dtype: fp32
+  predictive_tokens_per_seq: null
+  logits_save_sample_rate: 1.0
