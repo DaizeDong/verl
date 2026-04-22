@@ -991,6 +991,31 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 self.tf_config,
                 self.layer_name_mapping,
             )
+        # Strip training-only params that confuse SGLang's weight loader.
+        # Known offenders when mbridge bridge.py patch is applied for HF save:
+        #   - bias_predictor.weight: training-only prediction head, no SGLang submodule
+        #   - expert_bias: mbridge may export with name that collides with a linear layer
+        # Set VERL_DEBUG_ROLLOUT_SYNC_NAMES=1 to log every name/shape going to the rollout backend
+        # so we can identify additional culprits if SGLang weight_loader AssertionError recurs.
+        import os as _os
+        _dbg_sync_names = _os.environ.get("VERL_DEBUG_ROLLOUT_SYNC_NAMES", "0") == "1"
+
+        def _filter_rollout_skip(gen):
+            _skipped, _kept = 0, 0
+            for name, tensor in gen:
+                if "bias_predictor" in name or "expert_bias" in name or "_extra_state" in name:
+                    if _dbg_sync_names:
+                        logger.info("[rollout-sync][SKIP] %s %s", name, getattr(tensor, "shape", None))
+                    _skipped += 1
+                    continue
+                if _dbg_sync_names:
+                    logger.info("[rollout-sync][SEND] %s %s", name, getattr(tensor, "shape", None))
+                _kept += 1
+                yield name, tensor
+            if _dbg_sync_names:
+                logger.info("[rollout-sync] total kept=%d skipped=%d", _kept, _skipped)
+
+        per_tensor_param = _filter_rollout_skip(per_tensor_param)
         per_tensor_param = _wrap_predictor_sync_debug(
             per_tensor_param,
             num_hidden_layers=getattr(self.hf_config, "num_hidden_layers", 1),

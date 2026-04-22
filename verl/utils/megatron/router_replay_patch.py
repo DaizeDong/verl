@@ -135,6 +135,8 @@ class RouterReplay:
     logits_save_sample_rate = 1.0  # 1.0 = no sampling
     sampled_log_prob_token_ids = None  # set of int token IDs sampled during compute_log_prob
     current_sample_indices = None  # per-micro-batch indices to subsample logits in record_logits
+    current_full_token_count = None  # full-sequence valid token count for current micro-batch (used to
+                                     # detect SP-sharded logits in record_logits/record_predictive_bias)
 
     # Predictive loss tracking for wandb logging
     replay_topk_accuracy_tracker = []  # List of (layer_idx, accuracy_value)
@@ -252,6 +254,7 @@ class RouterReplay:
         """
         # Default: no sampling indices; record_logits will save everything.
         RouterReplay.current_sample_indices = None
+        RouterReplay.current_full_token_count = None
 
         if not RouterReplay.enable_logits_recording or RouterReplay.current_cache_action is None:
             logger.info(f"[record_global_token_ids] Skipping - enable_recording={RouterReplay.enable_logits_recording}, ")
@@ -259,6 +262,9 @@ class RouterReplay:
 
         ids_cpu = global_token_ids.detach().cpu().contiguous()
         sample_rate = RouterReplay.logits_save_sample_rate
+        # Store the full-sequence valid token count so record_logits/record_predictive_bias
+        # can detect SP-sharded tensors (shape[0] < full_count ⇒ need to gather before indexing).
+        RouterReplay.current_full_token_count = int(ids_cpu.shape[0])
 
         if RouterReplay.current_cache_action == RouterReplayCacheAction.COMPUTE_LOG_PROB:
             # Subsample uniformly by linspace indices; accumulate IDs across micro-batches.
@@ -315,6 +321,21 @@ class RouterReplay:
         if indices is not None:
             if indices.device != logits.device:
                 indices = indices.to(logits.device)
+            # indices were built from the full-sequence valid-token count. If this router
+            # is running in a sequence-parallel shard the local `logits` has shape[0] =
+            # full_count / tp_size, and indexing with full-range indices would trigger the
+            # CUDA `vectorized_gather_kernel` OOB assert. Detect this by comparing shape[0]
+            # to the stored full_token_count and gather across the TP group first.
+            full_count = RouterReplay.current_full_token_count
+            tp_size = mpu.get_tensor_model_parallel_world_size()
+            if tp_size > 1 and full_count is not None and logits.shape[0] < full_count:
+                logits = gather_from_sequence_parallel_region(
+                    logits, tensor_parallel_output_grad=False
+                )
+                # SP pads to a multiple of tp_size; truncate to the real valid-token count
+                # so the index range matches exactly.
+                if logits.shape[0] > full_count:
+                    logits = logits[:full_count]
             logits = logits[indices]
 
         # Move to CPU to avoid GPU memory pressure
@@ -360,6 +381,16 @@ class RouterReplay:
         if indices is not None:
             if indices.device != delta_logits.device:
                 indices = indices.to(delta_logits.device)
+            # Same SP-gather fix as record_logits: indices are full-sequence but delta_logits
+            # may be SP-sharded.
+            full_count = RouterReplay.current_full_token_count
+            tp_size = mpu.get_tensor_model_parallel_world_size()
+            if tp_size > 1 and full_count is not None and delta_logits.shape[0] < full_count:
+                delta_logits = gather_from_sequence_parallel_region(
+                    delta_logits, tensor_parallel_output_grad=False
+                )
+                if delta_logits.shape[0] > full_count:
+                    delta_logits = delta_logits[:full_count]
             delta_logits = delta_logits[indices]
 
         # Move to CPU to avoid GPU memory pressure
@@ -949,6 +980,12 @@ def patched_forward(self, input: torch.Tensor):
                             current_logits_full = gather_from_sequence_parallel_region(
                                 logits, tensor_parallel_output_grad=False
                             )
+                            # Megatron SP pads the full sequence up to a multiple of tp_size
+                            # before splitting; the trailing pad tokens are not in valid_mask,
+                            # so truncate the gathered tensors back to the unpadded length.
+                            if current_input_full.shape[0] > valid_mask.shape[0]:
+                                current_input_full = current_input_full[: valid_mask.shape[0]]
+                                current_logits_full = current_logits_full[: valid_mask.shape[0]]
 
                     # Debug asserts: check shape matching
                     assert old_inputs.shape[-1] == current_input_full.shape[-1], f"hidden_size mismatch: old={old_inputs.shape[-1]}, current={current_input_full.shape[-1]}"

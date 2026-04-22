@@ -267,6 +267,11 @@ class RouterReplayLogitsSaver:
 
         dp_rank = mpu.get_data_parallel_rank()
         dp_group = mpu.get_data_parallel_group()
+        # `torch.distributed.gather_object(..., dst=..., group=dp_group)` interprets
+        # `dst` as a GLOBAL rank. Passing `dst=0` breaks when global rank 0 is not a
+        # member of this DP sub-group (e.g., with PP>1 the DP groups in PP stage 1
+        # don't include global rank 0). Translate group-local rank 0 → global rank.
+        dp_dst_global = torch.distributed.get_global_rank(dp_group, 0)
 
         gathered_data = {"compute_log_prob": [], "training": [], "router_weights": {}, "global_token_ids": [], "predictive_bias": []}
 
@@ -333,7 +338,7 @@ class RouterReplayLogitsSaver:
                 # This works with gloo backend or when objects are serializable
                 if dp_rank == 0:
                     gather_list = [None] * dp_world_size
-                    torch.distributed.gather_object(local_layer_data, gather_list, dst=0, group=dp_group)
+                    torch.distributed.gather_object(local_layer_data, gather_list, dst=dp_dst_global, group=dp_group)
 
                     # Merge data from all DP ranks
                     layer_combined = {}
@@ -367,7 +372,7 @@ class RouterReplayLogitsSaver:
 
                     logger.info(f"[gather_logits_from_dp_group] {phase}: gathered {len(layer_combined)} layers/items from {dp_world_size} DP ranks")
                 else:
-                    torch.distributed.gather_object(local_layer_data, None, dst=0, group=dp_group)
+                    torch.distributed.gather_object(local_layer_data, None, dst=dp_dst_global, group=dp_group)
 
         except Exception as e:
             logger.error(f"[gather_logits_from_dp_group] Error during gathering: {e}")

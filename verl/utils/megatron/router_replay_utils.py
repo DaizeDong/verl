@@ -1011,21 +1011,23 @@ def set_router_predictive_data(
         valid_mask = valid_mask.cpu()
 
         # Set to each router layer with valid_mask (created externally)
-        local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
-        offset = local_rank_info["start"]
         # NOTE: We always use the per-layer CPU path regardless of sequence_parallel setting.
         # The scatter-based SP path requires old_inputs and valid_mask to be split consistently
         # with the SP-scattered current input, which is non-trivial to guarantee given that
         # old_inputs are packed from a different iteration's batch layout.  The per-layer path
         # is always correct because it stores the full token tensors on CPU and the loss
         # computation uses valid_mask to align old vs current tokens without any scatter.
+        # The stacked tensors in `valid_old_inputs`/`valid_old_logits` are built from
+        # `router_instances_list` (see merge_router_predictive_data) and are indexed by
+        # the local-per-rank MoE router position, so use `i` directly — do NOT add the
+        # global layer offset (which would overflow dim=1 when PP>1).
         for i, router in enumerate(router_instances_list):
             layer_inputs_concat = torch.cat(
-                [t[:, i + offset, :].to(dtype=compute_dtype, copy=False) for t in valid_old_inputs],
+                [t[:, i, :].to(dtype=compute_dtype, copy=False) for t in valid_old_inputs],
                 dim=0,
             ).unsqueeze(1).contiguous()
             layer_logits_concat = torch.cat(
-                [t[:, i + offset, :].to(dtype=compute_dtype, copy=False) for t in valid_old_logits],
+                [t[:, i, :].to(dtype=compute_dtype, copy=False) for t in valid_old_logits],
                 dim=0,
             ).unsqueeze(1).contiguous()
             router.set_predictive_data(

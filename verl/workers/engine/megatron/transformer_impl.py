@@ -804,6 +804,24 @@ class MegatronEngine(BaseEngine):
 
             per_tensor_param = export_qat_weights(per_tensor_param, self.module, self._qat_config.mode, self.bridge)
 
+        # Strip training-only params that confuse SGLang's weight loader. Mirror of the
+        # filter in verl/workers/megatron_workers.py (legacy path). Set
+        # VERL_DEBUG_ROLLOUT_SYNC_NAMES=1 to log every name/shape going to the rollout backend.
+        import os as _os
+        _dbg_sync_names = _os.environ.get("VERL_DEBUG_ROLLOUT_SYNC_NAMES", "0") == "1"
+
+        def _filter_rollout_skip(gen):
+            for name, tensor in gen:
+                if "bias_predictor" in name or "expert_bias" in name or "_extra_state" in name:
+                    if _dbg_sync_names:
+                        print(f"[rollout-sync][SKIP] {name} {getattr(tensor, 'shape', None)}", flush=True)
+                    continue
+                if _dbg_sync_names:
+                    print(f"[rollout-sync][SEND] {name} {getattr(tensor, 'shape', None)}", flush=True)
+                yield name, tensor
+
+        per_tensor_param = _filter_rollout_skip(per_tensor_param)
+
         return per_tensor_param, peft_config
 
     def disable_adapter(self) -> ContextManager:

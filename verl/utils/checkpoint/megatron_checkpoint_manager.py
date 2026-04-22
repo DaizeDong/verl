@@ -825,6 +825,13 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
         if self.should_save_hf_model and not self.use_hf_checkpoint:
             # wait for everyone to dump to local
+            log_with_rank(
+                f"[hf_model save] entering branch: bridge={type(self.bridge).__name__ if self.bridge else None}, "
+                f"vanilla_bridge={self.vanilla_bridge}, use_hf_checkpoint={self.use_hf_checkpoint}",
+                rank=self.rank,
+                logger=logger,
+                log_only_rank_0=True,
+            )
             if self.bridge is not None:
                 hf_model_ckpt_path = get_hf_model_checkpoint_path(local_path)
                 if self.vanilla_bridge:
@@ -835,10 +842,35 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                             continue
                         if sig in mbridge_config:
                             extended_args[sig] = mbridge_config[sig]
+                    log_with_rank(
+                        f"[hf_model save] calling vanilla bridge.save_weights(model, {hf_model_ckpt_path}, "
+                        f"extra_args={list(extended_args.keys())})",
+                        rank=self.rank,
+                        logger=logger,
+                        log_only_rank_0=True,
+                    )
                     self.bridge.save_weights(self.model, hf_model_ckpt_path, **extended_args)
                 else:
+                    log_with_rank(
+                        f"[hf_model save] calling bridge.save_hf_weights(model, {hf_model_ckpt_path})",
+                        rank=self.rank,
+                        logger=logger,
+                        log_only_rank_0=True,
+                    )
                     self.bridge.save_hf_weights(self.model, hf_model_ckpt_path)
+                log_with_rank(
+                    f"[hf_model save] bridge save returned for {hf_model_ckpt_path}",
+                    rank=self.rank,
+                    logger=logger,
+                    log_only_rank_0=True,
+                )
             else:
+                log_with_rank(
+                    "[hf_model save] self.bridge is None -> falling back to weight_saver + save_pretrained",
+                    rank=self.rank,
+                    logger=logger,
+                    log_only_rank_0=True,
+                )
                 state_dict = self.weight_saver(
                     self.model,
                     self.hf_config,
