@@ -1333,8 +1333,18 @@ class RayPPOTrainer:
                 return
 
         if self.config.actor_rollout_ref.rollout.skip.get("enable", False):
-            rollout_skip = RolloutSkip(self.config, self.async_rollout_manager)
-            rollout_skip.wrap_generate_sequences()
+            # Skip rollout cache is unsafe after resume: cached rollouts were captured
+            # under whatever code path was live at dump time, so any post-resume change
+            # that affects rollout outputs (e.g. fixed actor->rollout weight sync) won't
+            # be reflected. Re-run the rollout in that case.
+            if self.global_steps > 0:
+                pprint(
+                    f"[RolloutSkip()] resume detected (global_steps={self.global_steps}); "
+                    f"skipping rollout-cache wrap and running real rollouts"
+                )
+            else:
+                rollout_skip = RolloutSkip(self.config, self.async_rollout_manager)
+                rollout_skip.wrap_generate_sequences()
 
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
