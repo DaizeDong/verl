@@ -23,8 +23,13 @@ def reward_func(data_source, solution_str, ground_truth, extra_info=None):
 
         return math_dapo.compute_score(solution_str, ground_truth)["acc"]
 
+    if source in {"openai/gsm8k", "gsm8k"}:
+        from verl.utils.reward_score import gsm8k
+
+        return gsm8k.compute_score(solution_str, ground_truth)
+
     if source in {"Maxwell-Jia/AIME_2024", "opencompass/cnmo2024_en", "opencompass/cnmo2024_zh"}:
-        from recipe.r1.tasks import math_reward
+        from verl.utils.reward_score import math_reward
 
         return math_reward.compute_score(solution_str, ground_truth)
 

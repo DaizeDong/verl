@@ -3,7 +3,10 @@ import torch
 
 pytest.importorskip("megatron.core")
 
-from verl.utils.megatron.router_replay_utils import build_predictive_valid_mask
+from verl.utils.megatron.router_replay_utils import (
+    build_predictive_valid_mask,
+    restore_predictive_states_to_batch_order,
+)
 
 
 def test_build_predictive_valid_mask_prefix_lengths():
@@ -62,3 +65,40 @@ def test_build_predictive_valid_mask_handles_no_valid_samples():
 
     assert selected_lens == []
     assert valid_mask.tolist() == [False, False]
+
+
+def test_restore_predictive_states_to_batch_order_dynamic_indices():
+    old_inputs = ["sample3-inputs", "sample0-inputs", "sample2-inputs"]
+    old_logits = ["sample3-logits", "sample0-logits", "sample2-logits"]
+    old_positions = ["sample3-positions", "sample0-positions", "sample2-positions"]
+    sampled_masks = torch.tensor([True, False, True, True])
+    indices = [[3], [1], [0], [2]]
+
+    restored_inputs, restored_logits, restored_positions = restore_predictive_states_to_batch_order(
+        old_inputs,
+        old_logits,
+        old_positions,
+        sampled_masks,
+        indices=indices,
+    )
+
+    assert restored_inputs == ["sample0-inputs", None, "sample2-inputs", "sample3-inputs"]
+    assert restored_logits == ["sample0-logits", None, "sample2-logits", "sample3-logits"]
+    assert restored_positions == ["sample0-positions", None, "sample2-positions", "sample3-positions"]
+
+
+def test_restore_predictive_states_to_batch_order_sequential_masks():
+    old_inputs = ["sample0-inputs", "sample2-inputs"]
+    old_logits = ["sample0-logits", "sample2-logits"]
+    old_positions = ["sample0-positions", "sample2-positions"]
+
+    restored_inputs, restored_logits, restored_positions = restore_predictive_states_to_batch_order(
+        old_inputs,
+        old_logits,
+        old_positions,
+        [True, False, True],
+    )
+
+    assert restored_inputs == ["sample0-inputs", None, "sample2-inputs"]
+    assert restored_logits == ["sample0-logits", None, "sample2-logits"]
+    assert restored_positions == ["sample0-positions", None, "sample2-positions"]

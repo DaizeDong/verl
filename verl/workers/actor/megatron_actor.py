@@ -57,6 +57,7 @@ from verl.utils.megatron.router_replay_utils import (
     merge_router_predictive_data,
     set_router_predictive_data,
     set_router_predictive_bias_data,
+    restore_predictive_states_to_batch_order,
 )
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
 from verl.utils.megatron_utils import get_megatron_mtp_loss, get_model_config, unwrap_model
@@ -293,6 +294,7 @@ class MegatronPPOActor(BasePPOActor):
             if self.enable_bias_predictor:
                 self.mini_layer_old_inputs_list = []
                 self.mini_layer_old_logits_list = []
+                self.mini_layer_old_token_positions_list = []
                 self.mini_layer_sampled_masks_list = []
 
         # Initialize logits saver if record_file is specified
@@ -549,6 +551,16 @@ class MegatronPPOActor(BasePPOActor):
                 changed_groups,
             )
 
+    def _predictive_requires_positions(self) -> bool:
+        if self.config.router_replay.mode == "R3":
+            return True
+        tokens_per_seq = getattr(self.config.router_replay, "predictive_tokens_per_seq", None)
+        if tokens_per_seq is None:
+            return False
+        if isinstance(tokens_per_seq, str) and tokens_per_seq.lower() in {"", "none", "null"}:
+            return False
+        return True
+
     def _log_r3_predictive_trace(
         self,
         *,
@@ -569,7 +581,11 @@ class MegatronPPOActor(BasePPOActor):
         for idx, (old_input, old_logit) in enumerate(zip(old_inputs_list or [], old_logits_list or [])):
             if old_input is None or old_logit is None:
                 continue
-            if self.config.router_replay.mode == "R3" and old_token_positions_list is not None and old_token_positions_list[idx] is None:
+            if (
+                self._predictive_requires_positions()
+                and old_token_positions_list is not None
+                and old_token_positions_list[idx] is None
+            ):
                 continue
             sample_idx = idx
             break
@@ -1142,9 +1158,18 @@ class MegatronPPOActor(BasePPOActor):
                     # NEW: Expect list of variable-shape tensors instead of single padded tensor
                     layers_old_inputs_list = output["mini_layer_old_inputs_list"]  # list of [num_tokens_i, layers, hidden]
                     layers_old_logits_list = output["mini_layer_old_logits_list"]  # list of [num_tokens_i, layers, num_experts]
+                    layers_old_token_positions_list = output.get("mini_layer_old_token_positions_list")
+                    if layers_old_token_positions_list is None:
+                        layers_old_token_positions_list = [
+                            torch.arange(t.shape[0], dtype=torch.int32, device="cpu") for t in layers_old_inputs_list
+                        ]
                     sampled_masks = output["mini_layer_sampled_masks_tensor"]  # [num_batches * bs], bool tensor
                     logger.info(f"[Predictive Routing Replay] Shape of layers_old_inputs_list after compute_log_prob forward: {[t.shape if t is not None else None for t in layers_old_inputs_list]}")
                     logger.info(f"[Predictive Routing Replay] Shape of layers_old_logits_list after compute_log_prob forward: {[t.shape if t is not None else None for t in layers_old_logits_list]}")
+                    logger.info(
+                        "[Predictive Routing Replay] Shape of old_token_positions after compute_log_prob forward: "
+                        f"{[t.shape if t is not None else None for t in layers_old_token_positions_list]}"
+                    )
                     logger.info(f"[Predictive Routing Replay] Shape of sampled_masks after compute_log_prob forward: {sampled_masks.shape}, values: {sampled_masks}")
 
                     # Memory debug
@@ -1156,42 +1181,28 @@ class MegatronPPOActor(BasePPOActor):
                     # Each tensor is already on CPU and has shape [num_tokens_i, layers, hidden]
                     layers_old_inputs_list_np = [t.contiguous().float().numpy() for t in layers_old_inputs_list]
                     layers_old_logits_list_np = [t.contiguous().float().numpy() for t in layers_old_logits_list]
+                    layers_old_token_positions_list_np = [
+                        t.contiguous().cpu().to(torch.int32).numpy() for t in layers_old_token_positions_list
+                    ]
 
                     # Delete the torch tensors
-                    del layers_old_inputs_list, layers_old_logits_list
+                    del layers_old_inputs_list, layers_old_logits_list, layers_old_token_positions_list
                     import gc
                     gc.collect()
 
-                    # Note: dynamic_bsz reordering - if needed, reorder the list
-                    if use_dynamic_bsz:
-                        # TODO: check correctness
-                        indices = output["indices"]  # [num_batches * bs], range from 0 to (num_batches * bs - 1)
-                        indices_tensor = torch.tensor(list(itertools.chain.from_iterable(indices)) , dtype=torch.long, device=sampled_masks.device)  # Convert to tensor
-                        sampled_indices = indices_tensor[sampled_masks]  # [num_batches * sampled_batch_size], range from 0 to (num_batches * bs - 1)
-                        # Now we need to reassign the indices from 0 to (num_batches * sampled_batch_size - 1), while keeping the order
-                        # Out target: [99, 20, 49, 2, 40, 75, 0, 8] => [7, 3, 5, 1, 4, 6, 0, 2]
-                        indices_for_sorting = torch.argsort(sampled_indices)  # [99, 20, 49, 2, 40, 75, 0, 8] => [6, 3, 7, 1, 4, 2, 5, 0]
-                        revert_indices = torch.tensor(get_reverse_idx(indices_for_sorting), dtype=torch.long)  # [6, 3, 7, 1, 4, 2, 5, 0] => [7, 3, 5, 1, 4, 6, 0, 2]
-                        # Reorder the numpy lists
-                        layers_old_inputs_list_np = [layers_old_inputs_list_np[i] for i in revert_indices]
-                        layers_old_logits_list_np = [layers_old_logits_list_np[i] for i in revert_indices]
-
-                    # Insert None for unsampled entries
-                    full_inputs_list = []
-                    full_logits_list = []
-                    sampled_idx = 0
-                    for i in range(len(sampled_masks)):
-                        if sampled_masks[i]:
-                            full_inputs_list.append(layers_old_inputs_list_np[sampled_idx])
-                            full_logits_list.append(layers_old_logits_list_np[sampled_idx])
-                            sampled_idx += 1
-                        else:
-                            full_inputs_list.append(None)
-                            full_logits_list.append(None)
+                    full_inputs_list, full_logits_list, full_token_positions_list = (
+                        restore_predictive_states_to_batch_order(
+                            layers_old_inputs_list_np,
+                            layers_old_logits_list_np,
+                            layers_old_token_positions_list_np,
+                            sampled_masks,
+                            indices=output["indices"] if use_dynamic_bsz else None,
+                        )
+                    )
 
                     # logger.info(f"[Predictive Routing Replay] [Downsample] Restored predictive data to full batch size: {len(sampled_masks)} (downsampled from {len(layers_old_inputs_list_np)})")
 
-                    layers_predictive_states = (full_inputs_list, full_logits_list)
+                    layers_predictive_states = (full_inputs_list, full_logits_list, full_token_positions_list)
 
         # add empty cache after each compute
         get_torch_device().empty_cache()
@@ -1373,9 +1384,9 @@ class MegatronPPOActor(BasePPOActor):
                 )
                 old_inputs_list = None
                 old_logits_list = None
-            if self.config.router_replay.mode == "R3" and old_token_positions_list is None and old_inputs_list is not None:
+            if self._predictive_requires_positions() and old_token_positions_list is None and old_inputs_list is not None:
                 logger.warning(
-                    "[Predictive Routing Replay] old_token_positions missing while splitting R3 micro-batches. "
+                    "[Predictive Routing Replay] old_token_positions missing while splitting position-aware micro-batches. "
                     "Dropping position metadata for this mini_batch."
                 )
 
@@ -1666,7 +1677,7 @@ class MegatronPPOActor(BasePPOActor):
                     predictive_pair_status, predictive_pair_count, old_inputs_list, old_logits_list, old_token_positions_list = (
                         self._describe_predictive_pair(
                             batch.non_tensor_batch,
-                            require_positions=self.config.router_replay.mode == "R3",
+                            require_positions=self._predictive_requires_positions(),
                         )
                     )
 
@@ -1737,7 +1748,7 @@ class MegatronPPOActor(BasePPOActor):
                             )
                         elif predictive_pair_status == "missing_positions":
                             logger.warning(
-                                "[Predictive Routing Replay] old_token_positions not provided for this R3 micro-batch; "
+                                "[Predictive Routing Replay] old_token_positions not provided for this position-aware micro-batch; "
                                 "cleared predictive replay state."
                             )
                         elif predictive_pair_status == "partial":
@@ -1764,11 +1775,16 @@ class MegatronPPOActor(BasePPOActor):
             if RouterReplayHelper.is_r3_collect_stats_action(self.tf_config, vp_rank):
                 old_bias_status, old_bias_count, old_bias_list = self._describe_router_state_field(batch.non_tensor_batch, "old_bias")
                 if old_bias_status == "valid":
+                    old_token_positions_list = self._normalize_non_tensor_sequence(
+                        batch.non_tensor_batch.get("old_token_positions")
+                    )
                     set_router_predictive_bias_data(
                         old_bias_list,
                         attention_mask,
                         self.tf_config,
                         vp_rank,
+                        old_token_positions_list=old_token_positions_list,
+                        global_token_ids=batch.batch.get("global_token_ids"),
                     )
                     logger.info(
                         "[R3+Predictive] Loaded old_bias for R3_COLLECT_STATS "
@@ -1865,6 +1881,7 @@ class MegatronPPOActor(BasePPOActor):
                         input_ids,
                         self.mini_layer_old_inputs_list,
                         self.mini_layer_old_logits_list,
+                        self.mini_layer_old_token_positions_list,
                         self.mini_layer_sampled_masks_list,
                         self.tf_config,
                         vp_rank,
@@ -1949,9 +1966,11 @@ class MegatronPPOActor(BasePPOActor):
                         from verl.utils.megatron.router_replay_utils import reorder_list_for_vpp
                         losses_reduced["mini_layer_old_inputs_list"] = reorder_list_for_vpp(self.mini_layer_old_inputs_list, bs, vp_size, microbatch_group_size_per_vp_stage)
                         losses_reduced["mini_layer_old_logits_list"] = reorder_list_for_vpp(self.mini_layer_old_logits_list, bs, vp_size, microbatch_group_size_per_vp_stage)
+                        losses_reduced["mini_layer_old_token_positions_list"] = reorder_list_for_vpp(self.mini_layer_old_token_positions_list, bs, vp_size, microbatch_group_size_per_vp_stage)
                     else:
                         losses_reduced["mini_layer_old_inputs_list"] = self.mini_layer_old_inputs_list
                         losses_reduced["mini_layer_old_logits_list"] = self.mini_layer_old_logits_list
+                        losses_reduced["mini_layer_old_token_positions_list"] = self.mini_layer_old_token_positions_list
                     
                     losses_reduced["mini_layer_sampled_masks_tensor"] = reorder_and_merge_vpp_layers(self.mini_layer_sampled_masks_list, bs, vp_size, microbatch_group_size_per_vp_stage)
                     # logger.info(f"[Predictive Routing Replay] [Debug] mini_layer_old_inputs_list after reorder: len: {len(losses_reduced['mini_layer_old_inputs_list'])}, first element shape: {losses_reduced['mini_layer_old_inputs_list'][0].shape if len(losses_reduced['mini_layer_old_inputs_list']) > 0 else 'N/A'}")
@@ -1973,6 +1992,7 @@ class MegatronPPOActor(BasePPOActor):
                     # Just concatenate the lists from different micro-batches
                     losses_reduced["mini_layer_old_inputs_list"] = self.mini_layer_old_inputs_list
                     losses_reduced["mini_layer_old_logits_list"] = self.mini_layer_old_logits_list
+                    losses_reduced["mini_layer_old_token_positions_list"] = self.mini_layer_old_token_positions_list
                     losses_reduced["mini_layer_sampled_masks_tensor"] = torch.cat(self.mini_layer_sampled_masks_list, dim=0)
                     # logger.info(f"[Predictive Routing Replay] [Debug] mini_layer_old_inputs_list after reorder & merge: len: {len(losses_reduced['mini_layer_old_inputs_list'])}, first element shape: {losses_reduced['mini_layer_old_inputs_list'][0].shape if len(losses_reduced['mini_layer_old_inputs_list']) > 0 else 'N/A'}")
                     # logger.info(f"[Predictive Routing Replay] [Debug] mini_layer_old_logits_list after reorder & merge: len: {len(losses_reduced['mini_layer_old_logits_list'])}, first element shape: {losses_reduced['mini_layer_old_logits_list'][0].shape if len(losses_reduced['mini_layer_old_logits_list']) > 0 else 'N/A'}")
@@ -1987,6 +2007,7 @@ class MegatronPPOActor(BasePPOActor):
                 # Explicitly clear large data structures
                 self.mini_layer_old_inputs_list = []
                 self.mini_layer_old_logits_list = []
+                self.mini_layer_old_token_positions_list = []
                 self.mini_layer_sampled_masks_list = []
             
             # Force garbage collection to free CPU memory
@@ -2072,7 +2093,7 @@ class MegatronPPOActor(BasePPOActor):
                     else:  # Later ministeps: compute predictive loss
                         predictive_pair_status, predictive_pair_count, _, _, _ = self._describe_predictive_pair(
                             data.non_tensor_batch,
-                            require_positions=self.config.router_replay.mode == "R3",
+                            require_positions=self._predictive_requires_positions(),
                         )
                         if mini_step > 1:
                             logger.warning(f"[Predictive Router Replay] Mini-step {mini_step}: More than 2 mini-steps detected. Mathematically this may lead to sub-optimal optimization for bias predictors due to inconsistent training objective across different mini-steps. However this is not explicitly forbidden and would still work in practice.")
@@ -2104,7 +2125,8 @@ class MegatronPPOActor(BasePPOActor):
                             elif predictive_pair_status == "missing_positions":
                                 logger.warning(
                                     f"[Predictive Routing Replay] Mini-step {mini_step}: "
-                                    "old_token_positions not provided for R3; fallback to SKIP_PREDICTIVE."
+                                    "old_token_positions not provided for position-aware predictive replay; "
+                                    "fallback to SKIP_PREDICTIVE."
                                 )
                             elif predictive_pair_status == "partial":
                                 logger.warning(
@@ -2179,13 +2201,11 @@ class MegatronPPOActor(BasePPOActor):
                 append_to_dict(metrics, metric[0])  # append the metric from this micro-batch to global metrics.
 
             predictor_optimizer_should_step = (
-                manage_predictor_optimizer_lr and predictive_pair_status in {"valid", "all_none", "partial"}
-                # "partial": 1+ samples have valid predictive data → real non-zero gradient WAS
-                # computed by the inner backward. Must NOT zero the LR here.
+                manage_predictor_optimizer_lr and predictive_pair_status in {"valid", "all_none"}
                 # "all_none": all samples hit the synthetic-zero-loss path → zero gradient, but
                 # the optimizer step is still enabled (no-op update, keeps Adam moments consistent).
                 # "valid": all samples have valid predictive data → non-zero gradient.
-                # All other statuses (skip_predictive, missing, missing_positions,
+                # All other statuses (skip_predictive, missing, missing_positions, partial,
                 # skip_predictive_r3_extra_ministep): no valid gradient → LR=0 to suppress update.
             )
             if manage_predictor_optimizer_lr:
@@ -2205,14 +2225,11 @@ class MegatronPPOActor(BasePPOActor):
                 "skip_predictive_r3_extra_ministep",
                 "missing",
                 "missing_positions",
-                # NOTE: "partial" is intentionally NOT cleared here.
-                # With "partial" status, has_valid_data=True in the router and a real non-zero
-                # KL-post gradient is computed by the inner backward inside compute_topk.
-                # Clearing it would zero all training signal for the bias_predictor when
-                # the batch contains even one sample without a predictive pair — which is the
-                # typical case in practice, meaning bias_predictor would never update.
-                # "missing" and "missing_positions" are cleared because NO valid gradient was
-                # computed (either no data at all, or position-matching failed).
+                "partial",
+                # "partial" here means the paired fields themselves are inconsistent
+                # (for example old_inputs without old_logits). Sample-level missing
+                # entries still produce status="valid" when at least one complete
+                # predictive pair exists.
             }:
                 # When predictive loss is skipped or data is entirely invalid, the predictor
                 # should not move. Explicitly scrub any stale gradients that survived outside

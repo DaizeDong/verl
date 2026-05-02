@@ -97,6 +97,7 @@ class RouterReplayLogitsSaver:
                 "router_weights": {},
                 "global_token_ids": [],  # Direct list/tensor, no phase key
                 "predictive_bias": {},  # Bias predictor output (scaled delta_logits)
+                "predictive_bias_token_ids": [],  # Token ids aligned row-by-row with predictive_bias
             }
 
             # Organize by layer index
@@ -125,6 +126,9 @@ class RouterReplayLogitsSaver:
             for ids in logits_data.get("global_token_ids", []):
                 save_dict["global_token_ids"].append(ids)
 
+            for ids in logits_data.get("predictive_bias_token_ids", []):
+                save_dict["predictive_bias_token_ids"].append(ids)
+
             # Concatenate multiple micro-batches if present
             for phase in ["compute_log_prob", "training", "predictive_bias"]:
                 for layer_idx in save_dict[phase]:
@@ -133,6 +137,8 @@ class RouterReplayLogitsSaver:
 
             if len(save_dict["global_token_ids"]) > 0:
                 save_dict["global_token_ids"] = torch.cat(save_dict["global_token_ids"], dim=0)
+            if len(save_dict["predictive_bias_token_ids"]) > 0:
+                save_dict["predictive_bias_token_ids"] = torch.cat(save_dict["predictive_bias_token_ids"], dim=0)
 
             # Save to disk
             torch.save(save_dict, filepath)
@@ -140,6 +146,7 @@ class RouterReplayLogitsSaver:
             logger.info(f"  File contains: compute_log_prob={len(save_dict['compute_log_prob'])} layers, "
                         f"training={len(save_dict['training'])} layers, router_weights={len(save_dict['router_weights'])} layers, "
                         f"global_token_ids={save_dict['global_token_ids'].shape if isinstance(save_dict['global_token_ids'], torch.Tensor) else 0}, "
+                        f"predictive_bias_token_ids={save_dict['predictive_bias_token_ids'].shape if isinstance(save_dict['predictive_bias_token_ids'], torch.Tensor) else 0}, "
                         f"predictive_bias={len(save_dict['predictive_bias'])} layers")
 
         except Exception as e:
@@ -165,6 +172,7 @@ class RouterReplayLogitsSaver:
             "router_weights": {idx: tensor.clone() for idx, tensor in logits_data.get("router_weights", {}).items()},
             "global_token_ids": [tensor.clone() for tensor in logits_data.get("global_token_ids", [])],
             "predictive_bias": [(idx, tensor.clone()) for idx, tensor in logits_data.get("predictive_bias", [])],
+            "predictive_bias_token_ids": [tensor.clone() for tensor in logits_data.get("predictive_bias_token_ids", [])],
         }
 
         logger.info(f"[save_logits_async] After copy: "
@@ -219,7 +227,14 @@ class RouterReplayLogitsSaver:
 
         # Router logits are identical across TP ranks, so only return data on rank 0
         # to avoid duplicate saves
-        return logits_data if tp_rank == 0 else {"compute_log_prob": [], "training": [], "router_weights": {}, "global_token_ids": [], "predictive_bias": []}
+        return logits_data if tp_rank == 0 else {
+            "compute_log_prob": [],
+            "training": [],
+            "router_weights": {},
+            "global_token_ids": [],
+            "predictive_bias": [],
+            "predictive_bias_token_ids": [],
+        }
 
     @staticmethod
     @no_grad()
@@ -255,13 +270,19 @@ class RouterReplayLogitsSaver:
                 downsampled_data = {
                     "compute_log_prob": [],
                     "training": [],
-                    "router_weights": [],
+                    "router_weights": {},
+                    "global_token_ids": [t[:tokens_per_rank] for t in logits_data.get("global_token_ids", [])],
+                    "predictive_bias": [],
+                    "predictive_bias_token_ids": [
+                        t[:tokens_per_rank] for t in logits_data.get("predictive_bias_token_ids", [])
+                    ],
                 }
-                for phase in ["compute_log_prob", "training", "router_weights"]:
+                for phase in ["compute_log_prob", "training", "predictive_bias"]:
                     for layer_idx, logits in logits_data.get(phase, []):
                         if logits.size(0) > tokens_per_rank:
                             logits = logits[:tokens_per_rank]
                         downsampled_data[phase].append((layer_idx, logits))
+                downsampled_data["router_weights"] = logits_data.get("router_weights", {})
                 return downsampled_data
             return logits_data
 
@@ -273,11 +294,25 @@ class RouterReplayLogitsSaver:
         # don't include global rank 0). Translate group-local rank 0 → global rank.
         dp_dst_global = torch.distributed.get_global_rank(dp_group, 0)
 
-        gathered_data = {"compute_log_prob": [], "training": [], "router_weights": {}, "global_token_ids": [], "predictive_bias": []}
+        gathered_data = {
+            "compute_log_prob": [],
+            "training": [],
+            "router_weights": {},
+            "global_token_ids": [],
+            "predictive_bias": [],
+            "predictive_bias_token_ids": [],
+        }
 
         try:
 
-            for phase in ["compute_log_prob", "training", "router_weights", "global_token_ids", "predictive_bias"]:
+            for phase in [
+                "compute_log_prob",
+                "training",
+                "router_weights",
+                "global_token_ids",
+                "predictive_bias",
+                "predictive_bias_token_ids",
+            ]:
                 # Use appropriate default value based on phase data structure
                 default_value = {} if phase == "router_weights" else []
                 phase_data = logits_data.get(phase, default_value)
@@ -287,7 +322,7 @@ class RouterReplayLogitsSaver:
                 layer_dict = {}
                 token_ids_list = []  # Special handling for token_ids
 
-                if phase == "global_token_ids":
+                if phase in {"global_token_ids", "predictive_bias_token_ids"}:
                     # global_token_ids: list of tensors (no tuple wrapper)
                     for tensor in phase_data:
                         token_ids_list.append(tensor)
@@ -311,13 +346,13 @@ class RouterReplayLogitsSaver:
                 # Concatenate micro-batches for each layer
                 local_layer_data = []
 
-                if phase == "global_token_ids":
+                if phase in {"global_token_ids", "predictive_bias_token_ids"}:
                     if token_ids_list:
                         combined_ids = torch.cat(token_ids_list, dim=0)
                         # We treat it as layer -1 or some special key to reuse logic, or just a list of tensors
                         # But wait, gather_object expects list of (layer_idx, tensor).
                         # Let's use a dummy index for token_ids
-                        local_layer_data.append(("global_token_ids", combined_ids))
+                        local_layer_data.append((phase, combined_ids))
                 else:
                     for layer_idx in sorted(layer_dict.keys()):
                         # For router_weights, we only take the first chunk (it's a parameter, doesn't split by micro-batch)
@@ -351,10 +386,10 @@ class RouterReplayLogitsSaver:
                             layer_combined[layer_idx].append(logits)
 
                     # Concatenate along batch/token dimension (for logits) or pick first (for router_weights)
-                    if phase == "global_token_ids":
-                        if "global_token_ids" in layer_combined:
+                    if phase in {"global_token_ids", "predictive_bias_token_ids"}:
+                        if phase in layer_combined:
                             # Concatenate token_ids from all ranks
-                            combined_ids = torch.cat(layer_combined["global_token_ids"], dim=0)
+                            combined_ids = torch.cat(layer_combined[phase], dim=0)
                             gathered_data[phase].append(combined_ids)
                     elif phase == "router_weights":
                         for layer_idx in sorted(layer_combined.keys()):
@@ -379,4 +414,11 @@ class RouterReplayLogitsSaver:
             logger.error(f"  DP rank: {dp_rank}, DP world size: {dp_world_size}")
             raise
 
-        return gathered_data if dp_rank == 0 else {"compute_log_prob": [], "training": [], "router_weights": {}, "global_token_ids": [], "predictive_bias": []}
+        return gathered_data if dp_rank == 0 else {
+            "compute_log_prob": [],
+            "training": [],
+            "router_weights": {},
+            "global_token_ids": [],
+            "predictive_bias": [],
+            "predictive_bias_token_ids": [],
+        }

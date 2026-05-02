@@ -74,6 +74,8 @@ async def submit_request(server_address, **chat_complete_request):
             json=chat_complete_request,
         ) as resp:
             data = await resp.json()
+            if resp.status >= 400 or data.get("object") == "error":
+                raise RuntimeError(f"SGLang chat completion failed: status={resp.status}, body={data}")
             return ChatCompletion(**data)
     finally:
         await session.close()

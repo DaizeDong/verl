@@ -145,6 +145,18 @@ def _get_system_memory_info():
 def _to_numpy_array(value, *, dtype=None):
     if value is None:
         return None
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu().contiguous()
+        unsupported_numpy_dtypes = {torch.bfloat16}
+        for dtype_name in ("float8_e4m3fn", "float8_e5m2"):
+            if hasattr(torch, dtype_name):
+                unsupported_numpy_dtypes.add(getattr(torch, dtype_name))
+        if tensor.dtype in unsupported_numpy_dtypes:
+            tensor = tensor.to(torch.float32)
+        array = tensor.numpy()
+        if dtype is not None and array.dtype != dtype:
+            return array.astype(dtype, copy=False)
+        return array
     if isinstance(value, np.ndarray):
         if dtype is not None and value.dtype != dtype:
             return value.astype(dtype, copy=False)
@@ -508,6 +520,7 @@ def merge_router_predictive_data(
     input_ids,
     mini_layer_old_inputs_list,
     mini_layer_old_logits_list,
+    mini_layer_old_token_positions_list,
     mini_layer_sampled_masks_list,
     tf_config,
     vp_rank=None,
@@ -528,6 +541,8 @@ def merge_router_predictive_data(
         logits_storage_dtype: Storage dtype for router logits (old_logits): 'fp32', 'bf16', 'fp16', 'fp8'.
         predictive_tokens_per_seq: Number of tokens to uniformly subsample from each sequence.
             Uses evenly-spaced linspace indices. Set to None to keep all tokens.
+        mini_layer_old_token_positions_list: output list aligned with old_inputs/old_logits after
+            token and sequence downsampling.
     
     Returns:
         sampled_indices: Tensor of sampled batch indices (0 to downsample_batch_size-1, or 0 to batch_size-1 if no downsampling).
@@ -614,6 +629,7 @@ def merge_router_predictive_data(
     # Split by sample into list (each with different num_tokens)
     layers_old_inputs_list = []
     layers_old_logits_list = []
+    layers_old_token_positions_list = []
     total_tokens_before_split = 0
     for i in range(batch_size):
         start_idx = cu_seqlens[i].item()
@@ -626,6 +642,7 @@ def merge_router_predictive_data(
         
         layers_old_inputs_list.append(sample_inputs)
         layers_old_logits_list.append(sample_logits)
+        layers_old_token_positions_list.append(torch.arange(num_tokens, dtype=torch.int32, device="cpu"))
         total_tokens_before_split += num_tokens
 
     # Uniform token subsampling per sequence (R2 path — mirrors R3 sglang-side subsampling)
@@ -637,6 +654,7 @@ def merge_router_predictive_data(
                 idx = idx.clamp(0, n_tokens - 1)
                 layers_old_inputs_list[i] = layers_old_inputs_list[i][idx]
                 layers_old_logits_list[i] = layers_old_logits_list[i][idx]
+                layers_old_token_positions_list[i] = layers_old_token_positions_list[i][idx]
 
     # print(f"[Predictive Routing Replay] [Debug] Split into {len(layers_old_inputs_list)} samples without padding")
     # print(f"[Predictive Routing Replay] [Debug] Sample shapes: first={layers_old_inputs_list[0].shape}")
@@ -658,6 +676,7 @@ def merge_router_predictive_data(
         downsample_mask = torch.ones((bs,), dtype=torch.bool, device='cpu')
         layers_old_inputs_sampled = layers_old_inputs_list
         layers_old_logits_sampled = layers_old_logits_list
+        layers_old_token_positions_sampled = layers_old_token_positions_list
         # print(f"[Predictive Routing Replay] [Downsample] No downsampling: batch_size ({bs}) <= downsample_batch_size ({downsample_batch_size})")
     else:
         # Length-aware sampling: filter by sequence length threshold to avoid OOM from long sequences
@@ -686,6 +705,7 @@ def merge_router_predictive_data(
         downsample_mask[sampled_indices] = True
         layers_old_inputs_sampled = [layers_old_inputs_list[i] for i in sampled_indices]
         layers_old_logits_sampled = [layers_old_logits_list[i] for i in sampled_indices]
+        layers_old_token_positions_sampled = [layers_old_token_positions_list[i] for i in sampled_indices]
 
         # inputs_size_mb_after = sum(t.numel() * t.element_size() for t in layers_old_inputs_sampled) / 1024 / 1024
         # logits_size_mb_after = sum(t.numel() * t.element_size() for t in layers_old_logits_sampled) / 1024 / 1024
@@ -717,13 +737,14 @@ def merge_router_predictive_data(
     for i in range(len(layers_old_inputs_sampled)):
         mini_layer_old_inputs_list.append(layers_old_inputs_sampled[i])
         mini_layer_old_logits_list.append(layers_old_logits_sampled[i])
+        mini_layer_old_token_positions_list.append(layers_old_token_positions_sampled[i])
     mini_layer_sampled_masks_list.append(downsample_mask)
 
     # Explicitly delete GPU tensors to free memory immediately
     # This ensures GPU memory is released before the next micro-batch
     # Note: layers_old_inputs_sampled and layers_old_logits_sampled are now already appended to mini_layer lists
     del layers_merged_tensor, layers_old_inputs, layers_old_logits
-    del layers_old_inputs_list, layers_old_logits_list  # Delete the split-by-sample lists
+    del layers_old_inputs_list, layers_old_logits_list, layers_old_token_positions_list
     # downsample_mask is already appended, no need to delete here
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -819,6 +840,7 @@ def set_router_predictive_data(
                 )
                 continue
 
+            sample_seq_len = int(seq_lens[i])
             old_token_positions = None
             if old_token_positions_list is not None:
                 if i >= len(old_token_positions_list):
@@ -840,6 +862,29 @@ def set_router_predictive_data(
                         },
                     )
                     continue
+            elif old_input.shape[0] != sample_seq_len:
+                logger.warning(
+                    "[Predictive Routing Replay] old_inputs/old_logits for sample %s are downsampled "
+                    "(%s tokens) but old_token_positions is missing. Dropping predictive data for this sample.",
+                    i,
+                    old_input.shape[0],
+                )
+                _save_r3_trace_pt(
+                    f"trace-step{global_step}-mini{mini_step}-sample{i}-downsampled-missing-positions.pt",
+                    {
+                        "reason": "downsampled_missing_old_token_positions",
+                        "global_step": global_step,
+                        "mini_step": mini_step,
+                        "sample_idx": i,
+                        "request_id": None if router_request_ids is None or i >= len(router_request_ids) else router_request_ids[i],
+                        "sample_seq_len": sample_seq_len,
+                        "old_input": torch.from_numpy(old_input.copy()),
+                        "old_logit": torch.from_numpy(old_logit.copy()),
+                    },
+                )
+                continue
+
+            if old_token_positions_list is not None:
                 old_token_positions = _to_numpy_array(old_token_positions_list[i], dtype=np.int32)
                 if old_token_positions is None:
                     logger.warning(
@@ -903,7 +948,6 @@ def set_router_predictive_data(
                         },
                     )
                     continue
-                sample_seq_len = int(seq_lens[i])
                 if np.any(old_token_positions < 0) or np.any(old_token_positions >= sample_seq_len):
                     logger.warning(
                         "[Predictive Routing Replay] old_token_positions out of range for sample %s: "
@@ -1077,6 +1121,8 @@ def set_router_predictive_bias_data(
     attention_mask,
     tf_config,
     vp_rank=None,
+    old_token_positions_list=None,
+    global_token_ids=None,
 ):
     """
     Set per-layer recorded_old_bias for R3_COLLECT_STATS.
@@ -1087,27 +1133,88 @@ def set_router_predictive_bias_data(
         attention_mask (torch.Tensor): Attention mask [batch_size, seq_len].
         tf_config: Transformer config.
         vp_rank: Virtual pipeline rank.
+        old_token_positions_list: optional 1D local valid-token positions for each sample.
+        global_token_ids: optional [batch_size, seq_len] ids used by logits saving.
     """
     if isinstance(old_bias_list, np.ndarray):
         old_bias_list = list(old_bias_list)
+    if isinstance(old_token_positions_list, np.ndarray):
+        old_token_positions_list = list(old_token_positions_list)
 
     # Filter out None values
-    valid_indices = []
     valid_old_bias = []
+    valid_bias_token_ids = []
+    seq_lens = attention_mask.sum(dim=1, dtype=torch.int32).tolist()
     for i, old_bias in enumerate(old_bias_list):
-        if old_bias is not None:
-            valid_indices.append(i)
-            if isinstance(old_bias, list):
-                old_bias = np.array(old_bias, dtype=np.float32)
-            valid_old_bias.append(torch.from_numpy(old_bias.copy()))
+        if old_bias is None:
+            continue
+        old_bias = _to_numpy_array(old_bias, dtype=np.float32)
+        if old_bias is None:
+            continue
+        if old_bias.ndim != 3:
+            logger.warning(
+                "[R3+Predictive] old_bias must be 3D for sample %s, got shape=%s. Skipping bias stats.",
+                i,
+                old_bias.shape,
+            )
+            continue
 
-    del old_bias_list
+        sample_seq_len = int(seq_lens[i])
+        token_positions = None
+        if old_token_positions_list is not None and i < len(old_token_positions_list):
+            token_positions = _to_numpy_array(old_token_positions_list[i], dtype=np.int32)
+
+        if token_positions is None:
+            if old_bias.shape[0] != sample_seq_len:
+                logger.warning(
+                    "[R3+Predictive] old_bias for sample %s is downsampled (%s tokens) but old_token_positions "
+                    "is missing. Skipping bias stats to avoid position-corrupted saved artifacts.",
+                    i,
+                    old_bias.shape[0],
+                )
+                continue
+            token_positions_t = torch.arange(sample_seq_len, dtype=torch.long, device=attention_mask.device)
+        else:
+            token_positions_t = torch.as_tensor(token_positions, dtype=torch.long, device=attention_mask.device)
+            if token_positions_t.ndim != 1 or token_positions_t.numel() != old_bias.shape[0]:
+                logger.warning(
+                    "[R3+Predictive] old_bias/old_token_positions mismatch for sample %s: "
+                    "old_bias_tokens=%s positions_shape=%s. Skipping bias stats.",
+                    i,
+                    old_bias.shape[0],
+                    tuple(token_positions_t.shape),
+                )
+                continue
+            if (
+                torch.any(token_positions_t < 0)
+                or torch.any(token_positions_t >= sample_seq_len)
+                or torch.unique(token_positions_t).numel() != token_positions_t.numel()
+            ):
+                logger.warning(
+                    "[R3+Predictive] invalid old_token_positions for old_bias sample %s. Skipping bias stats.",
+                    i,
+                )
+                continue
+
+        valid_abs_positions = attention_mask[i].nonzero(as_tuple=False).squeeze(-1)
+        abs_positions = valid_abs_positions[token_positions_t]
+        if global_token_ids is not None:
+            sample_token_ids = global_token_ids[i, abs_positions.to(global_token_ids.device)].detach().cpu().to(torch.long)
+        else:
+            sample_start = int(sum(seq_lens[:i]))
+            sample_token_ids = (token_positions_t.detach().cpu().to(torch.long) + sample_start)
+
+        valid_old_bias.append(torch.from_numpy(old_bias.copy()))
+        valid_bias_token_ids.append(sample_token_ids.contiguous())
+
+    del old_bias_list, old_token_positions_list
 
     if len(valid_old_bias) == 0:
         # No valid bias data; clear bias on all routers
         router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
         for router in router_instances_list:
             router.clear_predictive_bias()
+        RouterReplay.clear_predictive_bias_token_ids()
         return
 
     # Determine compute dtype
@@ -1124,9 +1231,11 @@ def set_router_predictive_bias_data(
     # shape mismatches in the loss computation.  Keeping the full tensor on all ranks and
     # indexing per layer on CPU is always correct.
     bias_concat = torch.cat([t.to(compute_dtype) for t in valid_old_bias], dim=0)
+    bias_token_ids = torch.cat(valid_bias_token_ids, dim=0).to(torch.long)
     del valid_old_bias
 
     bias_concat = bias_concat.cpu()
+    RouterReplay.set_predictive_bias_token_ids(bias_token_ids)
 
     local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
     offset = local_rank_info["start"]
@@ -1137,6 +1246,100 @@ def set_router_predictive_bias_data(
     del bias_concat
     import gc
     gc.collect()
+
+
+def _flatten_index_sequence(indices) -> list[int]:
+    if isinstance(indices, torch.Tensor):
+        return [int(x) for x in indices.detach().cpu().view(-1).tolist()]
+    if isinstance(indices, np.ndarray):
+        return [int(x) for x in indices.reshape(-1).tolist()]
+
+    flattened = []
+    for item in indices:
+        if isinstance(item, (list, tuple, torch.Tensor, np.ndarray)):
+            flattened.extend(_flatten_index_sequence(item))
+        else:
+            flattened.append(int(item))
+    return flattened
+
+
+def restore_predictive_states_to_batch_order(
+    old_inputs_list,
+    old_logits_list,
+    old_token_positions_list,
+    sampled_masks,
+    indices=None,
+) -> tuple[list, list, list]:
+    """Restore sampled predictive states to original mini-batch order.
+
+    ``merge_router_predictive_data`` records sampled states in forward
+    micro-batch order. With dynamic batching that order is a permutation of the
+    mini-batch. The returned lists are always indexed by original mini-batch
+    sample id and contain ``None`` for samples whose state was not recorded.
+    """
+
+    if isinstance(sampled_masks, torch.Tensor):
+        mask_list = [bool(x) for x in sampled_masks.detach().cpu().view(-1).tolist()]
+    elif isinstance(sampled_masks, np.ndarray):
+        mask_list = [bool(x) for x in sampled_masks.reshape(-1).tolist()]
+    else:
+        mask_list = [bool(x) for x in sampled_masks]
+
+    batch_size = len(mask_list)
+    if indices is None:
+        output_to_batch_idx = list(range(batch_size))
+    else:
+        output_to_batch_idx = _flatten_index_sequence(indices)
+        if len(output_to_batch_idx) != batch_size:
+            raise ValueError(
+                "Dynamic predictive-state restore got mismatched indices and sampled masks: "
+                f"indices={len(output_to_batch_idx)} sampled_masks={batch_size}."
+            )
+
+    full_inputs_list = [None] * batch_size
+    full_logits_list = [None] * batch_size
+    full_token_positions_list = [None] * batch_size
+
+    sampled_idx = 0
+    for output_pos, is_sampled in enumerate(mask_list):
+        if not is_sampled:
+            continue
+        if sampled_idx >= len(old_inputs_list) or sampled_idx >= len(old_logits_list):
+            raise ValueError(
+                "Predictive-state restore has fewer sampled states than sampled masks: "
+                f"sampled_idx={sampled_idx}, old_inputs={len(old_inputs_list)}, "
+                f"old_logits={len(old_logits_list)}."
+            )
+        batch_idx = output_to_batch_idx[output_pos]
+        if batch_idx < 0 or batch_idx >= batch_size:
+            raise ValueError(
+                "Dynamic predictive-state restore got out-of-range batch index: "
+                f"batch_idx={batch_idx}, batch_size={batch_size}."
+            )
+
+        full_inputs_list[batch_idx] = old_inputs_list[sampled_idx]
+        full_logits_list[batch_idx] = old_logits_list[sampled_idx]
+        if old_token_positions_list is not None:
+            if sampled_idx >= len(old_token_positions_list):
+                raise ValueError(
+                    "Predictive-state restore has fewer token-position entries than sampled masks: "
+                    f"sampled_idx={sampled_idx}, old_token_positions={len(old_token_positions_list)}."
+                )
+            full_token_positions_list[batch_idx] = old_token_positions_list[sampled_idx]
+        sampled_idx += 1
+
+    if sampled_idx != len(old_inputs_list) or sampled_idx != len(old_logits_list):
+        raise ValueError(
+            "Predictive-state restore has extra sampled states after consuming sampled masks: "
+            f"consumed={sampled_idx}, old_inputs={len(old_inputs_list)}, old_logits={len(old_logits_list)}."
+        )
+    if old_token_positions_list is not None and sampled_idx != len(old_token_positions_list):
+        raise ValueError(
+            "Predictive-state restore has extra token-position entries after consuming sampled masks: "
+            f"consumed={sampled_idx}, old_token_positions={len(old_token_positions_list)}."
+        )
+
+    return full_inputs_list, full_logits_list, full_token_positions_list
 
 
 def reorder_list_for_vpp(

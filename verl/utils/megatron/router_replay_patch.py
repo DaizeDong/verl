@@ -114,11 +114,20 @@ class RouterReplay:
     router_instances = []
 
     # Global logits cache for recording
-    # Structure: {"compute_log_prob": [], "training": [], "router_weights": {}, "global_token_ids": [], "predictive_bias": []}
+    # Structure: {"compute_log_prob": [], "training": [], "router_weights": {},
+    #             "global_token_ids": [], "predictive_bias": [], "predictive_bias_token_ids": []}
     # Each list contains tuples of (layer_idx, tensor_cpu), router_weights stores parameter tensors
     # global_token_ids: list of token_ids_tensor
     # predictive_bias: list of (layer_idx, delta_logits_cpu) - bias after scaling
-    logits_cache = {"compute_log_prob": [], "training": [], "router_weights": {}, "global_token_ids": [], "predictive_bias": []}
+    # predictive_bias_token_ids: token ids aligned row-by-row with R3_COLLECT_STATS predictive_bias
+    logits_cache = {
+        "compute_log_prob": [],
+        "training": [],
+        "router_weights": {},
+        "global_token_ids": [],
+        "predictive_bias": [],
+        "predictive_bias_token_ids": [],
+    }
 
     # Flag to enable/disable logits recording
     enable_logits_recording = False
@@ -137,6 +146,8 @@ class RouterReplay:
     current_sample_indices = None  # per-micro-batch indices to subsample logits in record_logits
     current_full_token_count = None  # full-sequence valid token count for current micro-batch (used to
                                      # detect SP-sharded logits in record_logits/record_predictive_bias)
+    current_predictive_bias_token_ids = None
+    current_predictive_bias_token_ids_recorded = False
 
     # Predictive loss tracking for wandb logging
     replay_topk_accuracy_tracker = []  # List of (layer_idx, accuracy_value)
@@ -229,12 +240,36 @@ class RouterReplay:
         Returns a dict with 'compute_log_prob', 'training', 'router_weights' and 'global_token_ids' keys.
         """
         cache = RouterReplay.logits_cache
-        RouterReplay.logits_cache = {"compute_log_prob": [], "training": [], "router_weights": {}, "global_token_ids": [], "predictive_bias": []}
+        RouterReplay.logits_cache = {
+            "compute_log_prob": [],
+            "training": [],
+            "router_weights": {},
+            "global_token_ids": [],
+            "predictive_bias": [],
+            "predictive_bias_token_ids": [],
+        }
         # Note: do NOT clear sampled_log_prob_token_ids here — it needs to persist from
         # compute_log_prob save through all training mini-step saves so training phases
         # can filter to the same token set. Cleared at start of next compute_log_prob (set_cache_action).
         RouterReplay.current_sample_indices = None
+        RouterReplay.current_predictive_bias_token_ids = None
+        RouterReplay.current_predictive_bias_token_ids_recorded = False
         return cache
+
+    @staticmethod
+    @no_grad()
+    def set_predictive_bias_token_ids(token_ids: torch.Tensor | None):
+        """Set token ids that align with R3_COLLECT_STATS predictive_bias rows."""
+        if token_ids is None:
+            RouterReplay.current_predictive_bias_token_ids = None
+        else:
+            RouterReplay.current_predictive_bias_token_ids = token_ids.detach().cpu().to(torch.long).contiguous()
+        RouterReplay.current_predictive_bias_token_ids_recorded = False
+
+    @staticmethod
+    def clear_predictive_bias_token_ids():
+        RouterReplay.current_predictive_bias_token_ids = None
+        RouterReplay.current_predictive_bias_token_ids_recorded = False
 
     @staticmethod
     @no_grad()
@@ -376,22 +411,53 @@ class RouterReplay:
         if delta_logits.ndim == 2:
             delta_logits = delta_logits.unsqueeze(1)
 
-        # Apply save-time sampling along token dim (dim 0) if indices were set.
-        indices = RouterReplay.current_sample_indices
-        if indices is not None:
-            if indices.device != delta_logits.device:
-                indices = indices.to(delta_logits.device)
-            # Same SP-gather fix as record_logits: indices are full-sequence but delta_logits
-            # may be SP-sharded.
-            full_count = RouterReplay.current_full_token_count
-            tp_size = mpu.get_tensor_model_parallel_world_size()
-            if tp_size > 1 and full_count is not None and delta_logits.shape[0] < full_count:
-                delta_logits = gather_from_sequence_parallel_region(
-                    delta_logits, tensor_parallel_output_grad=False
+        token_ids = RouterReplay.current_predictive_bias_token_ids
+        if token_ids is not None:
+            if int(token_ids.numel()) != int(delta_logits.shape[0]):
+                logger.warning(
+                    "[record_predictive_bias] predictive_bias token id count mismatch: ids=%s bias_tokens=%s. "
+                    "Skipping predictive_bias save to avoid position-corrupted artifacts.",
+                    int(token_ids.numel()),
+                    int(delta_logits.shape[0]),
                 )
-                if delta_logits.shape[0] > full_count:
-                    delta_logits = delta_logits[:full_count]
-            delta_logits = delta_logits[indices]
+                return
+
+            # R3_COLLECT_STATS receives old_bias compacted to rollout-captured token
+            # positions.  Full-token sample indices would index the wrong rows here.
+            # Keep only captured tokens that also have saved current logits, and save
+            # their ids separately so readers can join by token id.
+            sampled_set = RouterReplay.sampled_log_prob_token_ids
+            if (
+                sampled_set is not None
+                and len(sampled_set) > 0
+                and RouterReplay.logits_save_sample_rate is not None
+                and RouterReplay.logits_save_sample_rate < 1.0
+            ):
+                mask_cpu = torch.tensor([int(tid) in sampled_set for tid in token_ids.tolist()], dtype=torch.bool)
+                mask = mask_cpu.to(delta_logits.device)
+                delta_logits = delta_logits[mask]
+                token_ids = token_ids[mask_cpu]
+
+            if not RouterReplay.current_predictive_bias_token_ids_recorded:
+                RouterReplay.logits_cache["predictive_bias_token_ids"].append(token_ids.detach().cpu().contiguous())
+                RouterReplay.current_predictive_bias_token_ids_recorded = True
+        else:
+            # Apply save-time sampling along token dim (dim 0) if indices were set.
+            indices = RouterReplay.current_sample_indices
+            if indices is not None:
+                if indices.device != delta_logits.device:
+                    indices = indices.to(delta_logits.device)
+                # Same SP-gather fix as record_logits: indices are full-sequence but delta_logits
+                # may be SP-sharded.
+                full_count = RouterReplay.current_full_token_count
+                tp_size = mpu.get_tensor_model_parallel_world_size()
+                if tp_size > 1 and full_count is not None and delta_logits.shape[0] < full_count:
+                    delta_logits = gather_from_sequence_parallel_region(
+                        delta_logits, tensor_parallel_output_grad=False
+                    )
+                    if delta_logits.shape[0] > full_count:
+                        delta_logits = delta_logits[:full_count]
+                delta_logits = delta_logits[indices]
 
         # Move to CPU to avoid GPU memory pressure
         delta_logits_cpu = delta_logits.detach().cpu().contiguous()
@@ -412,6 +478,7 @@ class RouterReplay:
                 "training": len(RouterReplay.logits_cache.get("training", [])),
                 "router_weights": len(RouterReplay.logits_cache.get("router_weights", [])),
                 "predictive_bias": len(RouterReplay.logits_cache.get("predictive_bias", [])),
+                "predictive_bias_token_ids": len(RouterReplay.logits_cache.get("predictive_bias_token_ids", [])),
             }
         }
 
@@ -476,6 +543,7 @@ class RouterReplay:
         """Clear old_bias for all router instances."""
         for router in RouterReplay.router_instances:
             router.clear_predictive_bias()
+        RouterReplay.clear_predictive_bias_token_ids()
 
     def set_predictive_action(self, action: RouterPredictiveAction):
         """Set the predictive action for this layer."""
@@ -893,12 +961,13 @@ def patched_forward(self, input: torch.Tensor):
                     logger.info("[Predictive Routing Replay] No predictive action set. Using vanilla routing.")
                 probs, routing_map = self.routing(logits)
 
-            elif predictive_routing_action == RouterPredictiveAction.RECORD: # PR2 inference phase
+            elif predictive_routing_action == RouterPredictiveAction.RECORD: # PR2 log_prob/record phase
                 with torch.no_grad():
-                    # Log_prob phase: record inputs and logits, apply bias correction
+                    # Log_prob phase: record inputs/logits and predictor stats only.
+                    # Do not apply the predictor to routing here: old_log_probs must match
+                    # the rollout policy's uncorrected router decisions.
                     self.router_replay.record_predictive_data(input, logits)
 
-                    # Apply bias correction (linear output)
                     delta_logits = self.bias_predictor(input)
 
                     # Track bias ratio: |delta_logits|_mean / |logits|_mean
@@ -910,9 +979,7 @@ def patched_forward(self, input: torch.Tensor):
                     if RouterReplay.enable_logits_recording:
                         RouterReplay.record_predictive_bias(delta_logits, layer_idx)
 
-                # Apply bias correction and route
-                corrected_logits = logits + delta_logits
-                probs, routing_map = self.routing(corrected_logits)  # TODO: this is inconsistent with other phases, as they use uncorrected logits
+                probs, routing_map = self.routing(logits)
 
             elif predictive_routing_action == RouterPredictiveAction.SKIP_PREDICTIVE:
                 # PR2/PR3 Training phase ministep=0

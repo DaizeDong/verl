@@ -96,6 +96,21 @@ class RolloutSkip:
         self.is_enable = _get_skip_attr(self.skip_config, "enable", False)
         self._rollout_wg = rollout_wg
 
+        actor_config = getattr(config.actor_rollout_ref, "actor", None)
+        router_replay_config = None if actor_config is None else getattr(actor_config, "router_replay", None)
+        router_replay_mode = _get_skip_attr(router_replay_config, "mode", "disabled")
+        if router_replay_mode == "R3" and self.is_enable:
+            self.is_enable = False
+            if isinstance(self.skip_config, dict):
+                self.skip_config["enable"] = False
+            elif hasattr(self.skip_config, "enable"):
+                self.skip_config.enable = False
+            print(
+                f"{self.print_mark}\033[33mDisabled rollout.skip because router_replay.mode=R3. "
+                "R3 predictive replay requires fresh rollout router states.\033[0m",
+                flush=True,
+            )
+
         if not self.is_enable:
             return
 
@@ -258,8 +273,8 @@ class RolloutSkip:
             self.record_gen_steps = gen_steps + self.__gen_offset_step
 
     def wrap_generate_sequences(self) -> None:
-        # if self.is_enable:
-        #     self._rollout_wg = rollout_wg
+        if not self.is_active:
+            return
 
         try:
             self._rollout_wg.generate_sequences = wrap_generate_sequences(self, self._rollout_wg)

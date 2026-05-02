@@ -123,6 +123,16 @@ def get_megatron_optimizer_param_scheduler(
 
 def get_megatron_last_lr(optimizer):
     """
-    Get the last learning rate from the optimizer parameter scheduler.
+    Get the base learning rate from the optimizer parameter scheduler.
+
+    Some runs add special parameter groups, for example a router bias predictor
+    with a much larger LR that may also be temporarily set to zero on skipped
+    predictive mini-steps. Report the smallest positive group LR so actor/lr
+    tracks the policy optimizer instead of a disabled or auxiliary group.
     """
+    positive_lrs = [
+        float(group.get("lr", 0.0)) for group in optimizer.param_groups if float(group.get("lr", 0.0)) > 0.0
+    ]
+    if positive_lrs:
+        return min(positive_lrs)
     return optimizer.param_groups[0]["lr"]

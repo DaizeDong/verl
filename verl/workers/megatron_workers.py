@@ -1249,6 +1249,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     # Store to non_tensor_batch (as numpy arrays for Ray serialization efficiency)
                     output.non_tensor_batch["old_inputs"] = layers_predictive_states[0]  # list of numpy array [num_tokens_i, layers, hidden] (variable shape), length = bs
                     output.non_tensor_batch["old_logits"] = layers_predictive_states[1]  # list of numpy array [num_tokens_i, layers, num_experts] (variable shape), length = bs
+                    if len(layers_predictive_states) > 2:
+                        output.non_tensor_batch["old_token_positions"] = layers_predictive_states[2]
                 else:
                     logger.warning(f"[Rank {self.rank}] Bias predictor enabled but layers_predictive_states is None!")
 
@@ -1261,6 +1263,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 if self.config.actor.router_replay.enable_bias_predictor and layers_predictive_states is not None:
                     output.non_tensor_batch["old_inputs"] = layers_predictive_states[0]
                     output.non_tensor_batch["old_logits"] = layers_predictive_states[1]
+                    if len(layers_predictive_states) > 2:
+                        output.non_tensor_batch["old_token_positions"] = layers_predictive_states[2]
                     logger.info(f"[Rank {self.rank}] R3 first step: recorded routed_experts + router states")
                 else:
                     logger.info(f"[Rank {self.rank}] R3 first step: recorded routed_experts for next step's replay")
@@ -1538,13 +1542,35 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
 
         if self.config.load_weight:
             t0 = time.time()
-            if self.config.megatron.use_dist_checkpointing:
-                load_mcore_dist_weights(
-                    critic_module,
-                    self.config.megatron.dist_checkpointing_path,
-                    is_value_model=True,
-                    prefix=self.config.megatron.dist_checkpointing_prefix,
-                )
+            load_initial_dist_checkpointing = self.config.megatron.use_dist_checkpointing
+            if self.config.megatron.load_initial_dist_checkpointing is not None:
+                load_initial_dist_checkpointing = self.config.megatron.load_initial_dist_checkpointing
+            if load_initial_dist_checkpointing:
+                try:
+                    load_mcore_dist_weights(
+                        critic_module,
+                        self.config.megatron.dist_checkpointing_path,
+                        is_value_model=True,
+                        prefix=self.config.megatron.dist_checkpointing_prefix,
+                    )
+                except Exception as e:
+                    if self.bridge is None:
+                        raise
+                    local_model_path = get_hf_model_path(self.config)
+                    logger.warning(
+                        "Failed to load initial Megatron dist checkpoint from %s, "
+                        "falling back to HF weights at %s. Error: %s: %s",
+                        self.config.megatron.dist_checkpointing_path,
+                        local_model_path,
+                        type(e).__name__,
+                        e,
+                    )
+                    if self.vanilla_bridge:
+                        self.bridge.load_weights(critic_module, local_model_path)
+                    else:
+                        self.bridge.load_hf_weights(
+                            critic_module, local_model_path, allowed_mismatched_params=["output_layer.weight"]
+                        )
             else:
                 if self.bridge is not None:
                     local_model_path = get_hf_model_path(self.config)

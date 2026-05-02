@@ -90,6 +90,73 @@ def _collect_bias_predictor_stats_from_state_dict(state_dict) -> str:
     return "\n".join(stats)
 
 
+def _validate_hf_weight_files(hf_model_path: str) -> None:
+    """Fail if an HF checkpoint has an index but missing weight shards."""
+    if not os.path.isdir(hf_model_path):
+        raise RuntimeError(f"HF checkpoint directory does not exist: {hf_model_path}")
+
+    def validate_safetensors_file(path: str) -> None:
+        try:
+            from safetensors import safe_open
+        except Exception:
+            return
+        try:
+            with safe_open(path, framework="pt", device="cpu") as handle:
+                keys = list(handle.keys())
+        except Exception as exc:
+            raise RuntimeError(f"Invalid safetensors file in HF checkpoint: {path}: {exc}") from exc
+        if not keys:
+            raise RuntimeError(f"Empty safetensors file in HF checkpoint: {path}")
+
+    index_paths = [
+        os.path.join(hf_model_path, "model.safetensors.index.json"),
+        os.path.join(hf_model_path, "pytorch_model.bin.index.json"),
+    ]
+    existing_index_paths = [path for path in index_paths if os.path.exists(path)]
+    if existing_index_paths:
+        for index_path in existing_index_paths:
+            with open(index_path, encoding="utf-8") as f:
+                index_data = json.load(f)
+            weight_map = index_data.get("weight_map", {})
+            if not isinstance(weight_map, dict) or not weight_map:
+                raise RuntimeError(f"HF checkpoint index has no weight_map: {index_path}")
+            expected_files = sorted(set(weight_map.values()))
+            missing_files = [
+                name
+                for name in expected_files
+                if not os.path.isfile(os.path.join(hf_model_path, name))
+                or os.path.getsize(os.path.join(hf_model_path, name)) == 0
+            ]
+            if missing_files:
+                preview = ", ".join(missing_files[:8])
+                if len(missing_files) > 8:
+                    preview += f", ... (+{len(missing_files) - 8} more)"
+                raise RuntimeError(
+                    f"Incomplete HF checkpoint at {hf_model_path}: {index_path} references "
+                    f"{len(missing_files)} missing/empty weight shard(s): {preview}"
+                )
+            for name in expected_files:
+                if name.endswith(".safetensors"):
+                    validate_safetensors_file(os.path.join(hf_model_path, name))
+        return
+
+    weight_files = [
+        name
+        for name in os.listdir(hf_model_path)
+        if name.endswith(".safetensors") or (name.startswith("pytorch_model") and name.endswith(".bin"))
+    ]
+    weight_files = [name for name in weight_files if os.path.isfile(os.path.join(hf_model_path, name))]
+    if not weight_files:
+        raise RuntimeError(f"HF checkpoint at {hf_model_path} has no model weight files")
+    empty_files = [name for name in weight_files if os.path.getsize(os.path.join(hf_model_path, name)) == 0]
+    if empty_files:
+        preview = ", ".join(empty_files[:8])
+        raise RuntimeError(f"HF checkpoint at {hf_model_path} has empty model weight files: {preview}")
+    for name in weight_files:
+        if name.endswith(".safetensors"):
+            validate_safetensors_file(os.path.join(hf_model_path, name))
+
+
 # Setup logging
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -761,6 +828,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     else:
                         self.bridge.save_hf_weights(self.model, hf_ckpt_path)
 
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+                if self.rank == 0:
+                    _validate_hf_weight_files(hf_ckpt_path)
                 log_with_rank(f"Saved bridge checkpoint to {hf_ckpt_path}", rank=self.rank, logger=logger)
 
             # Only rank 0 saves the hf config and tokenizer to huggingface path
@@ -858,6 +929,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                         log_only_rank_0=True,
                     )
                     self.bridge.save_hf_weights(self.model, hf_model_ckpt_path)
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+                if self.rank == 0:
+                    _validate_hf_weight_files(hf_model_ckpt_path)
                 log_with_rank(
                     f"[hf_model save] bridge save returned for {hf_model_ckpt_path}",
                     rank=self.rank,
@@ -900,6 +975,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
                             model = AutoModelForCausalLM.from_pretrained(self.config.model.path, torch_dtype="auto")
                     model.save_pretrained(hf_model_ckpt_path, state_dict=state_dict)
+                    _validate_hf_weight_files(hf_model_ckpt_path)
                     log_with_rank(
                         f"Saved Huggingface config and tokenizer to {hf_model_ckpt_path}",
                         rank=self.rank,
