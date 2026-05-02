@@ -399,9 +399,9 @@ def apply_patch_mbridge():
     try:
         from mbridge.models.qwen2moe import Qwen2MoEBridge
     except ImportError:
-        return
+        Qwen2MoEBridge = None
 
-    if not getattr(Qwen2MoEBridge, "_bias_predictor_patched", False):
+    if Qwen2MoEBridge is not None and not getattr(Qwen2MoEBridge, "_bias_predictor_patched", False):
         _orig_qwen2moe_mlp_mapping = Qwen2MoEBridge._weight_name_mapping_mlp
 
         def _patched_qwen2moe_mlp_mapping(self, name):
@@ -412,6 +412,36 @@ def apply_patch_mbridge():
 
         Qwen2MoEBridge._weight_name_mapping_mlp = _patched_qwen2moe_mlp_mapping
         Qwen2MoEBridge._bias_predictor_patched = True
+
+    # Patch Qwen3MoE bridge similarly. Without this, mbridge has no name mapping for
+    # router.bias_predictor.weight and silently drops it from export_weights -> SGLang's
+    # bias_predictor stays at zero -> predictive_bias_to_logits_ratio collapses to 0.
+    Qwen3MoEBridge = None
+    for _modpath, _clsname in (
+        ("mbridge.models.qwen3_moe", "Qwen3MoEBridge"),
+        ("mbridge.models.qwen3_moe", "Qwen3MoeBridge"),
+        ("mbridge.models.qwen3moe", "Qwen3MoEBridge"),
+        ("mbridge.models.qwen3moe", "Qwen3MoeBridge"),
+    ):
+        try:
+            _mod = __import__(_modpath, fromlist=[_clsname])
+            Qwen3MoEBridge = getattr(_mod, _clsname, None)
+            if Qwen3MoEBridge is not None:
+                break
+        except ImportError:
+            continue
+
+    if Qwen3MoEBridge is not None and not getattr(Qwen3MoEBridge, "_bias_predictor_patched", False):
+        _orig_qwen3moe_mlp_mapping = Qwen3MoEBridge._weight_name_mapping_mlp
+
+        def _patched_qwen3moe_mlp_mapping(self, name):
+            if "mlp.router.bias_predictor.weight" in name:
+                layer_number = name.split(".")[2]
+                return [f"model.layers.{layer_number}.mlp.bias_predictor.weight"]
+            return _orig_qwen3moe_mlp_mapping(self, name)
+
+        Qwen3MoEBridge._weight_name_mapping_mlp = _patched_qwen3moe_mlp_mapping
+        Qwen3MoEBridge._bias_predictor_patched = True
 
 
 def apply_patch_megatron_v012_with_torch_v28():

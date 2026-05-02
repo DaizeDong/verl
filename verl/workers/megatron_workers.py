@@ -993,8 +993,15 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             )
         # Strip training-only params that confuse SGLang's weight loader.
         # Known offenders when mbridge bridge.py patch is applied for HF save:
-        #   - bias_predictor.weight: training-only prediction head, no SGLang submodule
         #   - expert_bias: mbridge may export with name that collides with a linear layer
+        #   - *_extra_state: TransformerEngine internal state, not a model param
+        # NOTE: bias_predictor.weight WAS skipped here historically because earlier
+        # SGLang did not have the submodule. Current SGLang qwen3_moe defines a
+        # bias_predictor nn.Linear (initialized to zeros) and its load_weights() will
+        # accept and dispatch the weight via default_weight_loader. Skipping it left
+        # SGLang's predictor permanently at zero, which makes the rollout-side
+        # delta_logits zero and `predictive_bias_to_logits_ratio` collapse to 0 after
+        # any cluster restart that re-inits SGLang.
         # Set VERL_DEBUG_ROLLOUT_SYNC_NAMES=1 to log every name/shape going to the rollout backend
         # so we can identify additional culprits if SGLang weight_loader AssertionError recurs.
         import os as _os
@@ -1003,7 +1010,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         def _filter_rollout_skip(gen):
             _skipped, _kept = 0, 0
             for name, tensor in gen:
-                if "bias_predictor" in name or "expert_bias" in name or "_extra_state" in name:
+                if "expert_bias" in name or "_extra_state" in name:
                     if _dbg_sync_names:
                         logger.info("[rollout-sync][SKIP] %s %s", name, getattr(tensor, "shape", None))
                     _skipped += 1
