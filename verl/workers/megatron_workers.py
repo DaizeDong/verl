@@ -728,13 +728,42 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     )
             
             actor_optimizer = get_megatron_optimizer(
-                model=actor_module, 
+                model=actor_module,
                 config=optim_config_megatron,
                 config_overrides=config_overrides
             )
+            # Construction-time diagnostic for klpost1e2 max_lr corruption hunt:
+            # log per-(HDO, group) max_lr/min_lr/wd_mult/lr_mult/is_expert_parallel/is_decoupled_lr
+            # right after get_megatron_optimizer returns, BEFORE scheduler exists.
+            # This isolates whether _get_param_groups itself is producing wrong
+            # max_lr (vs corruption later by scheduler.step or load_state_dict).
+            if os.getenv("VERL_DEBUG_OPTIM_RESUME", "").lower() in {"1", "true", "yes", "on"} and self.rank == 0:
+                try:
+                    from verl.utils.checkpoint.megatron_checkpoint_manager import _iter_optimizer_chained_subs as _iter
+                    construct_dump = []
+                    for hdo in _iter(actor_optimizer):
+                        construct_dump.append([
+                            {k: g.get(k) for k in ("max_lr", "min_lr", "wd_mult", "lr_mult", "is_expert_parallel", "is_decoupled_lr", "default_config")}
+                            for g in (getattr(hdo, "param_groups", []) or [])
+                        ])
+                    logger.warning(f"[OptimResumeDebug] rank=0 POST-OPTIMIZER-CTOR per (HDO, group): {construct_dump}")
+                except Exception as _e:
+                    logger.warning(f"[OptimResumeDebug] construction dump failed: {_e}")
             actor_optimizer_scheduler = get_megatron_optimizer_param_scheduler(
                 optimizer=actor_optimizer, config=optim_config
             )
+            if os.getenv("VERL_DEBUG_OPTIM_RESUME", "").lower() in {"1", "true", "yes", "on"} and self.rank == 0:
+                try:
+                    from verl.utils.checkpoint.megatron_checkpoint_manager import _iter_optimizer_chained_subs as _iter
+                    post_sched_dump = []
+                    for hdo in _iter(actor_optimizer):
+                        post_sched_dump.append([
+                            (g.get("max_lr"), g.get("min_lr"), g.get("lr"))
+                            for g in (getattr(hdo, "param_groups", []) or [])
+                        ])
+                    logger.warning(f"[OptimResumeDebug] rank=0 POST-SCHEDULER-CTOR (max_lr, min_lr, lr) per (HDO, group): {post_sched_dump}")
+                except Exception as _e:
+                    logger.warning(f"[OptimResumeDebug] post-sched dump failed: {_e}")
         else:
             optim_config = None
             actor_optimizer = None
