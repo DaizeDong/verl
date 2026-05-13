@@ -16,6 +16,9 @@
 
 
 def reward_func(data_source, solution_str, ground_truth, extra_info=None):
+    if not isinstance(solution_str, str) or not solution_str:
+        return 0.0
+
     source = str(data_source)
 
     if source in {"math_dapo", "math", "math_dapo_reasoning"} or source.startswith("aime"):
@@ -32,6 +35,24 @@ def reward_func(data_source, solution_str, ground_truth, extra_info=None):
         from verl.utils.reward_score import math_reward
 
         return math_reward.compute_score(solution_str, ground_truth)
+
+    if source == "math500_moonlight":
+        # GSM8K-trained models output "#### <answer>". Extract everything after the
+        # last "####" and compare with ground_truth using LaTeX equivalence.
+        from verl.utils.reward_score import math_reward
+
+        idx = solution_str.rfind("####")
+        if idx < 0:
+            return 0.0
+        candidate = solution_str[idx + 4:].strip()
+        # Trim surrounding $ signs and trailing punctuation that often follows.
+        candidate = candidate.strip("$").strip().rstrip(".")
+        if not candidate:
+            return 0.0
+        try:
+            return 1.0 if math_reward.is_equiv(candidate, ground_truth) else 0.0
+        except Exception:
+            return 0.0
 
     if source == "Idavidrein/gpqa":
         from recipe.r1.tasks import gpqa
