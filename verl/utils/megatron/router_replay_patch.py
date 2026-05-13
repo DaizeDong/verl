@@ -94,6 +94,12 @@ def _predictive_sync_tokens() -> int:
     return max(1, parsed)
 
 
+def _predictor_stream_overlap_enabled() -> bool:
+    """Run RECORD-phase bias_predictor forward on a side CUDA stream so it overlaps
+    with the main-stream routing/dispatch/expert work that follows it."""
+    return os.getenv("VERL_PREDICTOR_STREAM_OVERLAP", "").lower() in {"1", "true", "yes", "on"}
+
+
 def _relative_l2(lhs: torch.Tensor, rhs: torch.Tensor) -> float:
     lhs_f = lhs.detach().float()
     rhs_f = rhs.detach().float()
@@ -154,6 +160,13 @@ class RouterReplay:
     predictive_loss_tracker = []  # List of (layer_idx, loss_value)
     predictive_bias_ratio_tracker = []  # List of (layer_idx, ratio_value)
     predictive_topk_accuracy_tracker = []  # List of (layer_idx, accuracy_value)
+
+    # Side CUDA stream used to overlap RECORD-phase bias_predictor forward with the
+    # main-stream routing/dispatch/expert work that follows it.  Lazy-initialized.
+    _predictor_stream = None
+    # Pending (layer_idx, tensor) entries queued from the side stream that still
+    # need .item() to materialize as floats.  Drained in get_and_clear_predictive_metrics().
+    _pending_bias_ratio_tensors = []
 
     def __init__(self):
         """Initializes a RouterReplay instance for a specific layer."""
@@ -239,6 +252,10 @@ class RouterReplay:
         Get the current logits cache and clear it.
         Returns a dict with 'compute_log_prob', 'training', 'router_weights' and 'global_token_ids' keys.
         """
+        # When VERL_PREDICTOR_STREAM_OVERLAP is on, predictive_bias entries were filled by
+        # .cpu() copies queued on the predictor side stream. Make the current stream wait
+        # so the cache contents are guaranteed visible to downstream gather/save logic.
+        RouterReplay.sync_predictor_stream()
         cache = RouterReplay.logits_cache
         RouterReplay.logits_cache = {
             "compute_log_prob": [],
@@ -578,6 +595,39 @@ class RouterReplay:
         RouterReplay.predictive_bias_ratio_tracker.append((layer_idx, ratio_value))
 
     @staticmethod
+    def get_predictor_stream():
+        """Lazy-init and return the side CUDA stream used for the bias_predictor forward."""
+        if not torch.cuda.is_available():
+            return None
+        if RouterReplay._predictor_stream is None:
+            RouterReplay._predictor_stream = torch.cuda.Stream()
+        return RouterReplay._predictor_stream
+
+    @staticmethod
+    def record_predictive_bias_ratio_async(layer_idx: int, ratio_tensor: torch.Tensor):
+        """Queue a bias-ratio tensor produced on the predictor side stream.
+        Resolved to a float (via .item()) by _flush_pending_predictive_metrics().
+        """
+        RouterReplay._pending_bias_ratio_tensors.append((layer_idx, ratio_tensor))
+
+    @staticmethod
+    def _flush_pending_predictive_metrics():
+        """Materialize pending bias-ratio tensors into the float tracker.
+        .item() implicitly synchronizes with the producing stream."""
+        for layer_idx, t in RouterReplay._pending_bias_ratio_tensors:
+            RouterReplay.predictive_bias_ratio_tracker.append((layer_idx, t.item()))
+        RouterReplay._pending_bias_ratio_tensors.clear()
+
+    @staticmethod
+    def sync_predictor_stream():
+        """Block the calling stream until all queued predictor work has completed.
+        Use before reading anything written by the predictor side stream from a
+        different stream (e.g., before consuming RouterReplay.logits_cache)."""
+        stream = RouterReplay._predictor_stream
+        if stream is not None:
+            torch.cuda.current_stream().wait_stream(stream)
+
+    @staticmethod
     def record_predictive_topk_accuracy(layer_idx: int, accuracy_value: float):
         """Record predictive top-k prediction accuracy for wandb logging."""
         RouterReplay.predictive_topk_accuracy_tracker.append((layer_idx, accuracy_value))
@@ -590,6 +640,10 @@ class RouterReplay:
     @staticmethod
     def get_and_clear_predictive_metrics():
         """Get aggregated predictive metrics and clear trackers."""
+        # Resolve any pending bias-ratio tensors queued from the predictor side stream
+        # (no-op when VERL_PREDICTOR_STREAM_OVERLAP is off).
+        RouterReplay._flush_pending_predictive_metrics()
+
         metrics = {}
 
         if RouterReplay.replay_topk_accuracy_tracker:
@@ -630,8 +684,7 @@ def calculate_topk_accuracy(
     topk_indices1_expanded = topk_indices1.unsqueeze(-1)  # [tokens, topk, 1]
     topk_indices2_expanded = topk_indices2.unsqueeze(-2)  # [tokens, 1, topk]
     matches = (topk_indices1_expanded == topk_indices2_expanded).any(dim=-1)  # [tokens, topk]
-    accuracy = matches.float().mean().item()
-    return accuracy
+    return matches.float().mean().item()
 
 
 def _patched_topk_routing_with_score_function(
@@ -962,22 +1015,46 @@ def patched_forward(self, input: torch.Tensor):
                 probs, routing_map = self.routing(logits)
 
             elif predictive_routing_action == RouterPredictiveAction.RECORD: # PR2 log_prob/record phase
-                with torch.no_grad():
-                    # Log_prob phase: record inputs/logits and predictor stats only.
-                    # Do not apply the predictor to routing here: old_log_probs must match
-                    # the rollout policy's uncorrected router decisions.
-                    self.router_replay.record_predictive_data(input, logits)
+                # Log_prob phase: record inputs/logits and predictor stats only.
+                # Do not apply the predictor to routing here: old_log_probs must match
+                # the rollout policy's uncorrected router decisions.
+                #
+                # The predictor's outputs (delta_logits) only feed: (1) bias_ratio telemetry,
+                # (2) optional disk save via record_predictive_bias.  Crucially, they do NOT
+                # flow into self.routing(logits) below.  That makes the predictor forward
+                # an independent kernel relative to the main-stream routing/dispatch/expert
+                # work; we run it on a side CUDA stream so it overlaps.
+                self.router_replay.record_predictive_data(input, logits)
+                layer_idx = self.router_replay.layer_idx if self.router_replay else 0
 
-                    delta_logits = self.bias_predictor(input)
-
-                    # Track bias ratio: |delta_logits|_mean / |logits|_mean
-                    layer_idx = self.router_replay.layer_idx if self.router_replay else 0
-                    bias_ratio = (torch.abs(delta_logits).mean() / (torch.abs(logits).mean() + 1e-10)).item()
-                    RouterReplay.record_predictive_bias_ratio(layer_idx, bias_ratio)
-
-                    # Record predictive bias to logits cache if saving is enabled
-                    if RouterReplay.enable_logits_recording:
-                        RouterReplay.record_predictive_bias(delta_logits, layer_idx)
+                if _predictor_stream_overlap_enabled():
+                    predictor_stream = RouterReplay.get_predictor_stream()
+                    # Make the predictor stream wait until the gating output (`logits`)
+                    # and the input tensor are fully materialized on the main stream.
+                    predictor_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(predictor_stream), torch.no_grad():
+                        delta_logits = self.bias_predictor(input)
+                        # Defer .item() to end-of-step so we don't host-sync here.
+                        bias_ratio_tensor = (
+                            torch.abs(delta_logits).mean()
+                            / (torch.abs(logits).mean() + 1e-10)
+                        )
+                        RouterReplay.record_predictive_bias_ratio_async(layer_idx, bias_ratio_tensor)
+                        if RouterReplay.enable_logits_recording:
+                            # The .cpu() inside record_predictive_bias is queued on the
+                            # predictor stream; the resulting CPU tensor is consumed at
+                            # end-of-step where sync_predictor_stream() guarantees ordering.
+                            RouterReplay.record_predictive_bias(delta_logits, layer_idx)
+                else:
+                    with torch.no_grad():
+                        delta_logits = self.bias_predictor(input)
+                        # Track bias ratio: |delta_logits|_mean / |logits|_mean
+                        bias_ratio = (
+                            torch.abs(delta_logits).mean() / (torch.abs(logits).mean() + 1e-10)
+                        ).item()
+                        RouterReplay.record_predictive_bias_ratio(layer_idx, bias_ratio)
+                        if RouterReplay.enable_logits_recording:
+                            RouterReplay.record_predictive_bias(delta_logits, layer_idx)
 
                 probs, routing_map = self.routing(logits)
 
@@ -1082,25 +1159,6 @@ def patched_forward(self, input: torch.Tensor):
 
                     elif self.config.bias_predictor_loss_type == "kl":
                         # KL divergence on logits_diff vs delta_logits distributions
-                        ##############
-                        # DEBUG
-                        # import datetime
-                        # SAVE_DIR = "/root/verl/debug/"
-                        # os.makedirs(SAVE_DIR, exist_ok=True)
-                        # TIME = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                        # torch.save({
-                        #     'inputs': input.cpu(),
-                        #     'logits': logits.cpu(),
-                        #     'old_inputs': old_inputs.cpu(),
-                        #     'old_logits': old_logits.cpu(),
-                        #     'valid_mask': valid_mask.cpu() if valid_mask is not None else None,
-                        #     'current_input': current_input.cpu(),
-                        #     'current_logits': current_logits.cpu(),
-                        #     'delta_logits': delta_logits.cpu(),
-                        #     'logits_diff': logits_diff.cpu(),
-                        # }, SAVE_DIR + f"predictive_routing_logits_{self.layer_number}_{TIME}.pt")
-                        # logger.info(f"[Predictive Routing Replay] [Debug] Saved delta_logits and logits_diff for debugging at layer {self.layer_number} to {SAVE_DIR}predictive_routing_logits_{self.layer_number}_{TIME}.pt")
-                        ##############
                         pred_log_probs = torch.log_softmax(delta_logits, dim=-1)
                         target_probs = torch.softmax(logits_diff, dim=-1)
                         predictive_loss = torch.nn.functional.kl_div(
@@ -1125,12 +1183,13 @@ def patched_forward(self, input: torch.Tensor):
 
                     predictive_loss = predictive_loss * predictive_loss_scale
 
-                    # Record predictive loss
                     layer_idx = self.router_replay.layer_idx if self.router_replay else 0
                     RouterReplay.record_predictive_loss(layer_idx, predictive_loss.item())
-
-                    # Record top-k prediction accuracy
-                    accuracy = calculate_topk_accuracy(topk=self.topk, logits1=old_logits + delta_logits, logits2=current_logits)
+                    accuracy = calculate_topk_accuracy(
+                        topk=self.topk,
+                        logits1=old_logits + delta_logits,
+                        logits2=current_logits,
+                    )
                     RouterReplay.record_predictive_topk_accuracy(layer_idx, accuracy)
 
                     if (

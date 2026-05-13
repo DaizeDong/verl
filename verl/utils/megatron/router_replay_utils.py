@@ -631,15 +631,13 @@ def merge_router_predictive_data(
     layers_old_logits_list = []
     layers_old_token_positions_list = []
     total_tokens_before_split = 0
+
     for i in range(batch_size):
         start_idx = cu_seqlens[i].item()
         num_tokens = seqlens[i].item()
         end_idx = start_idx + num_tokens
-        
-        # Extract this sample's tokens: [num_tokens_i, layers, hidden]
         sample_inputs = layers_old_inputs[0, start_idx:end_idx, :, :].cpu()
         sample_logits = layers_old_logits[0, start_idx:end_idx, :, :].cpu()
-        
         layers_old_inputs_list.append(sample_inputs)
         layers_old_logits_list.append(sample_logits)
         layers_old_token_positions_list.append(torch.arange(num_tokens, dtype=torch.int32, device="cpu"))
