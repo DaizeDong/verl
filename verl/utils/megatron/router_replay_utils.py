@@ -142,6 +142,63 @@ def _get_system_memory_info():
         return f"N/A (error: {e})"
 
 
+_STORAGE_DTYPE_MAP = {
+    'fp32': torch.float32,
+    'bf16': torch.bfloat16,
+    'fp16': torch.float16,
+    'fp8': torch.float8_e4m3fn,  # 1 byte/element; upcasted to compute dtype in set_router_predictive_data
+}
+
+
+_TORCH_TO_NUMPY_TRANSPORT_VIEW = {
+    # bf16 and fp16 aren't natively representable in numpy, but they're 2 bytes wide
+    # and we just need to ship the raw bits across the Ray plasma boundary.  Viewing
+    # them as uint16 / int16 lets numpy carry them as-is (no fp32 widening), halving
+    # the bytes serialized for these dtypes.  Re-view back to the original dtype on
+    # the receiver with the symmetric `_transport_numpy_to_tensor` helper.
+    torch.bfloat16: torch.uint16,
+    torch.float16: torch.int16,
+}
+
+
+def _transport_view_dtype_disabled() -> bool:
+    """If set, fall back to the legacy `.float().numpy()` widening on the sender
+    and plain `torch.from_numpy` on the receiver.  Used for A/B testing."""
+    return os.getenv("VERL_DISABLE_TRANSPORT_VIEW_DTYPE", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _tensor_to_transport_numpy(t: torch.Tensor) -> np.ndarray:
+    """Convert a CPU torch tensor to a numpy array suitable for Ray plasma transport
+    WITHOUT widening to fp32.  For bf16/fp16, the result is a uint16/int16 view of
+    the raw bits — receiver must call `_transport_numpy_to_tensor` with the original
+    dtype to restore the tensor."""
+    t = t.contiguous()
+    if _transport_view_dtype_disabled():
+        # Legacy: bf16/fp16 widen to fp32 before numpy (doubles transport bytes for bf16).
+        if t.dtype in _TORCH_TO_NUMPY_TRANSPORT_VIEW:
+            return t.float().numpy()
+        return t.numpy()
+    view_dtype = _TORCH_TO_NUMPY_TRANSPORT_VIEW.get(t.dtype)
+    if view_dtype is not None:
+        return t.view(view_dtype).numpy()
+    return t.numpy()
+
+
+def _transport_numpy_to_tensor(arr: np.ndarray, target_dtype: torch.dtype) -> torch.Tensor:
+    """Reverse of `_tensor_to_transport_numpy`.  Reinterprets the uint16/int16 view
+    used during transport back to the original torch dtype (zero-copy view)."""
+    t = torch.from_numpy(arr.copy())
+    # Sender may have widened to fp32 (legacy path / fp8) — convert back if needed.
+    # Note: from_numpy of an fp32 array gives torch.float32; converting to bf16 is a
+    # real cast (lossy), which mirrors the legacy round-trip exactly.
+    if t.dtype != target_dtype:
+        view_dtype = _TORCH_TO_NUMPY_TRANSPORT_VIEW.get(target_dtype)
+        if view_dtype is not None and t.dtype == view_dtype:
+            return t.view(target_dtype)
+        return t.to(target_dtype)
+    return t
+
+
 def _to_numpy_array(value, *, dtype=None):
     if value is None:
         return None
@@ -711,14 +768,8 @@ def merge_router_predictive_data(
         # print(f"[Predictive Routing Replay] [Memory] AFTER downsample - inputs: {inputs_size_mb_after:.2f} MB (saved {inputs_size_mb - inputs_size_mb_after:.2f} MB), logits: {logits_size_mb_after:.2f} MB, {_get_system_memory_info()}")
 
     # Lower precision storage to save memory (convert dtype per sample)
-    dtype_map = {
-        'fp32': torch.float32,
-        'bf16': torch.bfloat16,
-        'fp16': torch.float16,
-        'fp8': torch.float8_e4m3fn,  # 1 byte/element; upcasted to compute dtype in set_router_predictive_data
-    }
-    inputs_target_dtype = dtype_map.get(inputs_storage_dtype, torch.bfloat16)
-    logits_target_dtype = dtype_map.get(logits_storage_dtype, torch.float32)
+    inputs_target_dtype = _STORAGE_DTYPE_MAP.get(inputs_storage_dtype, torch.bfloat16)
+    logits_target_dtype = _STORAGE_DTYPE_MAP.get(logits_storage_dtype, torch.float32)
 
     if len(layers_old_inputs_sampled) > 0:
         for i in range(len(layers_old_inputs_sampled)):
@@ -776,6 +827,8 @@ def set_router_predictive_data(
     router_request_ids=None,
     global_step=None,
     mini_step=None,
+    inputs_storage_dtype: str = 'bf16',
+    logits_storage_dtype: str = 'fp32',
 ):
     """
     NEW: Simplified version that works with unpacked data (list of variable-shape tensors).
@@ -991,8 +1044,12 @@ def set_router_predictive_data(
                     continue
 
             valid_indices.append(i)
-            valid_old_inputs.append(torch.from_numpy(old_input.copy()))
-            valid_old_logits.append(torch.from_numpy(old_logit.copy()))
+            # Reinterpret transport-view dtypes (uint16/int16) back to the original
+            # storage dtype (bf16/fp16) that the sender used in `_tensor_to_transport_numpy`.
+            _inputs_torch_dtype = _STORAGE_DTYPE_MAP.get(inputs_storage_dtype, torch.bfloat16)
+            _logits_torch_dtype = _STORAGE_DTYPE_MAP.get(logits_storage_dtype, torch.float32)
+            valid_old_inputs.append(_transport_numpy_to_tensor(old_input, _inputs_torch_dtype))
+            valid_old_logits.append(_transport_numpy_to_tensor(old_logit, _logits_torch_dtype))
             if old_token_positions is not None:
                 valid_old_token_positions.append(torch.from_numpy(old_token_positions.copy()))
             if router_request_ids is not None and i < len(router_request_ids):

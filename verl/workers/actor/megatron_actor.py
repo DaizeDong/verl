@@ -50,6 +50,7 @@ from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAc
 from verl.utils.megatron.router_replay_saver import RouterReplayLogitsSaver
 from verl.utils.megatron.router_replay_utils import (
     RouterReplayHelper,
+    _tensor_to_transport_numpy,
     merge_router_topk_indices,
     pp_gather,
     reorder_and_merge_vpp_layers,
@@ -1177,10 +1178,13 @@ class MegatronPPOActor(BasePPOActor):
                     # logits_mb = sum(t.numel() * t.element_size() for t in layers_old_logits_list) / 1024 / 1024
                     # logger.info(f"[Predictive Routing Replay] [Memory] compute_log_prob: old_inputs={inputs_mb:.2f}MB (list of {len(layers_old_inputs_list)} samples), old_logits={logits_mb:.2f}MB, {get_system_memory_info()}")
 
-                    # Convert to numpy for Ray efficiency
-                    # Each tensor is already on CPU and has shape [num_tokens_i, layers, hidden]
-                    layers_old_inputs_list_np = [t.contiguous().float().numpy() for t in layers_old_inputs_list]
-                    layers_old_logits_list_np = [t.contiguous().float().numpy() for t in layers_old_logits_list]
+                    # Convert to numpy for Ray plasma transport.  Use the dtype-preserving
+                    # helper so bf16 (the default storage dtype) is shipped as a uint16 view
+                    # of the raw bits — `.float().numpy()` here previously widened bf16 to
+                    # fp32, doubling the cross-actor transport size for every micro-batch.
+                    # Each tensor is already on CPU and has shape [num_tokens_i, layers, hidden].
+                    layers_old_inputs_list_np = [_tensor_to_transport_numpy(t) for t in layers_old_inputs_list]
+                    layers_old_logits_list_np = [_tensor_to_transport_numpy(t) for t in layers_old_logits_list]
                     layers_old_token_positions_list_np = [
                         t.contiguous().cpu().to(torch.int32).numpy() for t in layers_old_token_positions_list
                     ]
@@ -1723,6 +1727,8 @@ class MegatronPPOActor(BasePPOActor):
                             router_request_ids=router_request_id_list,
                             global_step=self._current_r3_trace_global_step,
                             mini_step=self._current_r3_trace_mini_step,
+                            inputs_storage_dtype=self.config.router_replay.predictive_inputs_storage_dtype,
+                            logits_storage_dtype=self.config.router_replay.predictive_logits_storage_dtype,
                         )
                         if self.config.router_replay.mode == "R3":
                             logger.info(
