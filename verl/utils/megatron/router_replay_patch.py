@@ -49,6 +49,15 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+
+def _path_c_probe_enabled() -> bool:
+    """When set, COMPUTE_PREDICTIVE_LOSS records the relative L2 drift between
+    SGLang's hidden_states (shipped via predictive transport) and Megatron's
+    same-position hidden_states (live from the current forward).  Used to
+    validate whether Megatron can recompute h locally and eliminate the
+    SGLang→Megatron transport entirely (Path C).  Diagnostic-only."""
+    return os.getenv("VERL_PATH_C_PROBE", "").lower() in {"1", "true", "yes", "on"}
+
 # https://github.com/THUDM/slime/blob/main/slime/utils/routing_replay.py
 
 
@@ -160,6 +169,10 @@ class RouterReplay:
     predictive_loss_tracker = []  # List of (layer_idx, loss_value)
     predictive_bias_ratio_tracker = []  # List of (layer_idx, ratio_value)
     predictive_topk_accuracy_tracker = []  # List of (layer_idx, accuracy_value)
+    # Path-C probe: relative L2 drift between sglang's h and Megatron's h at the
+    # same router position.  Populated only when VERL_PATH_C_PROBE=1.
+    predictive_hidden_drift_tracker = []  # List of (layer_idx, drift_value)
+    predictive_logits_drift_tracker = []  # List of (layer_idx, drift_value)
 
     # Side CUDA stream used to overlap RECORD-phase bias_predictor forward with the
     # main-stream routing/dispatch/expert work that follows it.  Lazy-initialized.
@@ -638,6 +651,16 @@ class RouterReplay:
         RouterReplay.replay_topk_accuracy_tracker.append((layer_idx, accuracy_value))
 
     @staticmethod
+    def record_predictive_hidden_drift(layer_idx: int, drift_value: float):
+        """Path-C probe: ||h_sglang - h_megatron|| / ||h_sglang|| at aligned positions."""
+        RouterReplay.predictive_hidden_drift_tracker.append((layer_idx, drift_value))
+
+    @staticmethod
+    def record_predictive_logits_drift(layer_idx: int, drift_value: float):
+        """Path-C probe: ||l_sglang - l_megatron|| / ||l_sglang|| at aligned positions."""
+        RouterReplay.predictive_logits_drift_tracker.append((layer_idx, drift_value))
+
+    @staticmethod
     def get_and_clear_predictive_metrics():
         """Get aggregated predictive metrics and clear trackers."""
         # Resolve any pending bias-ratio tensors queued from the predictor side stream
@@ -665,6 +688,31 @@ class RouterReplay:
             avg_accuracy = sum(acc for _, acc in RouterReplay.predictive_topk_accuracy_tracker) / len(RouterReplay.predictive_topk_accuracy_tracker)
             metrics['predictive_topk_accuracy'] = avg_accuracy
             RouterReplay.predictive_topk_accuracy_tracker.clear()
+
+        if RouterReplay.predictive_hidden_drift_tracker:
+            drifts = [d for _, d in RouterReplay.predictive_hidden_drift_tracker]
+            metrics['predictive_hidden_drift_mean'] = sum(drifts) / len(drifts)
+            metrics['predictive_hidden_drift_max'] = max(drifts)
+            metrics['predictive_hidden_drift_min'] = min(drifts)
+            # Per-layer breakdown: log min/max layer indices at the extremes for triage.
+            _layer_to_drifts = {}
+            for layer_idx, d in RouterReplay.predictive_hidden_drift_tracker:
+                _layer_to_drifts.setdefault(layer_idx, []).append(d)
+            _layer_means = {li: sum(ds) / len(ds) for li, ds in _layer_to_drifts.items()}
+            _li_max = max(_layer_means, key=_layer_means.get)
+            _li_min = min(_layer_means, key=_layer_means.get)
+            metrics['predictive_hidden_drift_layer_max'] = _li_max
+            metrics['predictive_hidden_drift_layer_max_value'] = _layer_means[_li_max]
+            metrics['predictive_hidden_drift_layer_min'] = _li_min
+            metrics['predictive_hidden_drift_layer_min_value'] = _layer_means[_li_min]
+            RouterReplay.predictive_hidden_drift_tracker.clear()
+
+        if RouterReplay.predictive_logits_drift_tracker:
+            drifts = [d for _, d in RouterReplay.predictive_logits_drift_tracker]
+            metrics['predictive_logits_drift_mean'] = sum(drifts) / len(drifts)
+            metrics['predictive_logits_drift_max'] = max(drifts)
+            metrics['predictive_logits_drift_min'] = min(drifts)
+            RouterReplay.predictive_logits_drift_tracker.clear()
 
         return metrics
 
@@ -1146,6 +1194,19 @@ def patched_forward(self, input: torch.Tensor):
                         # logger.info(f"[Predictive Routing Replay] Applied token-level mask: {valid_mask.sum().item()}/{valid_mask.size(0)} valid tokens")
                         assert current_input.shape[0] == old_inputs.shape[0], f"Token count mismatch after masking: old={old_inputs.shape[0]}, current={current_input.shape[0]}"
                         assert current_logits.shape[0] == old_logits.shape[0], f"Token count mismatch after masking: old={old_logits.shape[0]}, current={current_logits.shape[0]}"
+
+                    if _path_c_probe_enabled():
+                        with torch.no_grad():
+                            _layer_idx = self.router_replay.layer_idx if self.router_replay else 0
+                            _old_in_f = old_inputs.to(torch.float32)
+                            _cur_in_f = current_input.to(torch.float32)
+                            _h_drift = ((_old_in_f - _cur_in_f).norm() / (_old_in_f.norm() + 1e-10)).item()
+                            RouterReplay.record_predictive_hidden_drift(_layer_idx, _h_drift)
+
+                            _old_lg_f = old_logits.to(torch.float32)
+                            _cur_lg_f = current_logits.to(torch.float32)
+                            _l_drift = ((_old_lg_f - _cur_lg_f).norm() / (_old_lg_f.norm() + 1e-10)).item()
+                            RouterReplay.record_predictive_logits_drift(_layer_idx, _l_drift)
 
                     # Compute delta_logits and logits_diff
                     # Use old_inputs with current weights to get delta_logits

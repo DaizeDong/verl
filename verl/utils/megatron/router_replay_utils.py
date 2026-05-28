@@ -77,7 +77,8 @@ def _checksum_value(value) -> Optional[str]:
         return None
     if isinstance(value, torch.Tensor):
         tensor = value.detach().cpu().contiguous()
-        if tensor.dtype == torch.bfloat16:
+        # numpy can't represent bf16 or fp8 — widen to fp32 for the CRC hash.
+        if tensor.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
             tensor = tensor.to(torch.float32)
         array = tensor.numpy()
     else:
@@ -156,8 +157,12 @@ _TORCH_TO_NUMPY_TRANSPORT_VIEW = {
     # them as uint16 / int16 lets numpy carry them as-is (no fp32 widening), halving
     # the bytes serialized for these dtypes.  Re-view back to the original dtype on
     # the receiver with the symmetric `_transport_numpy_to_tensor` helper.
+    # fp8 storage dtypes are 1 byte wide; view as uint8 (numpy has no fp8 dtype, so
+    # without this entry the fast path falls through to `t.numpy()` and raises).
     torch.bfloat16: torch.uint16,
     torch.float16: torch.int16,
+    torch.float8_e4m3fn: torch.uint8,
+    torch.float8_e5m2: torch.uint8,
 }
 
 
