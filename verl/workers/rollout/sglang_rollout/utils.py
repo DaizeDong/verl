@@ -23,6 +23,11 @@ import torch.distributed as dist
 from verl.utils.device import get_device_name
 from verl.workers.rollout.utils import ensure_async_iterator
 
+# Default LoRA name used when actor pushes adapter weights into the sglang engine.
+# Sourced from feat/predictor-stream-overlap where it was added alongside the
+# bias_predictor lora injection.
+SGLANG_LORA_NAME = "verl_actor_lora_name"
+
 
 def broadcast_pyobj(
     data: list[Any],
