@@ -19,6 +19,7 @@ from omegaconf import MISSING
 
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
+from verl.workers.config.actor import RouterReplayConfig
 from verl.workers.config.model import MtpConfig
 
 __all__ = [
@@ -263,6 +264,11 @@ class RolloutConfig(BaseConfig):
     quantization_config_file: Optional[str] = None
 
     enable_rollout_routing_replay: bool = False
+
+    # Router replay config inherited from actor side at runtime (megatron_workers
+    # copies actor.router_replay into the rollout omegaconf before instantiating
+    # RolloutConfig).  Ported from feat/predictor-stream-overlap onto v0.7.1.
+    router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
 
     enable_sleep_mode: bool = True
 
