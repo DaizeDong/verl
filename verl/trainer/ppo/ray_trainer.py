@@ -908,12 +908,15 @@ class RayPPOTrainer:
         # To stream teacher computation with actor rollout, we instead pass the full manager so that the
         # teacher loop workers can sleep/wake together with rollout workers
         reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+        # v0.7.1's AgentLoopManager.create() doesn't accept teacher_model_manager
+        # (teacher/distillation work landed on main after the v0.7.1 cut).  Drop
+        # the kwarg — teacher_model_manager is always None on this branch (no
+        # distillation), so nothing depends on AgentLoopManager seeing it.
         self.async_rollout_manager = AgentLoopManager.create(
             config=self.config,
             worker_group=self.actor_rollout_wg,
             rollout_resource_pool=actor_rollout_resource_pool,
             reward_loop_worker_handles=reward_loop_worker_handles,
-            teacher_model_manager=self.teacher_model_manager,
         )
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
         self.checkpoint_manager = CheckpointEngineManager(
