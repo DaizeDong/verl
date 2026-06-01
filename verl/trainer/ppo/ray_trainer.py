@@ -40,8 +40,17 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
-from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
+
+
+def is_distillation_enabled(config) -> bool:
+    """Local shim — upstream/release/v0.7.1 doesn't ship the
+    verl.trainer.distillation.losses module that the predictor port expects.
+    The predictor doesn't use distillation, so just always return False when
+    the config object is missing or falsy."""
+    if config is None:
+        return False
+    return bool(getattr(config, "enabled", False))
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
@@ -70,7 +79,13 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
-from verl.workers.config import DistillationConfig, EngineConfig
+from verl.workers.config import EngineConfig
+
+# Local alias — upstream/release/v0.7.1 doesn't ship DistillationConfig (added on
+# main after v0.7.1 cut).  Predictor port doesn't enable distillation, so a None-
+# typed alias is sufficient: any code path touching the real type is gated behind
+# is_distillation_enabled() which always returns False on this branch.
+DistillationConfig = type(None)
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
