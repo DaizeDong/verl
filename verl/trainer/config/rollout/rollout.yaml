@@ -306,6 +306,17 @@ skip_rollout: False
 # Note: Giving path under /tmp/ray/session* is not recommended as these are temporary Ray cluster directories.
 skip_dump_dir: /tmp/rollout_dump
 
+# Nested rollout-skip config (ported from feat/predictor-stream-overlap).
+# Used by the predictor port for stable A/B (load/dump rollout data instead of
+# recomputing).  Distinct from the flat skip_rollout/skip_dump_dir fields above,
+# which are kept for upstream-v0.7.1 backward compat.
+skip:
+  _target_: verl.workers.config.SkipConfig
+  enable: False
+  dump_dir: ~/.verl/rollout_dump
+  max_dump_step: 1
+  action: cache  # cache | repeat | repeat_last
+
 # Whether to skip tokenizer initialization for rollout engine
 # When enabled (True), the rollout assume token in token out for generation
 skip_tokenizer_init: True
