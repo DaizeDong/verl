@@ -19,6 +19,7 @@ from omegaconf import MISSING
 
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
+from verl.workers.config.actor import RouterReplayConfig
 from verl.workers.config.disaggregation import DisaggregationConfig
 from verl.workers.config.model import MtpConfig
 
@@ -248,6 +249,11 @@ class RolloutConfig(BaseConfig):
 
     # Rollout skip config (load/dump rollout data)
     skip: SkipConfig = field(default_factory=SkipConfig)
+
+    # Router replay config inherited from actor side at runtime (workers copy
+    # actor.router_replay into the rollout omegaconf before instantiating
+    # RolloutConfig). Required for R3 / predictive routing replay on SGLang.
+    router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
 
     profiler: Optional[ProfilerConfig] = None
 
