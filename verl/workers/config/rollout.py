@@ -31,6 +31,7 @@ __all__ = [
     "PrometheusConfig",
     "RolloutConfig",
     "CheckpointEngineConfig",
+    "SkipConfig",
 ]
 
 
