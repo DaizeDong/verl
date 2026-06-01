@@ -135,6 +135,27 @@ class CheckpointEngineConfig(BaseConfig):
 
 
 @dataclass
+class SkipConfig(BaseConfig):
+    """
+    Configuration for rollout skip: load/dump previously generated rollout data
+    instead of computing new rollouts (e.g. for debugging or reuse).
+
+    Ported from feat/predictor-stream-overlap onto v0.7.1.  v0.7.1's own flat
+    skip_rollout/skip_dump_dir fields are kept for backward compat with code
+    paths that use them directly.
+    """
+
+    enable: bool = False
+    dump_dir: str = "~/.verl/rollout_dump"
+    max_dump_step: int = 1
+    action: str = "cache"  # cache | repeat | repeat_last
+
+    def get(self, key: str, default=None):
+        """Dict-like get for compatibility with code that uses skip.get('enable', False)."""
+        return getattr(self, key, default)
+
+
+@dataclass
 class RolloutConfig(BaseConfig):
     _mutable_fields = {"max_model_len", "load_format", "expert_parallel_size", "moe_tensor_parallel_size"}
 
@@ -210,6 +231,9 @@ class RolloutConfig(BaseConfig):
 
     # Checkpoint Engine config for update weights from trainer to rollout
     checkpoint_engine: CheckpointEngineConfig = field(default_factory=CheckpointEngineConfig)
+
+    # Rollout skip config (load/dump rollout data) — ported from feat/predictor-stream-overlap.
+    skip: SkipConfig = field(default_factory=SkipConfig)
 
     skip_rollout: bool = False
 
