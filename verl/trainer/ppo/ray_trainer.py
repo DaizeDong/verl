@@ -66,8 +66,15 @@ from verl.trainer.ppo.utils import (
     need_critic,
     need_reference_policy,
     need_reward_model,
-    need_teacher_policy,
 )
+
+
+def need_teacher_policy(config) -> bool:
+    """Local shim — v0.7.1's verl.trainer.ppo.utils doesn't ship
+    need_teacher_policy (teacher/distillation work landed on main after
+    the v0.7.1 cut).  Predictor port doesn't enable distillation, so
+    always return False."""
+    return False
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
