@@ -33,10 +33,21 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
 from verl.experimental.agent_loop.utils import resolve_config_path
-from verl.experimental.teacher_loop import TeacherModelManager
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
-from verl.trainer.distillation import is_distillation_enabled
+
+
+# v0.7.1 doesn't ship teacher_loop / distillation.  Predictor port doesn't use
+# either, so stub the symbols agent_loop.py expects.  Any call path that touches
+# the real type is gated behind is_distillation_enabled() which returns False.
+class TeacherModelManager:  # type: ignore
+    pass
+
+
+def is_distillation_enabled(config) -> bool:
+    if config is None:
+        return False
+    return bool(getattr(config, "enabled", False))
 from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
