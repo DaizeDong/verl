@@ -26,7 +26,7 @@ from ray.actor import ActorHandle
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup, ResourcePoolManager
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import is_torch_npu_available
-from verl.workers.config import DiffusionRolloutConfig, HFModelConfig, RolloutConfig
+from verl.workers.config import HFModelConfig, RolloutConfig
 
 logger = logging.getLogger(__file__)
 
@@ -118,14 +118,14 @@ class RolloutReplica(ABC):
     def __init__(
         self,
         replica_rank: int,
-        config: RolloutConfig | DiffusionRolloutConfig,
+        config: RolloutConfig,
         model_config: DictConfig,
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
         is_teacher_model: bool = False,
     ) -> None:
         self.replica_rank = replica_rank
-        self.config: RolloutConfig | DiffusionRolloutConfig = omega_conf_to_dataclass(config)
+        self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = model_config
 
         self.world_size = (
