@@ -60,11 +60,15 @@ from verl.utils.rollout_trace import (
 )
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.config import (
-    DistillationConfig,
-    DistillationLossConfig,
     HFModelConfig,
     RolloutConfig,
 )
+
+# v0.7.1 doesn't ship distillation configs; stub them out since the only
+# code paths that reference them are guarded by is_distillation_enabled()
+# (always False here).
+DistillationConfig = type(None)
+DistillationLossConfig = type(None)
 from verl.workers.rollout.replica import DiffusionOutput, TokenOutput, get_rollout_replica_class
 
 logger = logging.getLogger(__file__)
