@@ -165,6 +165,11 @@ trainer:
   # Directory for logging rollout data; no dump if null
   rollout_data_dir: null
 
+  # Directory for logging validation data; no dump if null.  Ported from
+  # feat/predictor-stream-overlap onto v0.7.1 (the predictor port test
+  # scripts set this via Hydra and v0.7.1's struct config lacks the key).
+  validation_data_dir: null
+
   # whether to use legacy worker implementation
   #  mode: "auto", "enable", or "disable"
   use_legacy_worker_impl: auto
