@@ -1092,7 +1092,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="update_actor", logger=logger)
     @DistProfiler.annotate(color="red", role="actor_update")
-    def update_actor(self, data: DataProto, global_step: int = None):
+    def update_actor(self, data: DataProto):
+        # global_step is passed via data.meta_info["global_step"] — v0.7.1's
+        # Ray dispatcher rejects non-chunkable scalar kwargs on DataProto methods.
+        global_step = data.meta_info.get("global_step", None)
         assert self._is_actor
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)
@@ -1102,7 +1105,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
 
         from verl.utils.memory_utils import get_system_memory_info
-        
+
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
         
@@ -1221,7 +1224,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="compute_log_prob", logger=logger)
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
-    def compute_log_prob(self, data: DataProto, global_step: Optional[int] = None):
+    def compute_log_prob(self, data: DataProto):
+        # global_step via meta_info — see update_actor comment.
+        global_step = data.meta_info.get("global_step", None)
         assert self._is_actor
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module, load_grad=False)

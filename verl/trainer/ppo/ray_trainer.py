@@ -1244,7 +1244,10 @@ class RayPPOTrainer:
                 old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
             old_log_prob = DataProto.from_tensordict(old_log_prob)
         else:
-            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch, global_step=global_step)
+            # v0.7.1 dispatcher rejects scalar kwargs on DataProto methods —
+            # pass global_step through meta_info instead.
+            batch.meta_info["global_step"] = global_step
+            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
 
@@ -1287,7 +1290,10 @@ class RayPPOTrainer:
             actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
             actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
         else:
-            actor_output = self.actor_rollout_wg.update_actor(batch, global_step=global_step)
+            # v0.7.1 dispatcher rejects scalar kwargs on DataProto methods —
+            # pass global_step through meta_info instead.
+            batch.meta_info["global_step"] = global_step
+            actor_output = self.actor_rollout_wg.update_actor(batch)
 
         return actor_output
 
