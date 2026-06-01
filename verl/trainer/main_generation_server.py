@@ -74,12 +74,14 @@ async def submit_request(server_address, **chat_complete_request):
             json=chat_complete_request,
         ) as resp:
             data = await resp.json()
+            if resp.status >= 400 or data.get("object") == "error":
+                raise RuntimeError(f"SGLang chat completion failed: status={resp.status}, body={data}")
             return ChatCompletion(**data)
     finally:
         await session.close()
 
 
-async def generate_per_replica(server_address, model_path: str, n_samples: int, sampling_params: dict, chat_lst: list):
+async def generate_per_replica(server_address, model_path: str, n_samples: int, sampling_params: dict, chat_lst: list, replica_id: int = 0):
     # here we should sample n_samples for each chat_lst.
     # we use aiohttp to avoid hang in AsyncOpenAI when the number of requests is large.
 
@@ -98,8 +100,18 @@ async def generate_per_replica(server_address, model_path: str, n_samples: int, 
         for _ in range(n_samples)
     ]
 
+    total_requests = len(chat_complete_request)
+    print(f"[Replica {replica_id}] Starting {total_requests} generation requests to {server_address}")
+    
     tasks = [submit_request(server_address, **req) for req in chat_complete_request]
+    
+    # Add progress tracking
+    import time
+    start_time = time.time()
     results = await asyncio.gather(*tasks)
+    elapsed = time.time() - start_time
+    
+    print(f"[Replica {replica_id}] Completed {total_requests} requests in {elapsed:.1f}s ({total_requests/elapsed:.2f} req/s)")
     return results
 
 
@@ -110,9 +122,15 @@ async def generate(
     chat_sub_array = np.array_split(chat_numpy, num_replicas)
     chat_sub_array = [chat.tolist() for chat in chat_sub_array]
     assert len(server_addresses) == len(chat_sub_array)
+    
+    print(f"\n[INFO] Distributing {len(chat_numpy)} prompts across {num_replicas} replicas")
+    for i in range(num_replicas):
+        print(f"  - Replica {i}: {len(chat_sub_array[i])} prompts × {n_samples} samples = {len(chat_sub_array[i]) * n_samples} requests")
+    print()
+    
     results = await asyncio.gather(
         *[
-            generate_per_replica(server_addresses[i], model_path, n_samples, sampling_params, chat_sub_array[i])
+            generate_per_replica(server_addresses[i], model_path, n_samples, sampling_params, chat_sub_array[i], replica_id=i)
             for i in range(num_replicas)
         ]
     )
@@ -121,7 +139,19 @@ async def generate(
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
-    ray.init(runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_USE_V1": "1"}})
+    # Check if we're already in a Ray context (e.g., via ray job submit)
+    # If RAY_ADDRESS is set, connect to that specific cluster to ensure we use the local one
+    ray_address = os.environ.get("RAY_ADDRESS", None)
+    if ray_address:
+        # Already in Ray context or explicit address provided
+        ray.init(
+            address=ray_address,
+            runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_USE_V1": "1"}},
+            ignore_reinit_error=True
+        )
+    else:
+        # Start local Ray instance
+        ray.init(runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_USE_V1": "1"}})
 
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
@@ -154,28 +184,53 @@ def main(config):
 
     # concat dataset
     dataset = pd.concat(datasets, axis=0, ignore_index=True)
+    print(dataset)
     chat_lst = dataset[config.data.prompt_key].tolist()
-    chat_lst = [chat.tolist() for chat in chat_lst]
+    print(chat_lst)
+    chat_lst = [chat.tolist() if not isinstance(chat, str) else chat for chat in chat_lst]
     chat_numpy = np.array(chat_lst)
+    print(chat_numpy)
 
     # start native server
+    print(f"\n{'='*80}")
+    print(f"[INFO] Starting rollout servers...")
+    print(f"[INFO] TP size: {config.actor_rollout_ref.rollout.tensor_model_parallel_size}")
+    print(f"[INFO] Expected replicas: {(config.trainer.n_gpus_per_node * config.trainer.nnodes) // config.actor_rollout_ref.rollout.tensor_model_parallel_size}")
+    print(f"{'='*80}\n")
+    
     server_handles, server_addresses = asyncio.run(start_server(config))
+    
+    print(f"\n{'='*80}")
+    print(f"[INFO] Rollout servers started successfully!")
+    print(f"[INFO] Server addresses: {server_addresses}")
+    print(f"[INFO] Number of prompts: {len(chat_numpy)}")
+    print(f"[INFO] Samples per prompt: {n_samples}")
+    print(f"[INFO] Total generations: {len(chat_numpy) * n_samples}")
+    print(f"{'='*80}\n")
 
     # run generate
+    print(f"[INFO] Starting generation process... This may take a while.")
+    print(f"[INFO] You can monitor Ray dashboard at: http://{os.environ.get('HEAD_NODE', 'localhost')}:{os.environ.get('DASHBOARD_PORT', '8265')}")
     gen_results = asyncio.run(
         generate(server_addresses, config.actor_rollout_ref.model.path, n_samples, sampling_params, chat_numpy)
     )
 
     # reshape results into a numpy array
     import itertools
+    
+    print(f"\n{'='*80}")
+    print(f"[INFO] Generation completed! Processing results...")
+    print(f"{'='*80}\n")
 
     results = list(itertools.chain.from_iterable(gen_results))
+    print(f"[INFO] Total responses received: {len(results)}")
 
     # extract content from results
     results = np.array([result.choices[0].message.content for result in results])
     results = np.reshape(results, (-1, n_samples))
 
     assert results.shape == (len(chat_lst), n_samples)
+    print(f"[INFO] Results reshaped to: {results.shape} (prompts × samples)")
 
     results = results.tolist()
 
@@ -185,8 +240,10 @@ def main(config):
     # write to a new parquet
     output_dir = os.path.dirname(config.data.output_path)
     makedirs(output_dir, exist_ok=True)
-    print(f"Saving results to {config.data.output_path}")
+    print(f"\n[INFO] Saving {len(results)} results to {config.data.output_path}")
     dataset.to_parquet(config.data.output_path)
+    print(f"[SUCCESS] ✓ Results saved successfully!\n")
+    print(f"{'='*80}")
 
 
 if __name__ == "__main__":

@@ -37,14 +37,24 @@ use_distributed_optimizer: True
 # Whether to use distributed checkpointing
 use_dist_checkpointing: False
 
+# Whether to load the initial model weights from a distributed checkpoint.
+# Defaults to use_dist_checkpointing when left null.
+load_initial_dist_checkpointing: null
+
 # distributed checkpointing path
 dist_checkpointing_path: null
+
+# Whether to use hybrid context parallelism
+dynamic_context_parallel: False
+
+# Maximum sequence length per DPxCP rank
+max_seqlen_per_dp_cp_rank: null
 
 # distributed checkpointing prefix, e.g. Nemo2 will append prefix 'module.' to the state dict keys
 dist_checkpointing_prefix: ''
 
 # Make optimizer distributed checkpoint fully reshardable (TP/PP/EP/DP) as opposed to plain DP reshardability
-dist_ckpt_optim_fully_reshardable: True
+dist_ckpt_optim_fully_reshardable: False
 
 # Use as little memory as possible during save and load by using Gloo.
 # Has effect only when `dist_ckpt_optim_fully_reshardable` is enabled
@@ -114,3 +124,33 @@ router_replay:
   # File path to load recorded routing decisions for replay
   # Required when mode is 'replay'
   replay_file: null
+
+  # Router bias predictor flag mirrored from actor.router_replay.enable_bias_predictor so that
+  # the engine knows to build and checkpoint-load the predictor submodule.
+  enable_bias_predictor: false
+
+  # Loss type for training the bias predictor. Options: 'l2', 'kl', 'kl-post'.
+  # Only effective when enable_bias_predictor=true.
+  bias_predictor_loss_type: kl
+
+  # Learning-rate multiplier for bias predictor parameters (lr = base_lr * lr_mult).
+  # Only effective when enable_bias_predictor=true.
+  bias_predictor_lr_mult: 1000.0
+
+# QAT (Quantization-Aware Training) configuration
+qat:
+  _target_: verl.workers.config.QATEngineConfig
+  # Whether to enable QAT
+  enable: false
+  # Quantization mode: "w4a16" (weight-only FP4) or "w4a4" (weight + activation FP4)
+  mode: "w4a16"
+  # Group size for blockwise quantization (NVFP4 requires 16)
+  group_size: 16
+  # Module name patterns to exclude from quantization (fnmatch style for Megatron)
+  ignore_patterns:
+    - "lm_head"
+    - "*mlp.gate"
+  # Activation observer strategy (W4A4 only): "static_minmax", "memoryless_minmax", "minmax"
+  activation_observer: null
+  # Path to quantization config JSON for vLLM weight export
+  quantization_config_path: null

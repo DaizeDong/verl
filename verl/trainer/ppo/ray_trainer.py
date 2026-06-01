@@ -40,6 +40,7 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
+from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
@@ -50,7 +51,14 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
-from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
+from verl.trainer.ppo.utils import (
+    Role,
+    WorkerType,
+    need_critic,
+    need_reference_policy,
+    need_reward_model,
+    need_teacher_policy,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
@@ -62,7 +70,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
-from verl.workers.config import FSDPEngineConfig
+from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
@@ -211,6 +219,8 @@ def compute_advantage(
                 "Please set actor.calculate_sum_pi_squared=True in config."
             )
             adv_kwargs["sum_pi_squared"] = data.batch["sum_pi_squared"]
+            # old_log_probs needed for path-variance proxy: w_t = 1 - 2*exp(old_log_probs) + sum_pi_squared
+            adv_kwargs["old_log_probs"] = data.batch["old_log_probs"]
             # Get pre-computed rollout IS weights if available
             rollout_is_weights = data.batch.get("rollout_is_weights", None)
             adv_kwargs["rollout_is_weights"] = rollout_is_weights
@@ -280,6 +290,7 @@ class RayPPOTrainer:
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.config)
+        self.use_teacher_policy = need_teacher_policy(self.config)
 
         self.use_rm = need_reward_model(self.config)
 
@@ -411,8 +422,23 @@ class RayPPOTrainer:
 
         lines = []
         for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            entry = {}
+            for k, v in base_data.items():
+                if isinstance(v[i], np.bool_):
+                    entry[k] = bool(v[i])
+                elif isinstance(v[i], (np.str_)):
+                    entry[k] = str(v[i])
+                elif isinstance(v[i], (np.integer)):
+                    entry[k] = int(v[i])
+                elif isinstance(v[i], (np.floating)):
+                    entry[k] = float(v[i])
+                else:
+                    entry[k] = v[i]
+            try:
+                lines.append(json.dumps(entry, ensure_ascii=False))
+            except Exception as e:
+                print(f"Warning: Could not serialize entry {i} due to error: {e}. (entry: {entry})")
+                lines.append("{}")
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")
@@ -498,6 +524,17 @@ class RayPPOTrainer:
         assert self.reward_loop_manager is not None, "RewardLoopManager is None"
         batch_reward = self.reward_loop_manager.compute_rm_score(batch)
         return batch_reward
+
+    def _should_compute_teacher_colocate(self, batch: DataProto) -> bool:
+        return self.use_teacher_policy and not self.distillation_config.teacher_model.enable_resource_pool
+
+    def _compute_teacher_colocate(self, batch: DataProto) -> DataProto:
+        """Compute teacher logprobs after rollout when teacher and student are colocated."""
+        assert self.teacher_model_manager is not None, "TeacherModelManager is None"
+        teacher_batch = self.teacher_model_manager.compute_logprobs(batch)
+        if "teacher_multi_modal_data" in batch.non_tensor_batch:
+            batch.pop(non_tensor_batch_keys=["teacher_multi_modal_data"])
+        return teacher_batch
 
     def _validate(self, merged: bool = False):
         data_source_lst = []
@@ -693,6 +730,7 @@ class RayPPOTrainer:
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[actor_role],
                 config=self.config.actor_rollout_ref,
+                distillation_config=self.config.get("distillation"),
                 role=str(actor_role),
             )
             self.resource_pool_to_cls[actor_rollout_resource_pool][str(actor_role)] = actor_rollout_cls
@@ -712,16 +750,13 @@ class RayPPOTrainer:
                 from verl.workers.engine_workers import TrainingWorkerConfig
 
                 orig_critic_cfg = critic_cfg
-                if orig_critic_cfg.strategy == "fsdp":
-                    engine_config: FSDPEngineConfig = orig_critic_cfg.model.fsdp_config
-                    engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
-                    engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
-                else:
-                    raise NotImplementedError(f"Unknown strategy {orig_critic_cfg.strategy=}")
+                engine_config: EngineConfig = orig_critic_cfg.engine
+                engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
+                engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
 
                 critic_cfg = TrainingWorkerConfig(
                     model_type="value_model",
-                    model_config=orig_critic_cfg.model_config,
+                    model_config=orig_critic_cfg.model,
                     engine_config=engine_config,
                     optimizer_config=orig_critic_cfg.optim,
                     checkpoint_config=orig_critic_cfg.checkpoint,
@@ -820,6 +855,20 @@ class RayPPOTrainer:
         # Note: mode is always "async" since sync mode is deprecated
         self.async_rollout_mode = True
 
+        # initialize teacher loop manager
+        if self.use_teacher_policy:
+            from verl.experimental.teacher_loop import TeacherModelManager
+
+            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+            self.teacher_model_manager = TeacherModelManager(
+                config=self.config.distillation,
+                resource_pool=teacher_resource_pool,
+            )
+            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+        else:
+            self.teacher_model_manager = None
+            self.distillation_config = None
+
         # Support custom AgentLoopManager via config
         manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
         if manager_class_fqn:
@@ -834,12 +883,15 @@ class RayPPOTrainer:
 
         # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
         # to stream reward computation with actor rollout
+        # To stream teacher computation with actor rollout, we instead pass the full manager so that the
+        # teacher loop workers can sleep/wake together with rollout workers
         reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
         self.async_rollout_manager = AgentLoopManager.create(
             config=self.config,
             worker_group=self.actor_rollout_wg,
             rollout_resource_pool=actor_rollout_resource_pool,
             reward_loop_worker_handles=reward_loop_worker_handles,
+            teacher_model_manager=self.teacher_model_manager,
         )
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
         self.checkpoint_manager = CheckpointEngineManager(
@@ -972,8 +1024,18 @@ class RayPPOTrainer:
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
+            steps_per_epoch = len(self.train_dataloader)
+            at_epoch_boundary = steps_per_epoch > 0 and self.global_steps % steps_per_epoch == 0
+            if at_epoch_boundary:
+                print(
+                    f"Skipping dataloader state restore: global_steps={self.global_steps} "
+                    f"is at an epoch boundary (steps_per_epoch={steps_per_epoch}). "
+                    f"The saved state marks the dataloader as exhausted. "
+                    f"Next epoch will iterate from scratch."
+                )
+            else:
+                dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+                self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
@@ -1129,7 +1191,7 @@ class RayPPOTrainer:
 
         return ref_log_prob
 
-    def _compute_old_log_prob(self, batch: DataProto):
+    def _compute_old_log_prob(self, batch: DataProto, global_step: int | None = None):
         if self.use_legacy_worker_impl == "disable":
             # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
             # step 1: convert dataproto to tensordict.
@@ -1143,6 +1205,7 @@ class RayPPOTrainer:
             entropy = tu.get(output, "entropy")
             log_probs = tu.get(output, "log_probs")
             routed_experts = tu.get(output, "routed_experts")
+
             old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
             # step 4. No padding to padding
             entropy = no_padding_2_padding(entropy, batch_td)
@@ -1156,11 +1219,11 @@ class RayPPOTrainer:
                 old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
             old_log_prob = DataProto.from_tensordict(old_log_prob)
         else:
-            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch, global_step=global_step)
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
 
-    def _update_actor(self, batch: DataProto) -> DataProto:
+    def _update_actor(self, batch: DataProto, global_step: int | None = None) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
@@ -1171,6 +1234,11 @@ class RayPPOTrainer:
             # step 2: convert from padding to no-padding
             batch_td = left_right_2_no_padding(batch_td)
             calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+            distillation_use_topk = (
+                self.distillation_config.distillation_loss.loss_settings.use_topk
+                if is_distillation_enabled(self.config.get("distillation"))
+                else False
+            )
             ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
             ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
             ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
@@ -1179,13 +1247,14 @@ class RayPPOTrainer:
             tu.assign_non_tensor(
                 batch_td,
                 calculate_entropy=calculate_entropy,
+                distillation_use_topk=distillation_use_topk,
                 global_batch_size=ppo_mini_batch_size,
                 mini_batch_size=ppo_mini_batch_size,
                 epochs=ppo_epochs,
                 seed=seed,
                 dataloader_kwargs={"shuffle": shuffle},
+                compute_loss=True,
             )
-
             actor_output = self.actor_rollout_wg.update_actor(batch_td)
             actor_output = tu.get(actor_output, "metrics")
             actor_output = rename_dict(actor_output, "actor/")
@@ -1193,7 +1262,7 @@ class RayPPOTrainer:
             actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
             actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
         else:
-            actor_output = self.actor_rollout_wg.update_actor(batch)
+            actor_output = self.actor_rollout_wg.update_actor(batch, global_step=global_step)
 
         return actor_output
 
@@ -1263,9 +1332,20 @@ class RayPPOTrainer:
             if self.config.trainer.get("val_only", False):
                 return
 
-        if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
-            rollout_skip = RolloutSkip(self.config, self.async_rollout_manager)
-            rollout_skip.wrap_generate_sequences()
+        if self.config.actor_rollout_ref.rollout.skip.get("enable", False):
+            # Skip rollout cache is unsafe after resume: cached rollouts were captured
+            # under whatever code path was live at dump time, so any post-resume change
+            # that affects rollout outputs (e.g. fixed actor->rollout weight sync) won't
+            # be reflected. Re-run the rollout in that case.
+            if self.global_steps > 0:
+                pprint(
+                    f"[RolloutSkip()] resume detected (global_steps={self.global_steps}); "
+                    f"skipping rollout-cache wrap and running real rollouts"
+                )
+            else:
+                rollout_skip = RolloutSkip(self.config, self.async_rollout_manager)
+                if rollout_skip.is_enable:
+                    rollout_skip.wrap_generate_sequences()
 
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
@@ -1357,6 +1437,10 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+                    if self._should_compute_teacher_colocate(batch):
+                        with marked_timer("teacher", timing_raw, color="cyan"):
+                            batch_teacher = self._compute_teacher_colocate(batch)
+                            batch = batch.union(batch_teacher)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1376,6 +1460,13 @@ class RayPPOTrainer:
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
+
+                    # Inject global_token_ids if logits saving is enabled (check config, not runtime state)
+                    if self.config.actor_rollout_ref.actor.router_replay.record_file not in [None, ""]:
+                        batch_size, seq_len = batch.batch["attention_mask"].shape
+                        batch.batch["global_token_ids"] = torch.arange(
+                            batch_size * seq_len, device=batch.batch["attention_mask"].device
+                        ).reshape(batch_size, seq_len)
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -1401,7 +1492,9 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(
+                                batch, global_step=self.global_steps
+                            )
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
@@ -1501,39 +1594,17 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
+                    if self.config.trainer.critic_warmup > self.global_steps:
+                        # Still in critic warmup, only update weights to wake up rollout replicas.
+                        self.checkpoint_manager.update_weights(self.global_steps)
+                    else:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            actor_output = self._update_actor(batch)
-
-                        # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
-                        esi_close_to_expiration = should_save_ckpt_esi(
-                            max_steps_duration=self.max_steps_duration,
-                            redundant_time=self.config.trainer.esi_redundant_time,
-                        )
-                        # Check if the conditions for saving a checkpoint are met.
-                        # The conditions include a mandatory condition (1) and
-                        # one of the following optional conditions (2/3/4):
-                        # 1. The save frequency is set to a positive value.
-                        # 2. It's the last training step.
-                        # 3. The current step number is a multiple of the save frequency.
-                        # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
-                        if self.config.trainer.save_freq > 0 and (
-                            is_last_step
-                            or self.global_steps % self.config.trainer.save_freq == 0
-                            or esi_close_to_expiration
-                        ):
-                            if esi_close_to_expiration:
-                                print("Force saving checkpoint: ESI instance expiration approaching.")
-                            with marked_timer("save_checkpoint", timing_raw, color="green"):
-                                self._save_checkpoint()
-
-                        # update weights from trainer to rollout
-                        with marked_timer("update_weights", timing_raw, color="red"):
-                            self.checkpoint_manager.update_weights(self.global_steps)
-
+                            actor_output = self._update_actor(batch, global_step=self.global_steps)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        with marked_timer("update_weights", timing_raw, color="red"):
+                            self.checkpoint_manager.update_weights(self.global_steps)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
@@ -1550,6 +1621,89 @@ class RayPPOTrainer:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
 
+                # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
+                esi_close_to_expiration = should_save_ckpt_esi(
+                    max_steps_duration=self.max_steps_duration,
+                    redundant_time=self.config.trainer.esi_redundant_time,
+                )
+                # Check if the conditions for saving a checkpoint are met.
+                # The conditions include a mandatory condition (1) and
+                # one of the following optional conditions (2/3/4):
+                # 1. The save frequency is set to a positive value.
+                # 2. It's the last training step.
+                # 3. The current step number is a multiple of the save frequency.
+                # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
+                if self.config.trainer.save_freq > 0 and (
+                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
+                ):
+                    if esi_close_to_expiration:
+                        print("Force saving checkpoint: ESI instance expiration approaching.")
+                    
+                    # CRITICAL: Aggressive memory cleanup BEFORE checkpoint save
+                    # Problem: CPU memory exhaustion (Ray spilled 240GB) caused by:
+                    # - batch.non_tensor_batch containing old_inputs/old_logits (~16GB per process)
+                    # - actor_output, critic_output (~2-5GB)
+                    # - Intermediate tensors (reward_tensor, etc.)
+                    # When checkpoint generates state_dict, total memory exceeds limit → OOM
+                    print(f"[Memory] Pre-checkpoint cleanup: releasing batch data and intermediate results...")
+                    
+                    # Clear large data from batch.non_tensor_batch (but keep batch object itself)
+                    # batch is still needed after checkpoint save for metrics computation (Line 1387-1396)
+                    if 'batch' in locals():
+                        # Explicitly clear non_tensor_batch containing old_inputs/old_logits
+                        # This is the primary memory hog (~16GB per process, 512GB total across 32 processes)
+                        if hasattr(batch, 'non_tensor_batch') and batch.non_tensor_batch is not None:
+                            batch.non_tensor_batch.clear()
+                        # DO NOT delete batch itself - it's needed for metrics after checkpoint save
+                    
+                    # Delete intermediate outputs from actor/critic updates
+                    if 'actor_output' in locals():
+                        del actor_output
+                    if 'critic_output' in locals():
+                        del critic_output
+                    
+                    # Delete intermediate computation results
+                    if 'old_log_prob' in locals():
+                        del old_log_prob
+                    if 'reward_tensor' in locals():
+                        del reward_tensor
+                    if 'gen_batch_output' in locals():
+                        del gen_batch_output
+                    if 'ref_log_prob' in locals():
+                        del ref_log_prob
+                    if 'values' in locals():
+                        del values
+                    if 'gen_batch' in locals():
+                        del gen_batch
+                    
+                    # Force garbage collection to release memory immediately
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
+                    print(f"[Memory] Pre-checkpoint cleanup completed, proceeding with checkpoint save...")
+
+                    # update_weights() wakes rollout weights/kv cache back onto the shared GPUs.
+                    # Sleep replicas again before checkpoint save so Megatron can restore actor
+                    # parameters without competing with the rollout engine for memory.
+                    self.checkpoint_manager.sleep_replicas()
+                    
+                    with marked_timer("save_checkpoint", timing_raw, color="green"):
+                        self._save_checkpoint()
+
+                        # Checkpoint creates large state dicts and mbridge copies that must be freed
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        print(f"[Memory] After checkpoint save and cleanup: CPU memory usage may have temporarily increased")
+
+                    # HYBRID rollout has no direct wake_up path; re-run update_weights to
+                    # restore rollout memory for the next generation step after checkpointing.
+                    if not is_last_step:
+                        with marked_timer("post_ckpt_update_weights", timing_raw, color="green"):
+                            self.checkpoint_manager.update_weights(self.global_steps)
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (
                         self.global_steps + 1 in self.config.global_profiler.steps

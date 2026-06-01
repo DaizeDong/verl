@@ -16,12 +16,25 @@
 Router Replay Utilities
 Utilities for handling router replay functionality in Megatron models.
 """
+import os
+import json
+import socket
+import zlib
 
+import logging
+import numpy as np
 import inspect
 import warnings
 from typing import Optional
 
 import torch
+
+from verl.utils.memory_utils import get_system_memory_info
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 try:
     from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
@@ -37,14 +50,236 @@ from megatron.core.transformer.transformer_layer import get_transformer_layer_of
 
 from verl.models.mcore.util import (
     postprocess_packed_seqs,
-    postprocess_thd_no_padding,
+    postprocess_thd_engine,
     preprocess_packed_seqs,
-    preprocess_thd_no_padding,
+    preprocess_thd_engine,
 )
 from verl.utils.device import get_device_name
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction
 
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
 device_name = get_device_name()
+
+
+def _debug_r3_trace_enabled() -> bool:
+    return os.getenv("VERL_DEBUG_R3_TRACE", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_r3_trace_save_dir() -> Optional[str]:
+    value = os.getenv("VERL_DEBUG_R3_TRACE_SAVE_DIR", "").strip()
+    return value or None
+
+
+def _checksum_value(value) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu().contiguous()
+        # numpy can't represent bf16 or fp8 — widen to fp32 for the CRC hash.
+        if tensor.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
+            tensor = tensor.to(torch.float32)
+        array = tensor.numpy()
+    else:
+        array = np.ascontiguousarray(np.asarray(value))
+        if str(array.dtype) == "bfloat16":
+            array = array.astype(np.float32, copy=False)
+    return f"{zlib.crc32(array.tobytes()) & 0xFFFFFFFF:08x}"
+
+
+def _summary_value(value) -> Optional[dict]:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        array = value.detach().cpu().contiguous()
+        shape = list(array.shape)
+        dtype = str(array.dtype)
+    else:
+        array = np.asarray(value)
+        shape = list(array.shape)
+        dtype = str(array.dtype)
+    return {
+        "shape": shape,
+        "dtype": dtype,
+        "checksum": _checksum_value(array),
+    }
+
+
+def _append_r3_trace(source: str, payload: dict) -> None:
+    if not _debug_r3_trace_enabled():
+        return
+    if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    message = json.dumps({"source": source, **payload}, sort_keys=True)
+    logger.warning("[R3Trace] %s", message)
+    save_dir = _debug_r3_trace_save_dir()
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        trace_path = os.path.join(save_dir, f"trace-{socket.gethostname()}-{os.getpid()}.jsonl")
+        with open(trace_path, "a", encoding="utf-8") as f:
+            f.write(message + "\n")
+
+
+def _save_r3_trace_pt(filename: str, payload: dict) -> None:
+    save_dir = _debug_r3_trace_save_dir()
+    if not _debug_r3_trace_enabled() or not save_dir:
+        return
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(payload, os.path.join(save_dir, filename))
+
+
+def _get_system_memory_info():
+    """Get system memory information (total and available) in GB."""
+    if psutil is None:
+        return "N/A (psutil not available)"
+    try:
+        mem = psutil.virtual_memory()
+        total_gb = mem.total / (1024 ** 3)
+        available_gb = mem.available / (1024 ** 3)
+        used_gb = mem.used / (1024 ** 3)
+        return f"System: {used_gb:.2f}GB/{total_gb:.2f}GB used, {available_gb:.2f}GB available"
+    except Exception as e:
+        return f"N/A (error: {e})"
+
+
+_STORAGE_DTYPE_MAP = {
+    'fp32': torch.float32,
+    'bf16': torch.bfloat16,
+    'fp16': torch.float16,
+    'fp8': torch.float8_e4m3fn,  # 1 byte/element; upcasted to compute dtype in set_router_predictive_data
+}
+
+
+_TORCH_TO_NUMPY_TRANSPORT_VIEW = {
+    # bf16 and fp16 aren't natively representable in numpy, but they're 2 bytes wide
+    # and we just need to ship the raw bits across the Ray plasma boundary.  Viewing
+    # them as uint16 / int16 lets numpy carry them as-is (no fp32 widening), halving
+    # the bytes serialized for these dtypes.  Re-view back to the original dtype on
+    # the receiver with the symmetric `_transport_numpy_to_tensor` helper.
+    # fp8 storage dtypes are 1 byte wide; view as uint8 (numpy has no fp8 dtype, so
+    # without this entry the fast path falls through to `t.numpy()` and raises).
+    torch.bfloat16: torch.uint16,
+    torch.float16: torch.int16,
+    torch.float8_e4m3fn: torch.uint8,
+    torch.float8_e5m2: torch.uint8,
+}
+
+
+def _transport_view_dtype_disabled() -> bool:
+    """If set, fall back to the legacy `.float().numpy()` widening on the sender
+    and plain `torch.from_numpy` on the receiver.  Used for A/B testing."""
+    return os.getenv("VERL_DISABLE_TRANSPORT_VIEW_DTYPE", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _tensor_to_transport_numpy(t: torch.Tensor) -> np.ndarray:
+    """Convert a CPU torch tensor to a numpy array suitable for Ray plasma transport
+    WITHOUT widening to fp32.  For bf16/fp16, the result is a uint16/int16 view of
+    the raw bits — receiver must call `_transport_numpy_to_tensor` with the original
+    dtype to restore the tensor."""
+    t = t.contiguous()
+    if _transport_view_dtype_disabled():
+        # Legacy: bf16/fp16 widen to fp32 before numpy (doubles transport bytes for bf16).
+        if t.dtype in _TORCH_TO_NUMPY_TRANSPORT_VIEW:
+            return t.float().numpy()
+        return t.numpy()
+    view_dtype = _TORCH_TO_NUMPY_TRANSPORT_VIEW.get(t.dtype)
+    if view_dtype is not None:
+        return t.view(view_dtype).numpy()
+    return t.numpy()
+
+
+def _transport_numpy_to_tensor(arr: np.ndarray, target_dtype: torch.dtype) -> torch.Tensor:
+    """Reverse of `_tensor_to_transport_numpy`.  Reinterprets the uint16/int16 view
+    used during transport back to the original torch dtype (zero-copy view)."""
+    t = torch.from_numpy(arr.copy())
+    # Sender may have widened to fp32 (legacy path / fp8) — convert back if needed.
+    # Note: from_numpy of an fp32 array gives torch.float32; converting to bf16 is a
+    # real cast (lossy), which mirrors the legacy round-trip exactly.
+    if t.dtype != target_dtype:
+        view_dtype = _TORCH_TO_NUMPY_TRANSPORT_VIEW.get(target_dtype)
+        if view_dtype is not None and t.dtype == view_dtype:
+            return t.view(target_dtype)
+        return t.to(target_dtype)
+    return t
+
+
+def _to_numpy_array(value, *, dtype=None):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu().contiguous()
+        unsupported_numpy_dtypes = {torch.bfloat16}
+        for dtype_name in ("float8_e4m3fn", "float8_e5m2"):
+            if hasattr(torch, dtype_name):
+                unsupported_numpy_dtypes.add(getattr(torch, dtype_name))
+        if tensor.dtype in unsupported_numpy_dtypes:
+            tensor = tensor.to(torch.float32)
+        array = tensor.numpy()
+        if dtype is not None and array.dtype != dtype:
+            return array.astype(dtype, copy=False)
+        return array
+    if isinstance(value, np.ndarray):
+        if dtype is not None and value.dtype != dtype:
+            return value.astype(dtype, copy=False)
+        return value
+    if isinstance(value, list):
+        return np.asarray(value, dtype=dtype)
+    return np.asarray(value, dtype=dtype)
+
+
+def build_predictive_valid_mask(
+    attention_mask: torch.Tensor,
+    valid_indices: list[int],
+    old_lengths: list[int],
+    old_token_positions_list: Optional[list[torch.Tensor]] = None,
+) -> tuple[torch.Tensor, list[int]]:
+    """Build a packed-token valid mask for predictive replay.
+
+    Args:
+        attention_mask: [batch_size, seq_len] boolean/integer mask for current training batch.
+        valid_indices: batch indices for samples with predictive data.
+        old_lengths: token count for each valid sample.
+        old_token_positions_list: optional 1D local token positions for each valid sample.
+
+    Returns:
+        valid_mask: 1D bool tensor over packed valid tokens.
+        selected_current_lens: selected current-token count per valid sample.
+    """
+    seq_lens = attention_mask.sum(dim=1, dtype=torch.int32)
+    cumsum_lens = torch.cumsum(seq_lens, dim=0)
+    total_valid_tokens = int(cumsum_lens[-1].item()) if cumsum_lens.numel() > 0 else 0
+    valid_mask = torch.zeros(total_valid_tokens, dtype=torch.bool, device=attention_mask.device)
+    if not valid_indices:
+        return valid_mask, []
+
+    start_indices = torch.cat(
+        [
+            torch.tensor([0], device=attention_mask.device, dtype=torch.long),
+            cumsum_lens[:-1],
+        ]
+    )
+
+    selected_current_lens = []
+    for list_idx, batch_idx in enumerate(valid_indices):
+        sample_start = int(start_indices[batch_idx].item())
+        sample_seq_len = int(seq_lens[batch_idx].item())
+        old_len = int(old_lengths[list_idx])
+
+        if old_token_positions_list is None:
+            current_len = min(old_len, sample_seq_len)
+            if current_len > 0:
+                valid_mask[sample_start : sample_start + current_len] = True
+            selected_current_lens.append(current_len)
+            continue
+
+        token_positions = old_token_positions_list[list_idx].to(device=attention_mask.device, dtype=torch.long)
+        current_len = int(token_positions.numel())
+        if current_len > 0:
+            valid_mask[sample_start + token_positions] = True
+        selected_current_lens.append(current_len)
+
+    return valid_mask, selected_current_lens
 
 
 # from megatron.core.transformer.transformer_block import get_num_layers_to_build
@@ -215,8 +450,15 @@ def get_moe_num_layers_to_build(
 
     return num_moe_layers
 
-
-def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_list, tf_config, vp_rank=None):
+@torch.no_grad()
+def merge_router_topk_indices(
+    attention_mask,
+    input_ids,
+    mini_layer_topk_idx_list,
+    tf_config,
+    vp_rank=None,
+    packed_seq_params=None,
+):
     """
     Merge recorded router top-k indices across sequence-parallel ranks for all router instances,
     then pack/unpack them to align with the original (batch, seq_len) layout and append the result.
@@ -236,36 +478,51 @@ def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_lis
         None: The function has side effects only; it appends a tensor of shape
         [1, dynamic_bs_all, layer_num, topk] to mini_layer_topk_idx_list.
     """
-    with torch.no_grad():
-        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
-        layers_topk_idx = []
-        for router in router_instances_list:
-            layers_topk_idx.append(router.recorded_topk_idx.to(torch.uint8))  # dynamic_bs, topk
+    print(f"Packing router top-k indices for vp_rank={vp_rank}")
+    router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+    layers_topk_idx = []
+    for router in router_instances_list:
+        layers_topk_idx.append(router.recorded_topk_idx.to(torch.uint8))  # dynamic_bs, topk
 
-        # layer_num, dynamic_bs, topk  -> dynamic_bs, layer_num, topk
-        layers_topk_idx = torch.stack(layers_topk_idx).permute(1, 0, 2).to(device_name)
-        # dynamic_bs, layer_num, topk -> 1, dynamic_bs_all, layer_num, topk
-        layers_topk_idx = (
-            gather_from_sequence_parallel_region(layers_topk_idx, tensor_parallel_output_grad=False)
-            .unsqueeze(0)
-            .contiguous()
+    # layer_num, dynamic_bs, topk  -> dynamic_bs, layer_num, topk
+    # print(f"Shape of layers_topk_idx before gather: {layers_topk_idx[0].shape}, total layers: {len(layers_topk_idx)}")
+    layers_topk_idx = torch.stack(layers_topk_idx).permute(1, 0, 2).to(device_name)
+    # dynamic_bs, layer_num, topk -> 1, dynamic_bs_all, layer_num, topk
+    layers_topk_idx = (
+        gather_from_sequence_parallel_region(layers_topk_idx, tensor_parallel_output_grad=False)
+        .unsqueeze(0)
+        .contiguous()
+    )
+    # print(f"Shape of layers_topk_idx after gather: {layers_topk_idx.shape}")
+
+    if getattr(input_ids, "is_nested", False):
+        batch_size = input_ids.shape[0]
+        if packed_seq_params is None:
+            _, packed_seq_params, _ = preprocess_thd_engine(input_ids, pre_process=True)
+        layers_topk_idx = postprocess_thd_engine(
+            layers_topk_idx, packed_seq_params, input_ids, batch_size, post_process=True
+        )
+    else:
+        batch_size, seq_len = attention_mask.shape[:2]
+        if packed_seq_params is None:
+            _, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=True)
+        layers_topk_idx = postprocess_packed_seqs(
+            layers_topk_idx, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True
         )
 
-        if input_ids.is_nested:
-            batch_size = input_ids.shape[0]
-            _, packed_seq_params = preprocess_thd_no_padding(input_ids, pre_process=True)
-            layers_topk_idx = postprocess_thd_no_padding(
-                layers_topk_idx, packed_seq_params, input_ids, batch_size, post_process=True
-            )
-        else:
-            batch_size, seq_len = attention_mask.shape[:2]
-            _, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=True)
-            layers_topk_idx = postprocess_packed_seqs(
-                layers_topk_idx, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True
-            )
-        mini_layer_topk_idx_list.append(layers_topk_idx.cpu())
+    mini_layer_topk_idx_list.append(layers_topk_idx.cpu())
+
+    del layers_topk_idx
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    for router in router_instances_list:
+        router.recorded_topk_idx = None
+
+    return packed_seq_params
 
 
+@torch.no_grad()
 def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=None):
     """
     Scatter the packed router top-k indices back to sequence-parallel ranks and update each local
@@ -285,45 +542,904 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
     Returns:
         None: The function updates internal RouterReplay instances in-place.
     """
-    with torch.no_grad():
-        if layers_topk_idx.is_nested:
-            layers_topk_idx_rmpad, _, _ = preprocess_thd_no_padding(layers_topk_idx, pre_process=True)
+    if getattr(layers_topk_idx, "is_nested", False):
+        layers_topk_idx_rmpad, _, _ = preprocess_thd_engine(layers_topk_idx, pre_process=True)
+    else:
+        layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
+    layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()  # 1, dynamic_bs_all, layer_num, topk
+
+    # 1, dynamic_bs_split, layer_num, topk
+    layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
+        layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
+    ).unsqueeze(dim=0)
+
+    # dynamic_bs_split, layer_num, topk -> layer_num, dynamic_bs_split, topk
+    layers_topk_idx_reshape = layers_topk_idx_rmpad_split.permute(0, 2, 1, 3).squeeze(
+        dim=0
+    )  # layer_num, dynamic_bs_all, topk
+
+    local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
+    offset, end = local_rank_info["start"], local_rank_info["end"]
+    router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+
+    index_by_layer = len(layers_topk_idx_reshape) == tf_config.num_layers
+    moe_idx = sum(1 for i in range(offset) if is_moe_layer(tf_config, i))
+
+    router_offset = 0
+    for layer_idx in range(offset, end):
+        if not is_moe_layer(tf_config, layer_idx):
+            continue
+        router = router_instances_list[router_offset]
+        idx = layer_idx if index_by_layer else moe_idx
+        router.set_target_indices(layers_topk_idx_reshape[idx].to(torch.int64))
+        router_offset += 1
+        moe_idx += 1
+
+
+@torch.no_grad()
+def merge_router_predictive_data(
+    attention_mask,
+    input_ids,
+    mini_layer_old_inputs_list,
+    mini_layer_old_logits_list,
+    mini_layer_old_token_positions_list,
+    mini_layer_sampled_masks_list,
+    tf_config,
+    vp_rank=None,
+    packed_seq_params=None,
+    downsample_batch_size=None,
+    predictive_tokens_per_seq=None,
+    inputs_storage_dtype='bf16',
+    logits_storage_dtype='fp32',
+):
+    # TODO: check implementation correctness
+    """
+    Args:
+        downsample_batch_size: Number of sequences to keep per micro-batch. Keeps the first N sequences.
+            Set to None to keep all sequences (no downsampling).
+        inputs_storage_dtype: Storage dtype for hidden states (old_inputs): 'fp32', 'bf16', 'fp16', 'fp8'.
+            'fp8' uses torch.float8_e4m3fn (1 byte/element, 4x smaller than fp32). Tensors are
+            automatically upcasted to the model's compute dtype in set_router_predictive_data.
+        logits_storage_dtype: Storage dtype for router logits (old_logits): 'fp32', 'bf16', 'fp16', 'fp8'.
+        predictive_tokens_per_seq: Number of tokens to uniformly subsample from each sequence.
+            Uses evenly-spaced linspace indices. Set to None to keep all tokens.
+        mini_layer_old_token_positions_list: output list aligned with old_inputs/old_logits after
+            token and sequence downsampling.
+    
+    Returns:
+        sampled_indices: Tensor of sampled batch indices (0 to downsample_batch_size-1, or 0 to batch_size-1 if no downsampling).
+    """
+    # CRITICAL: Force synchronization and cleanup to prevent resource accumulation and async operation backlog
+    # print(f"[Predictive Routing Replay] [Debug] Synchronizing CUDA before merge...")
+    # torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    # gpu_allocated_before = torch.cuda.memory_allocated() / (1024**3)
+    # print(f"[Predictive Routing Replay] [Debug] GPU Memory before merge: {gpu_allocated_before:.2f}GB")
+    
+    print(f"Merging router predictive data...")
+    print(f"Packing router old_inputs & old_logits for vp_rank={vp_rank}, downsample_batch_size={downsample_batch_size}, inputs_storage_dtype={inputs_storage_dtype}, logits_storage_dtype={logits_storage_dtype}")
+    router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+    layers_old_inputs = []
+    layers_old_logits = []
+    for router in router_instances_list:
+        layers_old_inputs.append(router.recorded_old_inputs)  # dynamic_bs, hidden_size
+        layers_old_logits.append(router.recorded_old_logits)  # dynamic_bs, num_experts
+
+    # layer_num, dynamic_bs, hidden_size  -> dynamic_bs, layer_num, hidden_size
+    # layer_num, dynamic_bs, num_experts  -> dynamic_bs, layer_num, num_experts
+    # print(f"[Predictive Routing Replay] [Debug] Shape of layers_old_inputs before gather: {layers_old_inputs[0].shape}, sum: {layers_old_inputs[0].sum()}, total layers: {len(layers_old_inputs)}")
+    # print(f"[Predictive Routing Replay] [Debug] Shape of layers_old_logits before gather: {layers_old_logits[0].shape}, sum: {layers_old_logits[0].sum()}, total layers: {len(layers_old_logits)}")
+    
+    # CHECKPOINT 1: Before torch.stack
+    # print(f"[Predictive Routing Replay] [Debug] CHECKPOINT 1: Before torch.stack, device={device_name}")
+    # torch.cuda.synchronize()
+    
+    layers_old_inputs = torch.stack(layers_old_inputs)
+    # print(f"[Predictive Routing Replay] [Debug] CHECKPOINT 2: After stack inputs, shape={layers_old_inputs.shape}")
+    
+    layers_old_inputs = layers_old_inputs.permute(1, 0, 2)
+    # print(f"[Predictive Routing Replay] [Debug] CHECKPOINT 3: After permute inputs")
+    
+    layers_old_inputs = layers_old_inputs.to(device_name)
+    # print(f"[Predictive Routing Replay] [Debug] CHECKPOINT 4: After to(device) inputs, GPU={torch.cuda.memory_allocated()/(1024**3):.2f}GB")
+    
+    layers_old_logits = torch.stack(layers_old_logits).permute(1, 0, 2).to(device_name)
+    # print(f"[Predictive Routing Replay] [Debug] CHECKPOINT 5: After processing logits, GPU={torch.cuda.memory_allocated()/(1024**3):.2f}GB")
+
+    # Save original shapes before concat
+    hidden_size = layers_old_inputs.shape[-1]
+    num_experts = layers_old_logits.shape[-1]
+
+    # CHECKPOINT 6: Before torch.cat
+    # print(f"[Predictive Routing Replay] [Debug] CHECKPOINT 6: Before torch.cat, inputs={layers_old_inputs.shape}, logits={layers_old_logits.shape}")
+    
+    # dynamic_bs, layer_num, hidden_size -> 1, dynamic_bs_all, layer_num, hidden_size
+    # dynamic_bs, layer_num, num_experts -> 1, dynamic_bs_all, layer_num, num_experts
+    layers_merged_tensor = torch.cat([layers_old_inputs, layers_old_logits], dim=-1)
+    # print(f"[Predictive Routing Replay] [Debug] CHECKPOINT 7: After torch.cat, merged shape={layers_merged_tensor.shape}")
+    
+    # CHECKPOINT 8: Before gather (collective communication - all processes must reach here)
+    torch.cuda.synchronize()
+    # print(f"[Predictive Routing Replay] [Debug] CHECKPOINT 8: Before gather_from_sequence_parallel_region (ALL PROCESSES MUST BE HERE)")
+    
+    layers_merged_tensor = (
+        gather_from_sequence_parallel_region(layers_merged_tensor, tensor_parallel_output_grad=False)
+        .unsqueeze(0)
+        .contiguous()
+    )
+    
+    # CHECKPOINT 9: After gather
+    # torch.cuda.synchronize()
+    # print(f"[Predictive Routing Replay] [Debug] CHECKPOINT 9: After gather, shape={layers_merged_tensor.shape}, GPU={torch.cuda.memory_allocated()/(1024**3):.2f}GB")
+    
+    layers_old_inputs, layers_old_logits = torch.split(layers_merged_tensor, [hidden_size, num_experts], dim=-1)
+    # print(f"[Predictive Routing Replay] [Debug] Shape of layers_old_inputs after gather: {layers_old_inputs.shape}, sum: {layers_old_inputs.sum()}")
+    # print(f"[Predictive Routing Replay] [Debug] Shape of layers_old_logits after gather: {layers_old_logits.shape}, sum: {layers_old_logits.sum()}")
+
+    # ===== NEW: Keep unpacked format, split by sample without padding =====
+    # Shape after gather: [1, total_valid_tokens, layers, hidden/experts]
+    # We want to split into list of [num_tokens_i, layers, hidden] per sample
+    
+    batch_size = attention_mask.shape[0]
+    if packed_seq_params is None:
+        _, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=True)
+    
+    # Get token ranges per sample from packed_seq_params
+    cu_seqlens = packed_seq_params.cu_seqlens_q_padded  # [bs+1]
+    seqlens = attention_mask.sum(dim=1, dtype=torch.int32)  # [bs] - valid tokens per sample
+    
+    # Split by sample into list (each with different num_tokens)
+    layers_old_inputs_list = []
+    layers_old_logits_list = []
+    layers_old_token_positions_list = []
+    total_tokens_before_split = 0
+
+    for i in range(batch_size):
+        start_idx = cu_seqlens[i].item()
+        num_tokens = seqlens[i].item()
+        end_idx = start_idx + num_tokens
+        sample_inputs = layers_old_inputs[0, start_idx:end_idx, :, :].cpu()
+        sample_logits = layers_old_logits[0, start_idx:end_idx, :, :].cpu()
+        layers_old_inputs_list.append(sample_inputs)
+        layers_old_logits_list.append(sample_logits)
+        layers_old_token_positions_list.append(torch.arange(num_tokens, dtype=torch.int32, device="cpu"))
+        total_tokens_before_split += num_tokens
+
+    # Uniform token subsampling per sequence (R2 path — mirrors R3 sglang-side subsampling)
+    if predictive_tokens_per_seq is not None:
+        for i in range(len(layers_old_inputs_list)):
+            n_tokens = layers_old_inputs_list[i].shape[0]
+            if n_tokens > predictive_tokens_per_seq:
+                idx = torch.round(torch.linspace(0, n_tokens - 1, predictive_tokens_per_seq)).long()
+                idx = idx.clamp(0, n_tokens - 1)
+                layers_old_inputs_list[i] = layers_old_inputs_list[i][idx]
+                layers_old_logits_list[i] = layers_old_logits_list[i][idx]
+                layers_old_token_positions_list[i] = layers_old_token_positions_list[i][idx]
+
+    # print(f"[Predictive Routing Replay] [Debug] Split into {len(layers_old_inputs_list)} samples without padding")
+    # print(f"[Predictive Routing Replay] [Debug] Sample shapes: first={layers_old_inputs_list[0].shape}")
+    # print(f"[Predictive Routing Replay] [Debug] Total tokens: {total_tokens_before_split}")
+    
+    # Memory usage debug info BEFORE downsampling
+    # inputs_size_mb = sum(t.numel() * t.element_size() for t in layers_old_inputs_list) / 1024 / 1024
+    # logits_size_mb = sum(t.numel() * t.element_size() for t in layers_old_logits_list) / 1024 / 1024
+    # print(f"[Predictive Routing Replay] [Memory] BEFORE downsample - total size: inputs {inputs_size_mb:.2f} MB, logits {logits_size_mb:.2f} MB, {_get_system_memory_info()}")
+
+    # Batch-level downsampling to reduce memory usage (by selecting first N samples)
+    bs = len(layers_old_inputs_list)
+    
+    if downsample_batch_size is not None and downsample_batch_size >= bs:
+        downsample_batch_size = None  # No downsampling needed
+
+    if downsample_batch_size is None:
+        # No downsampling needed - keep all batches
+        downsample_mask = torch.ones((bs,), dtype=torch.bool, device='cpu')
+        layers_old_inputs_sampled = layers_old_inputs_list
+        layers_old_logits_sampled = layers_old_logits_list
+        layers_old_token_positions_sampled = layers_old_token_positions_list
+        # print(f"[Predictive Routing Replay] [Downsample] No downsampling: batch_size ({bs}) <= downsample_batch_size ({downsample_batch_size})")
+    else:
+        # Length-aware sampling: filter by sequence length threshold to avoid OOM from long sequences
+        # Calculate sequence lengths (num_tokens per sample)
+        seq_lengths = torch.tensor([t.shape[0] for t in layers_old_inputs_list], dtype=torch.long)
+        
+        max_seq_len_threshold = float('inf')
+        
+        # Filter sequences by length threshold
+        valid_indices = (seq_lengths <= max_seq_len_threshold).nonzero(as_tuple=True)[0].tolist()
+        
+        if len(valid_indices) >= downsample_batch_size:
+            # Sufficient valid sequences: randomly sample from them
+            sampled_indices = torch.tensor(valid_indices)[torch.randperm(len(valid_indices))[:downsample_batch_size]].tolist()
+            sampled_indices.sort()
+            logger.info(f"[Predictive Routing Replay] Length-filtered sampling: selected {len(sampled_indices)} from {len(valid_indices)} valid sequences (threshold={max_seq_len_threshold}, filtered out {bs - len(valid_indices)} long sequences)")
         else:
-            layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
-        layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()  # 1, dynamic_bs_all, layer_num, topk
+            # Insufficient valid sequences: select shortest ones from all sequences
+            _, sorted_indices = torch.sort(seq_lengths)
+            sampled_indices = sorted_indices[:downsample_batch_size].tolist()
+            sampled_indices.sort()
+            selected_lengths = seq_lengths[sorted_indices[:downsample_batch_size]]
+            logger.info(f"[Predictive Routing Replay] Shortest-first sampling: selected {len(sampled_indices)} shortest sequences (lengths: min={selected_lengths.min().item()}, max={selected_lengths.max().item()}, mean={selected_lengths.float().mean().item():.1f})")
+        
+        downsample_mask = torch.zeros((bs,), dtype=torch.bool, device='cpu')
+        downsample_mask[sampled_indices] = True
+        layers_old_inputs_sampled = [layers_old_inputs_list[i] for i in sampled_indices]
+        layers_old_logits_sampled = [layers_old_logits_list[i] for i in sampled_indices]
+        layers_old_token_positions_sampled = [layers_old_token_positions_list[i] for i in sampled_indices]
 
-        # 1, dynamic_bs_split, layer_num, topk
-        layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
-            layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
-        ).unsqueeze(dim=0)
+        # inputs_size_mb_after = sum(t.numel() * t.element_size() for t in layers_old_inputs_sampled) / 1024 / 1024
+        # logits_size_mb_after = sum(t.numel() * t.element_size() for t in layers_old_logits_sampled) / 1024 / 1024
+        # print(f"[Predictive Routing Replay] [Downsample] Batch downsampling: kept first {downsample_batch_size}/{bs} sequences")
+        # print(f"[Predictive Routing Replay] [Memory] AFTER downsample - inputs: {inputs_size_mb_after:.2f} MB (saved {inputs_size_mb - inputs_size_mb_after:.2f} MB), logits: {logits_size_mb_after:.2f} MB, {_get_system_memory_info()}")
 
-        # dynamic_bs_split, layer_num, topk -> layer_num, dynamic_bs_split, topk
-        layers_topk_idx_reshape = layers_topk_idx_rmpad_split.permute(0, 2, 1, 3).squeeze(
-            dim=0
-        )  # layer_num, dynamic_bs_all, topk
-        local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
-        offset, end = local_rank_info["start"], local_rank_info["end"]
-        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+    # Lower precision storage to save memory (convert dtype per sample)
+    inputs_target_dtype = _STORAGE_DTYPE_MAP.get(inputs_storage_dtype, torch.bfloat16)
+    logits_target_dtype = _STORAGE_DTYPE_MAP.get(logits_storage_dtype, torch.float32)
 
-        # When dim-0 covers all layers (e.g. R3, or R2 with all-MoE models),
-        # index by absolute layer_idx; otherwise (R2 with mixed dense/MoE),
-        # dim-0 only contains MoE layers, index by MoE-layer ordinal.
-        index_by_layer = len(layers_topk_idx_reshape) == tf_config.num_layers
+    if len(layers_old_inputs_sampled) > 0:
+        for i in range(len(layers_old_inputs_sampled)):
+            if inputs_target_dtype != layers_old_inputs_sampled[i].dtype:
+                layers_old_inputs_sampled[i] = layers_old_inputs_sampled[i].to(inputs_target_dtype)
+            if logits_target_dtype != layers_old_logits_sampled[i].dtype:
+                layers_old_logits_sampled[i] = layers_old_logits_sampled[i].to(logits_target_dtype)
+        
+        # total_size_after = sum(t.numel() * t.element_size() for t in layers_old_inputs_sampled) / 1024 / 1024
+        # total_size_after += sum(t.numel() * t.element_size() for t in layers_old_logits_sampled) / 1024 / 1024
+        # print(f"[Predictive Routing Replay] [Memory] Reduced precision to {target_dtype}: {total_size_before:.2f}MB → {total_size_after:.2f}MB (saved {total_size_before - total_size_after:.2f} MB), {_get_system_memory_info()}")
 
-        # For R2: count MoE layers before `offset` as the starting position.
-        moe_idx = sum(1 for i in range(offset) if is_moe_layer(tf_config, i))
+    # Append per-sample arrays to mini-batch lists
+    for i in range(len(layers_old_inputs_sampled)):
+        mini_layer_old_inputs_list.append(layers_old_inputs_sampled[i])
+        mini_layer_old_logits_list.append(layers_old_logits_sampled[i])
+        mini_layer_old_token_positions_list.append(layers_old_token_positions_sampled[i])
+    mini_layer_sampled_masks_list.append(downsample_mask)
 
-        router_offset = 0
-        for layer_idx in range(offset, end):
-            if not is_moe_layer(tf_config, layer_idx):
+    # Explicitly delete GPU tensors to free memory immediately
+    # This ensures GPU memory is released before the next micro-batch
+    # Note: layers_old_inputs_sampled and layers_old_logits_sampled are now already appended to mini_layer lists
+    del layers_merged_tensor, layers_old_inputs, layers_old_logits
+    del layers_old_inputs_list, layers_old_logits_list, layers_old_token_positions_list
+    # downsample_mask is already appended, no need to delete here
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # Calculate cumulative memory
+    # total_size_mb = sum(t.numel() * t.element_size() for t in mini_layer_old_inputs_list) / 1024 / 1024
+    # total_size_mb += sum(t.numel() * t.element_size() for t in mini_layer_old_logits_list) / 1024 / 1024
+    # print(f"[Predictive Routing Replay] [Memory] Cumulative predictive data in list: {total_size_mb:.2f} MB ({len(mini_layer_old_inputs_list)} micro-batches), {_get_system_memory_info()}")
+
+    # Clear recorded data from router instances to free GPU memory
+    for router in router_instances_list:
+        router.recorded_old_inputs = None
+        router.recorded_old_logits = None
+
+    # FINAL CHECKPOINT: Force synchronization and cleanup after merge completion
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    # gpu_allocated_after = torch.cuda.memory_allocated() / (1024 ** 3)
+    # print(f"[Predictive Routing Replay] [Debug] CHECKPOINT FINAL: Merge completed. GPU Memory: {gpu_allocated_before:.2f}GB -> {gpu_allocated_after:.2f}GB (delta: {gpu_allocated_after - gpu_allocated_before:+.2f}GB)")
+    # print(f"[Predictive Routing Replay] [Debug] merge_router_predictive_data COMPLETED successfully")
+
+
+@torch.no_grad()
+def set_router_predictive_data(
+    old_inputs_list,
+    old_logits_list,
+    attention_mask,
+    tf_config,
+    vp_rank=None,
+    old_token_positions_list=None,
+    router_request_ids=None,
+    global_step=None,
+    mini_step=None,
+    inputs_storage_dtype: str = 'bf16',
+    logits_storage_dtype: str = 'fp32',
+):
+    """
+    NEW: Simplified version that works with unpacked data (list of variable-shape tensors).
+    
+    Args:
+        layers_old_inputs_list (list): List of tensors, each [num_tokens_i, layers, hidden]
+        layers_old_logits_list (list): List of tensors, each [num_tokens_i, layers, num_experts]
+        attention_mask (torch.Tensor): Attention mask [batch_size, seq_len]
+        tf_config: Transformer config
+        vp_rank: Virtual pipeline rank
+    """
+    # Handle multiple possible formats after Ray serialization
+    if isinstance(old_inputs_list, np.ndarray):
+        old_inputs_list = list(old_inputs_list)
+    if isinstance(old_logits_list, np.ndarray):
+        old_logits_list = list(old_logits_list)
+    if isinstance(old_token_positions_list, np.ndarray):
+        old_token_positions_list = list(old_token_positions_list)
+    if isinstance(router_request_ids, np.ndarray):
+        router_request_ids = list(router_request_ids)
+
+    # logger.info(f"old_inputs_list: type {type(old_inputs_list)}, length {len(old_inputs_list) if isinstance(old_inputs_list, list) else 'N/A'}")
+    # if isinstance(old_inputs_list, list) and len(old_inputs_list) > 0 and old_inputs_list[0] is not None:
+    #     logger.info(f"old_inputs_list[0]: type {type(old_inputs_list[0])}, shape {old_inputs_list[0].shape if hasattr(old_inputs_list[0], 'shape') else 'N/A'}")
+
+    # Filter out None values
+    valid_indices = []
+    valid_old_inputs = []
+    valid_old_logits = []
+    valid_old_token_positions = []
+    valid_router_request_ids = []
+    seq_lens = attention_mask.sum(dim=1, dtype=torch.int32).tolist()
+    for i, (old_input, old_logit) in enumerate(zip(old_inputs_list, old_logits_list)):
+        if old_input is not None and old_logit is not None:
+            old_input = _to_numpy_array(old_input)
+            old_logit = _to_numpy_array(old_logit)
+
+            if old_input is None or old_logit is None:
                 continue
-            router = router_instances_list[router_offset]
-            idx = layer_idx if index_by_layer else moe_idx
-            router.set_target_indices(layers_topk_idx_reshape[idx].to(torch.int64))
-            router_offset += 1
-            moe_idx += 1
+
+            if old_input.shape[0] != old_logit.shape[0]:
+                logger.warning(
+                    "[Predictive Routing Replay] old_inputs/old_logits length mismatch for sample %s: %s vs %s. "
+                    "Dropping predictive data for this sample.",
+                    i,
+                    old_input.shape[0],
+                    old_logit.shape[0],
+                )
+                _save_r3_trace_pt(
+                    f"trace-step{global_step}-mini{mini_step}-sample{i}-length-mismatch.pt",
+                    {
+                        "reason": "old_inputs_old_logits_length_mismatch",
+                        "global_step": global_step,
+                        "mini_step": mini_step,
+                        "sample_idx": i,
+                        "request_id": None if router_request_ids is None or i >= len(router_request_ids) else router_request_ids[i],
+                        "old_input": torch.from_numpy(old_input.copy()),
+                        "old_logit": torch.from_numpy(old_logit.copy()),
+                    },
+                )
+                continue
+
+            sample_seq_len = int(seq_lens[i])
+            old_token_positions = None
+            if old_token_positions_list is not None:
+                if i >= len(old_token_positions_list):
+                    logger.warning(
+                        "[Predictive Routing Replay] old_token_positions missing for sample %s. "
+                        "Dropping predictive data for this sample.",
+                        i,
+                    )
+                    _save_r3_trace_pt(
+                        f"trace-step{global_step}-mini{mini_step}-sample{i}-missing-positions.pt",
+                        {
+                            "reason": "missing_old_token_positions",
+                            "global_step": global_step,
+                            "mini_step": mini_step,
+                            "sample_idx": i,
+                            "request_id": None if router_request_ids is None or i >= len(router_request_ids) else router_request_ids[i],
+                            "old_input": torch.from_numpy(old_input.copy()),
+                            "old_logit": torch.from_numpy(old_logit.copy()),
+                        },
+                    )
+                    continue
+            elif old_input.shape[0] != sample_seq_len:
+                logger.warning(
+                    "[Predictive Routing Replay] old_inputs/old_logits for sample %s are downsampled "
+                    "(%s tokens) but old_token_positions is missing. Dropping predictive data for this sample.",
+                    i,
+                    old_input.shape[0],
+                )
+                _save_r3_trace_pt(
+                    f"trace-step{global_step}-mini{mini_step}-sample{i}-downsampled-missing-positions.pt",
+                    {
+                        "reason": "downsampled_missing_old_token_positions",
+                        "global_step": global_step,
+                        "mini_step": mini_step,
+                        "sample_idx": i,
+                        "request_id": None if router_request_ids is None or i >= len(router_request_ids) else router_request_ids[i],
+                        "sample_seq_len": sample_seq_len,
+                        "old_input": torch.from_numpy(old_input.copy()),
+                        "old_logit": torch.from_numpy(old_logit.copy()),
+                    },
+                )
+                continue
+
+            if old_token_positions_list is not None:
+                old_token_positions = _to_numpy_array(old_token_positions_list[i], dtype=np.int32)
+                if old_token_positions is None:
+                    logger.warning(
+                        "[Predictive Routing Replay] old_token_positions is None for sample %s while positions are required. "
+                        "Dropping predictive data for this sample.",
+                        i,
+                    )
+                    _save_r3_trace_pt(
+                        f"trace-step{global_step}-mini{mini_step}-sample{i}-positions-none.pt",
+                        {
+                            "reason": "old_token_positions_none",
+                            "global_step": global_step,
+                            "mini_step": mini_step,
+                            "sample_idx": i,
+                            "request_id": None if router_request_ids is None or i >= len(router_request_ids) else router_request_ids[i],
+                            "old_input": torch.from_numpy(old_input.copy()),
+                            "old_logit": torch.from_numpy(old_logit.copy()),
+                        },
+                    )
+                    continue
+                if len(old_token_positions.shape) != 1:
+                    logger.warning(
+                        "[Predictive Routing Replay] old_token_positions must be 1D for sample %s, got shape=%s. "
+                        "Dropping predictive data for this sample.",
+                        i,
+                        old_token_positions.shape,
+                    )
+                    _save_r3_trace_pt(
+                        f"trace-step{global_step}-mini{mini_step}-sample{i}-positions-ndim.pt",
+                        {
+                            "reason": "old_token_positions_ndim_mismatch",
+                            "global_step": global_step,
+                            "mini_step": mini_step,
+                            "sample_idx": i,
+                            "request_id": None if router_request_ids is None or i >= len(router_request_ids) else router_request_ids[i],
+                            "old_input": torch.from_numpy(old_input.copy()),
+                            "old_logit": torch.from_numpy(old_logit.copy()),
+                            "old_token_positions": torch.from_numpy(old_token_positions.copy()),
+                        },
+                    )
+                    continue
+                if old_token_positions.shape[0] != old_input.shape[0]:
+                    logger.warning(
+                        "[Predictive Routing Replay] old_token_positions length mismatch for sample %s: "
+                        "positions=%s old_inputs=%s. Dropping predictive data for this sample.",
+                        i,
+                        old_token_positions.shape[0],
+                        old_input.shape[0],
+                    )
+                    _save_r3_trace_pt(
+                        f"trace-step{global_step}-mini{mini_step}-sample{i}-positions-length.pt",
+                        {
+                            "reason": "old_token_positions_length_mismatch",
+                            "global_step": global_step,
+                            "mini_step": mini_step,
+                            "sample_idx": i,
+                            "request_id": None if router_request_ids is None or i >= len(router_request_ids) else router_request_ids[i],
+                            "old_input": torch.from_numpy(old_input.copy()),
+                            "old_logit": torch.from_numpy(old_logit.copy()),
+                            "old_token_positions": torch.from_numpy(old_token_positions.copy()),
+                        },
+                    )
+                    continue
+                if np.any(old_token_positions < 0) or np.any(old_token_positions >= sample_seq_len):
+                    logger.warning(
+                        "[Predictive Routing Replay] old_token_positions out of range for sample %s: "
+                        "sample_seq_len=%s positions_head=%s. Dropping predictive data for this sample.",
+                        i,
+                        sample_seq_len,
+                        old_token_positions[:8].tolist(),
+                    )
+                    _save_r3_trace_pt(
+                        f"trace-step{global_step}-mini{mini_step}-sample{i}-positions-range.pt",
+                        {
+                            "reason": "old_token_positions_out_of_range",
+                            "global_step": global_step,
+                            "mini_step": mini_step,
+                            "sample_idx": i,
+                            "request_id": None if router_request_ids is None or i >= len(router_request_ids) else router_request_ids[i],
+                            "sample_seq_len": sample_seq_len,
+                            "old_input": torch.from_numpy(old_input.copy()),
+                            "old_logit": torch.from_numpy(old_logit.copy()),
+                            "old_token_positions": torch.from_numpy(old_token_positions.copy()),
+                        },
+                    )
+                    continue
+                if np.unique(old_token_positions).shape[0] != old_token_positions.shape[0]:
+                    logger.warning(
+                        "[Predictive Routing Replay] old_token_positions contains duplicates for sample %s. "
+                        "Dropping predictive data for this sample.",
+                        i,
+                    )
+                    _save_r3_trace_pt(
+                        f"trace-step{global_step}-mini{mini_step}-sample{i}-positions-duplicate.pt",
+                        {
+                            "reason": "old_token_positions_duplicate",
+                            "global_step": global_step,
+                            "mini_step": mini_step,
+                            "sample_idx": i,
+                            "request_id": None if router_request_ids is None or i >= len(router_request_ids) else router_request_ids[i],
+                            "old_input": torch.from_numpy(old_input.copy()),
+                            "old_logit": torch.from_numpy(old_logit.copy()),
+                            "old_token_positions": torch.from_numpy(old_token_positions.copy()),
+                        },
+                    )
+                    continue
+
+            valid_indices.append(i)
+            # Reinterpret transport-view dtypes (uint16/int16) back to the original
+            # storage dtype (bf16/fp16) that the sender used in `_tensor_to_transport_numpy`.
+            _inputs_torch_dtype = _STORAGE_DTYPE_MAP.get(inputs_storage_dtype, torch.bfloat16)
+            _logits_torch_dtype = _STORAGE_DTYPE_MAP.get(logits_storage_dtype, torch.float32)
+            valid_old_inputs.append(_transport_numpy_to_tensor(old_input, _inputs_torch_dtype))
+            valid_old_logits.append(_transport_numpy_to_tensor(old_logit, _logits_torch_dtype))
+            if old_token_positions is not None:
+                valid_old_token_positions.append(torch.from_numpy(old_token_positions.copy()))
+            if router_request_ids is not None and i < len(router_request_ids):
+                valid_router_request_ids.append(router_request_ids[i])
+            else:
+                valid_router_request_ids.append(None)
+    del old_inputs_list, old_logits_list, old_token_positions_list  # Free memory
+
+    if len(valid_old_inputs) > 0:
+        predictive_loss_scale = 1.0
+
+        logger.info(f"[Predictive Routing Replay] Loaded {len(valid_old_inputs)} valid samples (shapes: {[t.shape for t in valid_old_inputs[:3]]}...)")
+
+        old_lengths = [int(t.shape[0]) for t in valid_old_inputs]
+        valid_mask, selected_current_lens = build_predictive_valid_mask(
+            attention_mask=attention_mask,
+            valid_indices=valid_indices,
+            old_lengths=old_lengths,
+            old_token_positions_list=(valid_old_token_positions if len(valid_old_token_positions) > 0 else None),
+        )
+        logger.info(
+            "[Predictive Routing Replay] Created valid_mask with %s/%s valid tokens. "
+            "old_lens=%s selected_current_lens=%s using_positions=%s predictive_loss_scale=%.6f",
+            int(valid_mask.sum().item()),
+            int(valid_mask.numel()),
+            old_lengths[:8],
+            selected_current_lens[:8],
+            len(valid_old_token_positions) > 0,
+            predictive_loss_scale,
+        )
+        _append_r3_trace(
+            "verl.router_replay.set_predictive_data",
+            {
+                "global_step": global_step,
+                "mini_step": mini_step,
+                "num_valid_samples": len(valid_old_inputs),
+                "sample_idx": valid_indices[0],
+                "request_id": valid_router_request_ids[0],
+                "old_inputs": _summary_value(valid_old_inputs[0]),
+                "old_logits": _summary_value(valid_old_logits[0]),
+                "old_token_positions": _summary_value(valid_old_token_positions[0] if len(valid_old_token_positions) > 0 else None),
+                "valid_mask_sum": int(valid_mask.sum().item()),
+                "valid_mask_numel": int(valid_mask.numel()),
+                "selected_current_lens_head": selected_current_lens[:8],
+                "predictive_loss_scale": predictive_loss_scale,
+            },
+        )
+
+        # Get router instances and compute dtype
+        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+        if router_instances_list and hasattr(router_instances_list[0], 'bias_predictor') and router_instances_list[0].bias_predictor is not None:
+            compute_dtype = router_instances_list[0].bias_predictor.weight.dtype
+            # print(f"[Memory] Detected bias_predictor weight dtype: {compute_dtype}, {_get_system_memory_info()}")
+        else:
+            compute_dtype = tf_config.params_dtype
+            # print(f"[Memory] Using tf_config.params_dtype: {compute_dtype}, {_get_system_memory_info()}")
+
+        valid_mask = valid_mask.cpu()
+
+        # Set to each router layer with valid_mask (created externally)
+        # NOTE: We always use the per-layer CPU path regardless of sequence_parallel setting.
+        # The scatter-based SP path requires old_inputs and valid_mask to be split consistently
+        # with the SP-scattered current input, which is non-trivial to guarantee given that
+        # old_inputs are packed from a different iteration's batch layout.  The per-layer path
+        # is always correct because it stores the full token tensors on CPU and the loss
+        # computation uses valid_mask to align old vs current tokens without any scatter.
+        # The stacked tensors in `valid_old_inputs`/`valid_old_logits` are built from
+        # `router_instances_list` (see merge_router_predictive_data) and are indexed by
+        # the local-per-rank MoE router position, so use `i` directly — do NOT add the
+        # global layer offset (which would overflow dim=1 when PP>1).
+        for i, router in enumerate(router_instances_list):
+            layer_inputs_concat = torch.cat(
+                [t[:, i, :].to(dtype=compute_dtype, copy=False) for t in valid_old_inputs],
+                dim=0,
+            ).unsqueeze(1).contiguous()
+            layer_logits_concat = torch.cat(
+                [t[:, i, :].to(dtype=compute_dtype, copy=False) for t in valid_old_logits],
+                dim=0,
+            ).unsqueeze(1).contiguous()
+            router.set_predictive_data(
+                inputs=layer_inputs_concat,
+                logits=layer_logits_concat,
+                valid_mask=valid_mask,
+                loss_scale=predictive_loss_scale,
+            )
+            logger.info(
+                f"[Predictive Routing Replay] Set layer {i} predictive data with layer_inputs shape "
+                f"{router.recorded_old_inputs.shape}, layer_logits shape {router.recorded_old_logits.shape}"
+            )
+            del layer_inputs_concat, layer_logits_concat
+
+        del valid_old_inputs, valid_old_logits, valid_old_token_positions
+        import gc
+        gc.collect()
+        # logger.info(f"[Memory] [forward_step] After set_router_predictive_data: {get_system_memory_info()}")
+
+    else:
+        # For processes without valid samples, also set empty predictive data
+        logger.warning(f"[Predictive Routing Replay] No valid old_inputs/old_logits found. Setting None to all routers.")
+        _append_r3_trace(
+            "verl.router_replay.set_predictive_data",
+            {
+                "global_step": global_step,
+                "mini_step": mini_step,
+                "num_valid_samples": 0,
+                "sample_idx": None,
+                "request_id": None,
+                "valid_mask_sum": 0,
+                "valid_mask_numel": 0,
+                "selected_current_lens_head": [],
+            },
+        )
+        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+        for i, router in enumerate(router_instances_list):
+            router.set_predictive_data(
+                inputs=None,
+                logits=None,
+                valid_mask=None
+            )
 
 
+def set_router_predictive_bias_data(
+    old_bias_list,
+    attention_mask,
+    tf_config,
+    vp_rank=None,
+    old_token_positions_list=None,
+    global_token_ids=None,
+):
+    """
+    Set per-layer recorded_old_bias for R3_COLLECT_STATS.
+    Similar to set_router_predictive_data but only handles the bias tensor.
+
+    Args:
+        old_bias_list (list): List of numpy arrays, each [num_tokens_i, num_layers, num_experts] or None.
+        attention_mask (torch.Tensor): Attention mask [batch_size, seq_len].
+        tf_config: Transformer config.
+        vp_rank: Virtual pipeline rank.
+        old_token_positions_list: optional 1D local valid-token positions for each sample.
+        global_token_ids: optional [batch_size, seq_len] ids used by logits saving.
+    """
+    if isinstance(old_bias_list, np.ndarray):
+        old_bias_list = list(old_bias_list)
+    if isinstance(old_token_positions_list, np.ndarray):
+        old_token_positions_list = list(old_token_positions_list)
+
+    # Filter out None values
+    valid_old_bias = []
+    valid_bias_token_ids = []
+    seq_lens = attention_mask.sum(dim=1, dtype=torch.int32).tolist()
+    for i, old_bias in enumerate(old_bias_list):
+        if old_bias is None:
+            continue
+        old_bias = _to_numpy_array(old_bias, dtype=np.float32)
+        if old_bias is None:
+            continue
+        if old_bias.ndim != 3:
+            logger.warning(
+                "[R3+Predictive] old_bias must be 3D for sample %s, got shape=%s. Skipping bias stats.",
+                i,
+                old_bias.shape,
+            )
+            continue
+
+        sample_seq_len = int(seq_lens[i])
+        token_positions = None
+        if old_token_positions_list is not None and i < len(old_token_positions_list):
+            token_positions = _to_numpy_array(old_token_positions_list[i], dtype=np.int32)
+
+        if token_positions is None:
+            if old_bias.shape[0] != sample_seq_len:
+                logger.warning(
+                    "[R3+Predictive] old_bias for sample %s is downsampled (%s tokens) but old_token_positions "
+                    "is missing. Skipping bias stats to avoid position-corrupted saved artifacts.",
+                    i,
+                    old_bias.shape[0],
+                )
+                continue
+            token_positions_t = torch.arange(sample_seq_len, dtype=torch.long, device=attention_mask.device)
+        else:
+            token_positions_t = torch.as_tensor(token_positions, dtype=torch.long, device=attention_mask.device)
+            if token_positions_t.ndim != 1 or token_positions_t.numel() != old_bias.shape[0]:
+                logger.warning(
+                    "[R3+Predictive] old_bias/old_token_positions mismatch for sample %s: "
+                    "old_bias_tokens=%s positions_shape=%s. Skipping bias stats.",
+                    i,
+                    old_bias.shape[0],
+                    tuple(token_positions_t.shape),
+                )
+                continue
+            if (
+                torch.any(token_positions_t < 0)
+                or torch.any(token_positions_t >= sample_seq_len)
+                or torch.unique(token_positions_t).numel() != token_positions_t.numel()
+            ):
+                logger.warning(
+                    "[R3+Predictive] invalid old_token_positions for old_bias sample %s. Skipping bias stats.",
+                    i,
+                )
+                continue
+
+        valid_abs_positions = attention_mask[i].nonzero(as_tuple=False).squeeze(-1)
+        abs_positions = valid_abs_positions[token_positions_t]
+        if global_token_ids is not None:
+            sample_token_ids = global_token_ids[i, abs_positions.to(global_token_ids.device)].detach().cpu().to(torch.long)
+        else:
+            sample_start = int(sum(seq_lens[:i]))
+            sample_token_ids = (token_positions_t.detach().cpu().to(torch.long) + sample_start)
+
+        valid_old_bias.append(torch.from_numpy(old_bias.copy()))
+        valid_bias_token_ids.append(sample_token_ids.contiguous())
+
+    del old_bias_list, old_token_positions_list
+
+    if len(valid_old_bias) == 0:
+        # No valid bias data; clear bias on all routers
+        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+        for router in router_instances_list:
+            router.clear_predictive_bias()
+        RouterReplay.clear_predictive_bias_token_ids()
+        return
+
+    # Determine compute dtype
+    router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+    if router_instances_list and hasattr(router_instances_list[0], 'bias_predictor') and router_instances_list[0].bias_predictor is not None:
+        compute_dtype = router_instances_list[0].bias_predictor.weight.dtype
+    else:
+        compute_dtype = tf_config.params_dtype
+
+    # Concatenate all valid samples: [total_valid_tokens, num_layers, num_experts]
+    # NOTE: We intentionally skip the scatter_to_sequence_parallel_region here.
+    # Scattering old_bias along the token dimension would split it inconsistently with how
+    # the corresponding current tokens are distributed in the forward pass, leading to
+    # shape mismatches in the loss computation.  Keeping the full tensor on all ranks and
+    # indexing per layer on CPU is always correct.
+    bias_concat = torch.cat([t.to(compute_dtype) for t in valid_old_bias], dim=0)
+    bias_token_ids = torch.cat(valid_bias_token_ids, dim=0).to(torch.long)
+    del valid_old_bias
+
+    bias_concat = bias_concat.cpu()
+    RouterReplay.set_predictive_bias_token_ids(bias_token_ids)
+
+    local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
+    offset = local_rank_info["start"]
+    for i, router in enumerate(router_instances_list):
+        # Set per-layer bias: [total_valid_tokens, num_experts]
+        router.set_predictive_bias(bias_concat[:, i + offset, :].contiguous())
+
+    del bias_concat
+    import gc
+    gc.collect()
+
+
+def _flatten_index_sequence(indices) -> list[int]:
+    if isinstance(indices, torch.Tensor):
+        return [int(x) for x in indices.detach().cpu().view(-1).tolist()]
+    if isinstance(indices, np.ndarray):
+        return [int(x) for x in indices.reshape(-1).tolist()]
+
+    flattened = []
+    for item in indices:
+        if isinstance(item, (list, tuple, torch.Tensor, np.ndarray)):
+            flattened.extend(_flatten_index_sequence(item))
+        else:
+            flattened.append(int(item))
+    return flattened
+
+
+def restore_predictive_states_to_batch_order(
+    old_inputs_list,
+    old_logits_list,
+    old_token_positions_list,
+    sampled_masks,
+    indices=None,
+) -> tuple[list, list, list]:
+    """Restore sampled predictive states to original mini-batch order.
+
+    ``merge_router_predictive_data`` records sampled states in forward
+    micro-batch order. With dynamic batching that order is a permutation of the
+    mini-batch. The returned lists are always indexed by original mini-batch
+    sample id and contain ``None`` for samples whose state was not recorded.
+    """
+
+    if isinstance(sampled_masks, torch.Tensor):
+        mask_list = [bool(x) for x in sampled_masks.detach().cpu().view(-1).tolist()]
+    elif isinstance(sampled_masks, np.ndarray):
+        mask_list = [bool(x) for x in sampled_masks.reshape(-1).tolist()]
+    else:
+        mask_list = [bool(x) for x in sampled_masks]
+
+    batch_size = len(mask_list)
+    if indices is None:
+        output_to_batch_idx = list(range(batch_size))
+    else:
+        output_to_batch_idx = _flatten_index_sequence(indices)
+        if len(output_to_batch_idx) != batch_size:
+            raise ValueError(
+                "Dynamic predictive-state restore got mismatched indices and sampled masks: "
+                f"indices={len(output_to_batch_idx)} sampled_masks={batch_size}."
+            )
+
+    full_inputs_list = [None] * batch_size
+    full_logits_list = [None] * batch_size
+    full_token_positions_list = [None] * batch_size
+
+    sampled_idx = 0
+    for output_pos, is_sampled in enumerate(mask_list):
+        if not is_sampled:
+            continue
+        if sampled_idx >= len(old_inputs_list) or sampled_idx >= len(old_logits_list):
+            raise ValueError(
+                "Predictive-state restore has fewer sampled states than sampled masks: "
+                f"sampled_idx={sampled_idx}, old_inputs={len(old_inputs_list)}, "
+                f"old_logits={len(old_logits_list)}."
+            )
+        batch_idx = output_to_batch_idx[output_pos]
+        if batch_idx < 0 or batch_idx >= batch_size:
+            raise ValueError(
+                "Dynamic predictive-state restore got out-of-range batch index: "
+                f"batch_idx={batch_idx}, batch_size={batch_size}."
+            )
+
+        full_inputs_list[batch_idx] = old_inputs_list[sampled_idx]
+        full_logits_list[batch_idx] = old_logits_list[sampled_idx]
+        if old_token_positions_list is not None:
+            if sampled_idx >= len(old_token_positions_list):
+                raise ValueError(
+                    "Predictive-state restore has fewer token-position entries than sampled masks: "
+                    f"sampled_idx={sampled_idx}, old_token_positions={len(old_token_positions_list)}."
+                )
+            full_token_positions_list[batch_idx] = old_token_positions_list[sampled_idx]
+        sampled_idx += 1
+
+    if sampled_idx != len(old_inputs_list) or sampled_idx != len(old_logits_list):
+        raise ValueError(
+            "Predictive-state restore has extra sampled states after consuming sampled masks: "
+            f"consumed={sampled_idx}, old_inputs={len(old_inputs_list)}, old_logits={len(old_logits_list)}."
+        )
+    if old_token_positions_list is not None and sampled_idx != len(old_token_positions_list):
+        raise ValueError(
+            "Predictive-state restore has extra token-position entries after consuming sampled masks: "
+            f"consumed={sampled_idx}, old_token_positions={len(old_token_positions_list)}."
+        )
+
+    return full_inputs_list, full_logits_list, full_token_positions_list
+
+
+def reorder_list_for_vpp(
+    micro_batch_list,
+    num_microbatches: int,
+    vpp_size: int,
+    microbatch_group_size_per_vp_stage: int,
+) -> list:
+    """
+    Reorder a list of elements according to VPP schedule (for variable-shape tensors).
+    
+    This function only reorders the list elements without concatenating them,
+    making it suitable for lists of variable-shape tensors.
+    
+    Args:
+        micro_batch_list: List of elements (can be tensors of different shapes)
+        num_microbatches (int): Number of microbatches per pipeline stage (bs).
+        vpp_size (int): Virtual pipeline parallel size (number of model chunks).
+        microbatch_group_size_per_vp_stage (int): Number of consecutive microbatches processed per VPP stage.
+    
+    Returns:
+        list: Reordered list of elements
+    """
+    if vpp_size <= 1:
+        return micro_batch_list
+    
+    # Build schedule table
+    schedule_table = get_schedule_table(num_microbatches, vpp_size, microbatch_group_size_per_vp_stage)
+    
+    # Group by model_chunk_id
+    elements_by_chunk = [[] for _ in range(vpp_size)]
+    for vidx, (_mb, chunk_id) in enumerate(schedule_table):
+        elements_by_chunk[chunk_id].append(micro_batch_list[vidx])
+    
+    # Flatten in chunk order
+    reordered_list = []
+    for chunk_id in range(vpp_size):
+        reordered_list.extend(elements_by_chunk[chunk_id])
+    
+    return reordered_list
 def reorder_and_merge_vpp_layers(
     micro_batch_tensor_list,
     num_microbatches: int,
@@ -538,3 +1654,116 @@ class RouterReplayHelper:
             router_instances_list
             and router_instances_list[0].router_replay_action == RouterReplayAction.REPLAY_BACKWARD
         )
+
+    @staticmethod
+    def is_predictive_record_action(tf_config, vp_rank=None) -> bool:
+        """Check if current action is RECORD_FOR_PREDICTIVE (log_prob phase).
+        
+        This inspects the first local RouterReplay instance's predictive_action and compares it to
+        RouterPredictiveAction.RECORD_FOR_PREDICTIVE.
+        """
+        from verl.utils.megatron.router_replay_patch import RouterPredictiveAction
+
+        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+        return (
+            router_instances_list
+            and router_instances_list[0].predictive_action == RouterPredictiveAction.RECORD
+        )
+
+    @staticmethod
+    def is_predictive_compute_loss_action(tf_config, vp_rank=None) -> bool:
+        """Check if current action is COMPUTE_PREDICTIVE_LOSS (training ministep>=1).
+        
+        This inspects the first local RouterReplay instance's predictive_action and compares it to
+        RouterPredictiveAction.COMPUTE_PREDICTIVE_LOSS.
+        """
+        from verl.utils.megatron.router_replay_patch import RouterPredictiveAction
+
+        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+        return (
+            router_instances_list
+            and router_instances_list[0].predictive_action == RouterPredictiveAction.COMPUTE_PREDICTIVE_LOSS
+        )
+
+    @staticmethod
+    def is_predictive_skip_action(tf_config, vp_rank=None) -> bool:
+        """Check if current action is SKIP_PREDICTIVE (training ministep==0).
+        
+        This inspects the first local RouterReplay instance's predictive_action and compares it to
+        RouterPredictiveAction.SKIP_PREDICTIVE.
+        """
+        from verl.utils.megatron.router_replay_patch import RouterPredictiveAction
+
+        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+        return (
+            router_instances_list
+            and router_instances_list[0].predictive_action == RouterPredictiveAction.SKIP_PREDICTIVE
+        )
+
+    @staticmethod
+    def is_r3_collect_stats_action(tf_config, vp_rank=None) -> bool:
+        """Check if current action is R3_COLLECT_STATS (R3 compute_log_prob phase).
+        
+        This inspects the first local RouterReplay instance's predictive_action and compares it to
+        RouterPredictiveAction.R3_COLLECT_STATS.
+        """
+        from verl.utils.megatron.router_replay_patch import RouterPredictiveAction
+
+        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+        return (
+            router_instances_list
+            and router_instances_list[0].predictive_action == RouterPredictiveAction.R3_COLLECT_STATS
+        )
+
+
+def decode_router_states_batch(
+    base64_list,
+    hf_config,
+    data_type: str,
+):
+    """
+    Decode base64 encoded router states for a batch.
+    
+    Args:
+        base64_list: List of base64 encoded strings (one per sample), or numpy array
+        hf_config: HF model config with num_hidden_layers, hidden_size, num_local_experts
+        data_type: "inputs" or "logits"
+    
+    Returns:
+        List of numpy arrays, each with shape [num_tokens, num_layers, hidden/num_experts]
+        None entries for samples without router states
+    """
+    import pybase64
+    
+    # Handle numpy array input (convert to list)
+    if isinstance(base64_list, np.ndarray):
+        base64_list = base64_list.tolist()
+    
+    num_layers = hf_config.num_hidden_layers
+    
+    if data_type == "inputs":
+        hidden_size = hf_config.hidden_size
+        feature_dim = hidden_size
+    elif data_type == "logits":
+        num_experts = hf_config.num_local_experts
+        feature_dim = num_experts
+    else:
+        raise ValueError(f"Invalid data_type: {data_type}. Must be 'inputs' or 'logits'")
+    
+    decoded_list = []
+    for base64_str in base64_list:
+        if base64_str == "" or base64_str is None:
+            decoded_list.append(None)
+            continue
+        
+        # Decode base64
+        data_bytes = pybase64.b64decode(base64_str.encode("utf-8"))
+        # SGLang stores as fp16/bf16, we decode as fp16 (compatible with bf16 bytes)
+        data_array = np.frombuffer(data_bytes, dtype=np.float16)
+        
+        # Reshape: [num_tokens, num_layers, feature_dim]
+        num_tokens = len(data_array) // (num_layers * feature_dim)
+        data_array = data_array.reshape(num_tokens, num_layers, feature_dim)
+        decoded_list.append(data_array)
+    
+    return decoded_list

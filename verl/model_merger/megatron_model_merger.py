@@ -16,6 +16,7 @@ import json
 import os
 import warnings
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, ContextManager
 
@@ -151,7 +152,8 @@ class MegatronModelMerger(BaseModelMerger):
             os.environ["MASTER_PORT"] = "12355"
 
         set_numa_affinity()
-        torch.distributed.init_process_group(get_nccl_backend())
+        pg_timeout_seconds = int(os.getenv("VERL_MODEL_MERGER_PG_TIMEOUT_SECONDS", "7200"))
+        torch.distributed.init_process_group(get_nccl_backend(), timeout=timedelta(seconds=pg_timeout_seconds))
 
         self.rank = torch.distributed.get_rank()
         self.world_size = torch.distributed.get_world_size()
